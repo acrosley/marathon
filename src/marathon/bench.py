@@ -112,7 +112,7 @@ def simulate(
 def _print_report(report: dict) -> None:
     p = report["params"]
     print(
-        f"marathon bench — turns={p['turns']} growth={p['growth']}B "
+        f"marathon bench - turns={p['turns']} growth={p['growth']}B "
         f"edit_every={p['edit_every']} block_size={p['block_size']}"
     )
     print(f"{'turn':>5} {'state B':>10} {'full B':>10} {'wire B':>10} {'ratio':>8}")
@@ -134,7 +134,7 @@ def _print_report(report: dict) -> None:
     )
     print(
         f"token estimate (~{_BYTES_PER_TOKEN_ESTIMATE} B/token): "
-        f"full≈{t['full_tokens_estimate']:,}  wire≈{t['wire_tokens_estimate']:,}"
+        f"full~{t['full_tokens_estimate']:,}  wire~{t['wire_tokens_estimate']:,}"
     )
 
 

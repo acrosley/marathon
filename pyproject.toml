@@ -8,10 +8,11 @@ version = "0.0.1"
 description = "Delta-encoded context architecture for LLMs: per-turn cost proportional to what changed, not total context size."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 authors = [{ name = "Andrew Crosley" }]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
+  "License :: OSI Approved :: Apache Software License",
   "Programming Language :: Python :: 3",
 ]
 dependencies = []
@@ -24,6 +25,8 @@ live = ["anthropic>=0.40"]
 packages = ["src/marathon"]
 
 [tool.pytest.ini_options]
+# ponytail: pythonpath beats requiring `pip install -e .` before a bare `pytest`
+pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-q"
 
