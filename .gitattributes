@@ -1,3 +1,4 @@
 # ponytail: WSL runs these; CRLF breaks bash and git apply
 *.sh text eol=lf
 *.patch text eol=lf
+.gitattributes text eol=lf
