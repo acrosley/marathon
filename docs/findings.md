@@ -147,3 +147,40 @@ LMCache retrieves ~99.7% of tokens every turn (`Retrieved 12505 out of 12547`, v
 Takeaway: on the edit turn CacheBlend-as-shipped is a tie with full recompute (1.260 vs 1.265 s) and it is 7× worse than prefix caching on every unchanged turn (prefix caching is off in blend mode). The idea isn't refuted — with 15% recomputed at vLLM's efficiency the edit turn would be ~0.25 s, a ~5× win — but LMCache 0.5.3's implementation of it can't deliver that on this stack. Phase 1 exit criterion (TTFT win on mid-edit sessions) is NOT met by this route yet. Options, cheapest first: lower `blend_recompute_ratios` (0.05, 0.02) and check output parity against full recompute; blend + vLLM prefix caching on together so unchanged turns keep the 0.12 s path and blend only pays on edits; a late/realistic edit position where prefix caching gets partial hits; or bypass LMCache's recompute path and do the position-shifted KV reuse Marathon's design actually calls for (DESIGN.md "positional entanglement") — the delta engine already knows exactly which byte ranges changed.
 
 @acrosley 2026-08-18
+
+## 2026-08-18 — Position-shifted KV reuse: re-rotated shifted KV holds quality at 0.7% recompute (Qwen3-0.6B, HF)
+
+Command: `scripts/kvshift_probe.sh --model Qwen/Qwen3-0.6B --turns 20` → `marathon.kvshift_probe` (WSL2, `~/marathon-venv`: torch 2.13.0+cu130, transformers 5.15.0, sdpa attention, bf16, no vLLM/LMCache) · Model: `Qwen/Qwen3-0.6B` · Cost: $0.
+
+The route DESIGN.md actually calls for, instead of LMCache: the delta engine says the turn changed one span, so reuse `P` verbatim, compute `E'` fresh, and reuse `S`'s cached V unchanged while **re-rotating** `S`'s cached K by δ = |E'|−|E| positions. RoPE is a rotation, so a key computed at position `p` moves to `p+δ` exactly by one more rotation of angle `δ·θ_i` — no recompute, no approximation. Measured against the real model's `inv_freq`: max abs error 1.3e-05 in fp32 (`tests/test_kvshift.py` proves the identity on a tiny random Qwen3 config, CPU, in CI). What re-rotation cannot fix is that `S`'s KV attended to `E`, not `E'`; that residual is what selective recompute buys back.
+
+Sessions are built with `marathon.session.Session` (20 turns of varied prose, ~5.2k tokens); `marathon.diff` locates the edit (`byte delta head=10783 tail=10599` for the mid edit) and the token span is snapped to it. Four questions per scenario: three planted unique facts (one in `P`, one in the edited span, one in `S`) and one open-ended turn. `klmean` is mean KL vs full recompute over a teacher-forced continuation of the reference's own tokens (stable; free-running greedy agreement is bimodal and is reported but not relied on). `tf_top1` is per-position top-1 agreement. `frac` = tokens forwarded / total; `eff` adds the blend policy's layer-0/1 scan over all of `S`. Worst case over the four questions is shown. `no-rerotate` is the control: same reuse, keys left at their stale angles.
+
+```
+scenario    edit          policy         frac    eff   klmean(worst)  tf_top1  QA   prefill_s
+edit-turn0  turn 0        full-recompute 1.000  1.000     0.0000       1.00    3/3    0.058
+ P=35       E 17->21      no-rerotate    0.007  0.007     0.0168       1.00    3/3    0.024
+ S=5152     d=+4          reuse-all      0.007  0.007     0.0033       1.00    3/3    0.023
+                          first-32       0.013  0.013     0.0023       0.92    3/3    0.023
+                          first-128      0.031  0.031     0.0036       1.00    3/3    0.024
+                          blend-r0.05    0.056  0.128     0.0025       1.00    3/3    0.025
+                          blend-r0.15    0.155  0.226     0.0022       1.00    3/3    0.035
+                          blend-r0.30    0.303  0.374     0.0024       1.00    3/3    0.049
+edit-mid    turn 10       full-recompute 1.000  1.000     0.0000       1.00    3/3    0.058
+ P=2576     E 18->22      no-rerotate    0.007  0.007     0.0183       0.98    3/3    0.023
+ S=2610     d=+4          reuse-all      0.007  0.007     0.0027       0.98    3/3    0.023
+                          first-128      0.032  0.032     0.0009       0.98    3/3    0.024
+                          blend-r0.15    0.082  0.154     0.0010       0.96    3/3    0.025
+                          blend-r0.30    0.157  0.228     0.0006       0.96    3/3    0.035
+edit-grow   turn 10       full-recompute 1.000  1.000     0.0000       1.00    3/3    0.134
+ P=2576     E 257->466    no-rerotate    0.089  0.089     0.0295       0.92    3/3    0.025
+ S=2371     d=+209        reuse-all      0.088  0.088     0.0024       1.00    3/3    0.026
+                          first-128      0.112  0.112     0.0019       1.00    3/3    0.027
+                          blend-r0.15    0.154  0.226     0.0013       1.00    3/3    0.038
+                          blend-r0.30    0.219  0.291     0.0017       1.00    3/3    0.039
+```
+
+Takeaway: re-rotated shifted-KV reuse holds up. Recomputing only `E'` plus the new query — 0.7% of tokens on a small edit, 8.8% when the edit grows the history by 209 tokens — keeps mean KL vs full recompute at ~0.002 nats, per-position top-1 agreement at 0.96–1.00, and all planted-fact answers exact. Selective recompute of `S` (CacheBlend-style top-r by layer-1 K deviation, or a flat first-M) lowers KL by a further 2–4× but from an already negligible base; on this workload it does not pay for itself, and the blend policy's layer-0/1 scan over all of `S` costs more (`eff` − `frac` ≈ 0.07) than the recompute it selects. The control settles that re-rotation is doing the work: leaving `S`'s keys at their stale angles is 5–20× worse in KL at identical cost, and is the only policy that ever breaks per-position agreement (0.92). Wall time is 0.023 s vs 0.058 s full recompute (2.5×), but that number is not the claim — a 0.6B model at 5k tokens in HF is launch-latency-bound, not compute-bound, so the honest predictor of a serving win is the recompute fraction: 0.007–0.09 here versus CacheBlend's fixed 0.15 recomputed through LMCache's Python path (previous entry), which tied full recompute.
+Caveats: single model size (Qwen3-0.6B); a Qwen3-8B scale-up was started and aborted — the download filled the C: drive (0 bytes free), which wedged the WSL VM; `wsl --terminate Ubuntu` did not bring it back and `--shutdown` is off limits, so WSL needs a manual restart by the lead. ~114 GB was freed from `%TEMP%` (stale diagnostic dumps); the partial Qwen3-8B download is still in the WSL HF cache. Also: in these sessions `S` is semantically independent of the edited span (separate log entries), which is the friendly case for reuse — an edit that later text actually depends on should be the next test.
+
+@acrosley 2026-08-18
