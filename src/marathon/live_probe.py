@@ -23,9 +23,7 @@ _FILLER = (
     "be measured across turns. "
 ) * 12
 
-_SYSTEM = (
-    "You are a latency probe. Reply to every message with the single word: ok"
-)
+_SYSTEM = "You are a latency probe. Reply to every message with the single word: ok"
 
 
 def probe(turns: int = 6, model: str = "claude-3-5-haiku-latest") -> list[dict]:
