@@ -31,9 +31,7 @@ class Snapshot:
 
     @staticmethod
     def compute_chain_hash(index: int, parent: str | None, state_hash: str) -> str:
-        return digest(
-            canonical_bytes({"index": index, "parent": parent, "state_hash": state_hash})
-        )
+        return digest(canonical_bytes({"index": index, "parent": parent, "state_hash": state_hash}))
 
 
 class Ledger:

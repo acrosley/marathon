@@ -117,9 +117,7 @@ def compute_delta(base: bytes, target: bytes, block_size: int = DEFAULT_BLOCK_SI
     for off in range(0, len(base) - block_size + 1, block_size):
         block = base[off : off + block_size]
         a, b = _weak(block)
-        table.setdefault((b << 16) | a, []).append(
-            (off, hashlib.sha256(block).digest())
-        )
+        table.setdefault((b << 16) | a, []).append((off, hashlib.sha256(block).digest()))
 
     i = 0
     a, b = _weak(target[0:block_size])
@@ -166,8 +164,7 @@ def apply_delta(base: bytes, delta: Delta) -> bytes:
         if isinstance(op, Copy):
             if op.offset < 0 or op.length < 0 or op.offset + op.length > len(base):
                 raise DeltaError(
-                    f"copy out of range: offset={op.offset} length={op.length} "
-                    f"base={len(base)}"
+                    f"copy out of range: offset={op.offset} length={op.length} base={len(base)}"
                 )
             out += base[op.offset : op.offset + op.length]
         else:

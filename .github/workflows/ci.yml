@@ -19,7 +19,9 @@ jobs:
       - name: Install
         run: pip install -e ".[dev]"
       - name: Lint
-        run: ruff check src tests
+        run: |
+          ruff check src tests
+          ruff format --check src tests
       - name: Test
         run: pytest
       - name: Smoke-run benchmark
