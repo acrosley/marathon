@@ -1,6 +1,6 @@
 # Marathon — Execution Plan
 
-**Status:** Phase 0 in progress · **Updated:** 2026-08-18 · **Companion:** [DESIGN.md](../DESIGN.md) (doc 0001), [protocol.md](protocol.md), [findings.md](findings.md)
+**Status:** Phase 0 exit criteria met; Phase 1 next · **Updated:** 2026-08-18 · **Companion:** [DESIGN.md](../DESIGN.md) (doc 0001), [protocol.md](protocol.md), [findings.md](findings.md)
 
 This plan sequences the delta-encoded context architecture from pure systems work (buildable today against existing APIs) toward the research bet (training the trust contract). Each phase has explicit exit criteria; a phase is not done until its metrics are collected and its correctness gate passes.
 
@@ -10,9 +10,9 @@ Build the ledger, diff engine, and turn protocol; use them to canonicalize state
 
 Delivered so far: canonical serialization with the append-only prefix guarantee, hash-chained ledger with tamper detection, rsync-style block delta engine with randomized round-trip property tests, turn protocol with integrity verification (reconstruction is proven against the target hash, never assumed), offline benchmark harness, experimental live TTFT/cache probe, CI (lint + tests on 3.10 and 3.12).
 
-Remaining for exit: run the live probe to establish real TTFT and cache-read baselines against the Anthropic API; add a session-runner that drives a real conversation through the ledger (canonical serializer as the single path to the wire); publish baseline metrics in-repo (tokens resent per turn, bytes-of-diff vs bytes-of-state, TTFT flat-vs-growing, cache-hit rate); add a full-context replay correctness gate.
+Done 2026-08-18: live probe run against the Anthropic API (cache-read = full history on unchanged-prefix turns; one early edit collapses it — see [findings.md](findings.md)); session runner (`session.py`) with the canonical serializer as the single path to the wire; full-context replay correctness gate in CI (`tests/test_replay_gate.py`); baseline metrics published in README and findings.md. Still open: TTFT flat-vs-growing needs longer sessions than the probe has run; single-writer concurrency and store eviction are tracked under cross-cutting.
 
-**Exit criteria:** wire bytes per turn ~O(|diff| + |input|) in the offline bench (achieved; see README quickstart); live probe shows cache-read tokens ≈ total history tokens on unchanged-prefix turns; correctness replay gate green in CI.
+**Exit criteria (met 2026-08-18):** wire bytes per turn ~O(|diff| + |input|) in the offline bench; live probe shows cache-read tokens ≈ total history tokens on unchanged-prefix turns; correctness replay gate green in CI.
 
 ## Phase 1 — Self-hosted inference and warm-tier KV reuse
 

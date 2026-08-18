@@ -16,6 +16,7 @@ from .protocol import (
     prepare_turn,
     resolve_turn,
 )
+from .session import Session
 
 __version__ = "0.0.1"
 
@@ -29,6 +30,7 @@ __all__ = [
     "Ledger",
     "LedgerError",
     "ProtocolError",
+    "Session",
     "Snapshot",
     "TurnPayload",
     "UnknownBaselineError",

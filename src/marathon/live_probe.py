@@ -17,6 +17,8 @@ from __future__ import annotations
 import argparse
 import time
 
+from .session import Session
+
 _FILLER = (
     "This is deterministic filler content used to grow the context in a "
     "byte-stable, append-only fashion so that provider prefix caching can "
@@ -34,20 +36,21 @@ def probe(
     import anthropic  # deferred: optional dependency
 
     client = anthropic.Anthropic()
-    history: list[dict] = []
+    session = Session()
     rows: list[dict] = []
 
     for t in range(turns):
-        history.append({"role": "user", "text": f"Turn {t}. {_FILLER} Reply 'ok'."})
         if t == edit_at:
-            history[0]["text"] = "[EDITED] " + history[0]["text"]
+            session.edit(0, "[EDITED] " + session.messages[0]["content"])
+        # Everything the model sees is decoded from the server-verified state bytes.
+        state = session.turn("user", f"Turn {t}. {_FILLER} Reply 'ok'.")
+        history = Session.decode(state)
 
-        # Rebuild message list each turn: cache_control breakpoint only on the
-        # final block (max-4-breakpoint limit), earlier turns byte-stable.
+        # cache_control breakpoint only on the final block (max-4-breakpoint limit).
         messages = []
         for i, h in enumerate(history):
-            block: dict = {"type": "text", "text": h["text"]}
-            if i == len(history) - 1 and h["role"] == "user":
+            block: dict = {"type": "text", "text": h["content"]}
+            if i == len(history) - 1:
                 block["cache_control"] = {"type": "ephemeral"}
             messages.append({"role": h["role"], "content": [block]})
 
@@ -72,9 +75,11 @@ def probe(
                 "input_tokens": usage.input_tokens,
                 "cache_read_input_tokens": getattr(usage, "cache_read_input_tokens", None),
                 "cache_creation_input_tokens": getattr(usage, "cache_creation_input_tokens", None),
+                "wire_bytes": len(session.last_payload.wire_bytes()),
+                "state_bytes": len(state),
             }
         )
-        history.append({"role": "assistant", "text": final.content[0].text})
+        session.turn("assistant", final.content[0].text)
 
     return rows
 
