@@ -45,3 +45,5 @@ DESIGN.md         founding design doc (0001)
 ## Design invariants
 
 Determinism first: identical logical state must always serialize to identical bytes, so state can be referenced by hash instead of resent. Never trust reconstruction: every resolved turn is verified against the declared target hash before it becomes the next baseline. Append-only history: serializing `history[:k]` is always a byte-prefix of serializing `history[:k+1]`, which is what makes provider prefix caching hit maximally in Phase 0. Efficiency must not change answers: correctness is always evaluated against full-context replay, which the deterministic ledger makes exact.
+
+@acrosley 2026-08-17

@@ -59,3 +59,5 @@ Marathon does not need a custom model to start. Phase 0 is pure systems work aga
 ## Success metrics
 
 Per-turn prefill tokens should approach O(|diff| + |input|) rather than O(|history|). TTFT should stay flat as session length grows. Correctness against full-context replay must remain within an agreed tolerance — efficiency that changes answers is a regression, not a win.
+
+@acrosley 2026-08-17

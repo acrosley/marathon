@@ -39,3 +39,5 @@ Content addressing and hash-chain verification shipped in Phase 0 by design — 
 ## North-star metrics
 
 Per-turn prefill tokens → O(|diff| + |input|). TTFT flat as session length grows. Correctness vs full-context replay within tolerance. Cost per turn flat as session length grows.
+
+@acrosley 2026-08-17

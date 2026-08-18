@@ -35,3 +35,5 @@ Idempotence: replaying a payload against the same baseline yields the same targe
 ## Future versions
 
 v1 candidates, in rough priority order: signed payloads (snapshot signatures over `target_hash`), compression of insert data (zstd) negotiated per session, chunked baselines for very large states (Merkle segmentation so partial invalidation doesn't rehash everything), and an explicit full-snapshot op for baseline recovery.
+
+@acrosley 2026-08-17
