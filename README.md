@@ -40,6 +40,8 @@ src/marathon/
   session.py      session runner: canonical bytes are the single path to the wire
   bench.py        offline full-resend vs delta benchmark
   live_probe.py   experimental TTFT / prompt-cache probe (Anthropic API)
+  local_probe.py  Phase 1 probe: self-hosted vLLM, modes none / prefix / blend (LMCache CacheBlend)
+scripts/          Phase 1 WSL2 environment: setup, LMCache source build + patches, probe runner
 tests/            full test suite incl. randomized diff round-trip properties
 docs/             plan and protocol spec
 DESIGN.md         founding design doc (0001)
