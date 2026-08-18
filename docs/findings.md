@@ -61,3 +61,89 @@ turn  ttft_s  input  cache_read  cache_creation  wire_bytes  state_bytes
 Takeaway: cache numbers are identical to the hand-built probe, so the earlier findings are a property of the library, not the harness. The contrast the project exists for is visible on turn 13: the provider throws away its cache and re-processes 5,968 tokens, while Marathon's own wire payload absorbs the same edit in 2,897 bytes (~+560 B over steady state) — the delta engine already knows how cheap the edit is; the serving side just can't use that yet. Also: `test_replay_gate.py` now proves in CI that delta-reconstructed state == full-context replay at every turn of a 60-turn session with mid-history edits.
 
 @acrosley 2026-08-18
+
+## 2026-08-18 — Phase 1 stack up: local prefix-cache baseline reproduces the Phase 0 collapse (Qwen3-14B-FP8, vLLM 0.27.1, RTX 5090)
+
+Command: `scripts/phase1_probe.sh --mode prefix --turns 24 --edit-at 20` (WSL2 Ubuntu 24.04, `~/marathon-venv`: torch 2.13.0+cu130, vLLM 0.27.1, LMCache 0.5.3, flashinfer-jit-cache 0.6.16.post3+cu130) · Model: `Qwen/Qwen3-14B-FP8` (15.3 GiB weights, ~10 GiB KV) · Cost: $0, electricity.
+
+Setup notes worth keeping: WSL2 has no UVA, so vLLM 0.27's v2 model runner fails ("UVA is not available") — `VLLM_USE_V2_MODEL_RUNNER=0`. No nvcc in WSL, so FlashInfer's sampler JIT fails — prebuilt `flashinfer-jit-cache` wheel from `flashinfer.ai/whl/cu130`. Model choice: Qwen3.8-27B-FP8 rejected (30.9 GB weights, no KV room; and it is a hybrid Gated-DeltaNet/attention model — 48 of 64 layers carry recurrent state with no per-token KV, so non-prefix KV reuse cannot apply to them). Same for Qwen3.5-4B (24/32 linear). Qwen3-14B is dense full-attention: every layer's KV is a candidate for reuse.
+
+`prefill_s` = wall time of a `max_tokens=1` generate on the offline engine (no network); `prefix_hit_tokens` from vLLM's own `vllm:prefix_cache_hits` counter, per turn.
+
+```
+turn  prefill_s  prompt_tokens  prefix_hit  wire_bytes  state_bytes
+ 17     0.104        10825        10208        3361        54422
+ 18     0.113        11426        10816        3361        57448
+ 19     0.117        12027        11408        3361        60474
+ 20     1.285        12632            0        4524        63509   <- edit turn 0: full collapse
+ 21     0.122        13233        12624        3396        66535   <- rebuilt
+ 22     0.122        13834        13216        3396        69561
+ 23     0.125        14435        13824        3396        72587
+```
+
+Takeaway: the provider-side finding is now reproduced on hardware we own, quietly (no network noise: steady-state prefill climbs 0.06 → 0.13 s over 14k tokens; the edit turn is 1.285 s, ~11× the neighbours, with prefix hits at zero), while Marathon's wire payload absorbs the same edit in +1.2 KB. This is the Phase 1 baseline that non-prefix KV reuse (LMCache CacheBlend, `--mode blend`) has to beat on turn 20. Blend mode: engine starts and the blender builds once vLLM's model is registered with LMCache's tracker (`scripts/patch_vllm_blend.py`), but the first store fails in LMCache's pure-torch KV transfer fallback (its compiled `c_ops` doesn't bind against this stack) — being worked.
+
+@acrosley 2026-08-18
+
+## 2026-08-18 — CacheBlend runs end to end, but on LMCache's pure-torch fallback it is slower than no caching
+
+Commands: `scripts/phase1_probe.sh --mode blend --turns 24 --edit-at 20` and `--mode none --turns 24 --edit-at 20` · same stack/model as above · Cost: $0.
+
+Two bugs had to be fixed to get blend past turn 0. (1) The PyPI `lmcache==0.5.3` wheel's compiled `c_ops` extension is ABI-incompatible with torch 2.13 (`undefined symbol: c10::impl::cow::materialize_cow_storage`); LMCache silently falls back to a pure-torch KV transfer whose `single_layer_kv_transfer` has no branch for vLLM 0.27's fused KV layout `[num_blocks, num_kv_heads, block_size, 2*head_size]` → `IndexError`. `scripts/patch_lmcache_fused_kv.py` adds that branch. (2) LMCache strips whitespace from `blend_special_str` and takes `encode(...)[1:]`, so the probe's separator (`encode(" # # ")` = 3 tokens) produced two adjacent split points → a zero-length chunk → `ZeroDivisionError` in the pinned allocator; the probe now derives the separator exactly the way LMCache does. Reuse is real once running: the log shows e.g. `Retrieved 9526 out of 9558 tokens` per turn.
+
+```
+turn  prompt_tokens   none_s   blend_s   prefix_s (from previous entry)
+ 17      10753        1.127     1.169     0.104
+ 18      11350        1.184     3.307     0.113
+ 19      11947        1.367     1.258     0.117
+ 20      12548        1.265     1.364     1.285   <- edit turn 0
+ 21      13145        1.425     1.647     0.122
+ 22      13742        1.538     1.686     0.122
+ 23      14339        1.692     1.824     0.125
+```
+
+Takeaway: `none` gives the honest no-cache curve — prefill grows linearly, ~1.3 s at 12.5k tokens, so the prefix-mode edit turn (1.285 s) is exactly "recompute everything". Blend on the torch fallback is no better than that and spikes (3.3 s at turn 18): every layer's KV moves through Python-level gathers to a 20 GB pinned CPU buffer, and the retrieve cost swamps the recompute it saves. Nothing can be concluded about CacheBlend itself from these numbers; the measurement needs the native `c_ops` kernels, which means building LMCache against torch 2.13 (no wheel exists) — needs nvcc, which WSL doesn't have and we have no root for. Being worked (conda/pip-provided CUDA 13.0 toolkit, source build).
+
+@acrosley 2026-08-18
+
+## 2026-08-18 — LMCache built from source against torch 2.13 in 53 s (no root: nvcc ships inside torch's cu13 wheels); blend still bottlenecked on one op
+
+Command: `scripts/phase1_build_lmcache.sh` then `scripts/phase1_probe.sh --mode blend --turns 24 --edit-at 20` · Cost: $0.
+
+No `lmcache` wheel exists for torch 2.13, and WSL has no nvcc and no root for apt — but torch 2.13's cu13 wheels bundle a complete nvcc (13.3.73) under `site-packages/nvidia/cu13/{bin,include,lib}`. `phase1_build_lmcache.sh` symlinks a `~/cuda-home` tree from it (nvcc 13.3 with 13.0 cudart headers trips CCCL's compatibility check → `NVCC_PREPEND_FLAGS=-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK`), builds LMCache v0.5.3 from source with `TORCH_CUDA_ARCH_LIST=12.0` in 53 s, and re-applies the venv patches. `c_ops` now binds (no "compiled extension not found" in the log). Except: LMCache's native `single_layer_kv_transfer` — the per-layer op the layerwise CacheBlend path calls — has no branch for vLLM 0.27's fused KV layout either (its `switch` covers formats 0,1,2,3,6,7; the fused 10–13 exist only in the multi-layer kernels), so that one op is unbound back to the patched torch fallback.
+
+```
+turn  prompt_tokens  blend_s(native except 1 op)  blend_s(all torch)  none_s  prefix_s
+ 17      10753          1.081                       1.169              1.127   0.104
+ 18      11350          1.113                       3.307              1.184   0.113
+ 19      11947          1.282                       1.258              1.367   0.117
+ 20      12548          1.329                       1.364              1.265   1.285   <- edit turn 0
+ 21      13145          1.354                       1.647              1.425   0.122
+ 22      13742          1.515                       1.686              1.538   0.122
+ 23      14339          1.619                       1.824              1.692   0.125
+```
+
+Takeaway: the spikes are gone and blend is a touch faster than the all-torch run, but the curve is still the linear "recompute everything" line — no edit-turn spike, but no reuse win either, even though LMCache retrieves ~99.7% of tokens every turn (`Retrieved 12505 out of 12547`). The per-layer KV move is still Python. The one thing between this stack and a real CacheBlend number is ~30 lines of CUDA adding the fused branch to `csrc/mem_kernels.cu::single_layer_kv_transfer` (worth upstreaming). Being worked.
+
+@acrosley 2026-08-18
+
+## 2026-08-18 — Fully native CacheBlend ties full recompute; the cost is LMCache's Python layerwise recompute, not KV transfer
+
+Command: `scripts/phase1_build_lmcache.sh` (now applies `scripts/lmcache_fused_single_layer.patch` — 38-line CUDA change adding vLLM 0.27's fused KV formats 12/13 to `single_layer_kv_transfer`; unit-checked bit-exact against a manual gather, HND+NHD, both directions) then `scripts/phase1_probe.sh --mode blend --turns 24 --edit-at 20` · Cost: $0.
+
+```
+turn  prompt_tokens  blend_s(native)  none_s  prefix_s
+ 17      10753          0.757          1.127   0.104
+ 18      11350          0.795          1.184   0.113
+ 19      11947          0.845          1.367   0.117
+ 20      12548          1.260          1.265   1.285   <- edit turn 0
+ 21      13145          0.981          1.425   0.122
+ 22      13742          1.301          1.538   0.122
+ 23      14339          1.530          1.692   0.125
+```
+
+LMCache retrieves ~99.7% of tokens every turn (`Retrieved 12505 out of 12547`, vLLM: "External prefix cache hit rate 90.9%") and recomputes a fixed 15% (`blend_recompute_ratios=[0.15]`; the edit changes *which* tokens, not how many). Where an 11.3k-token turn's 0.977 s goes (DEBUG per-layer timestamps): `LMCBlender.blend` 804 ms (82%) — layer 0 over all tokens 174 ms, check layer 34 ms, layers 2–39 over the selected 15% 586 ms (~15 ms/layer) — plus ~170 ms of vLLM prefill for the ~600 uncached tokens and sampling. The KV move itself, measured directly at turn-20 scale (2.06 GB, 40 layers, pinned CPU): 77 ms total, 26.7 GB/s — memcpy speed. So transfer is ~2 ms of the 15 ms per layer; ~90% of blend time is LMCache's own eager Python Qwen3 recompute path at ~9 µs/token/layer vs ~2.5 µs for vLLM's prefill — 3.6× less efficient per token than the prefill it replaces. 0.15 × 3.6 ≈ 0.55, plus two full-length passes and the vLLM tail, lands blend on the recompute-everything line.
+
+Takeaway: on the edit turn CacheBlend-as-shipped is a tie with full recompute (1.260 vs 1.265 s) and it is 7× worse than prefix caching on every unchanged turn (prefix caching is off in blend mode). The idea isn't refuted — with 15% recomputed at vLLM's efficiency the edit turn would be ~0.25 s, a ~5× win — but LMCache 0.5.3's implementation of it can't deliver that on this stack. Phase 1 exit criterion (TTFT win on mid-edit sessions) is NOT met by this route yet. Options, cheapest first: lower `blend_recompute_ratios` (0.05, 0.02) and check output parity against full recompute; blend + vLLM prefix caching on together so unchanged turns keep the 0.12 s path and blend only pays on edits; a late/realistic edit position where prefix caching gets partial hits; or bypass LMCache's recompute path and do the position-shifted KV reuse Marathon's design actually calls for (DESIGN.md "positional entanglement") — the delta engine already knows exactly which byte ranges changed.
+
+@acrosley 2026-08-18

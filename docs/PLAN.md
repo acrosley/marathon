@@ -1,10 +1,10 @@
 # Marathon — Execution Plan
 
-**Status:** Phase 0 exit criteria met; Phase 1 next · **Updated:** 2026-08-18 · **Companion:** [DESIGN.md](../DESIGN.md) (doc 0001), [protocol.md](protocol.md), [findings.md](findings.md)
+**Status:** Phase 1 in progress (stack up, baseline measured, CacheBlend running on fallback kernels) · **Updated:** 2026-08-18 · **Companion:** [DESIGN.md](../DESIGN.md) (doc 0001), [protocol.md](protocol.md), [findings.md](findings.md)
 
 This plan sequences the delta-encoded context architecture from pure systems work (buildable today against existing APIs) toward the research bet (training the trust contract). Each phase has explicit exit criteria; a phase is not done until its metrics are collected and its correctness gate passes.
 
-## Phase 0 — Deterministic core and prefix-cache maximization *(current)*
+## Phase 0 — Deterministic core and prefix-cache maximization *(done)*
 
 Build the ledger, diff engine, and turn protocol; use them to canonicalize state so unchanged history always serializes byte-identically and append-only, making provider prefix caching hit maximally. No custom model, no self-hosted inference.
 
@@ -14,7 +14,9 @@ Done 2026-08-18: live probe run against the Anthropic API (cache-read = full his
 
 **Exit criteria (met 2026-08-18):** wire bytes per turn ~O(|diff| + |input|) in the offline bench; live probe shows cache-read tokens ≈ total history tokens on unchanged-prefix turns; correctness replay gate green in CI.
 
-## Phase 1 — Self-hosted inference and warm-tier KV reuse
+## Phase 1 — Self-hosted inference and warm-tier KV reuse *(current)*
+
+Started 2026-08-18. Stack: WSL2 Ubuntu on the RTX 5090, `~/marathon-venv` with torch 2.13+cu130, vLLM 0.27.1, LMCache 0.5.3, model `Qwen/Qwen3-14B-FP8` (dense full-attention on purpose — hybrid Gated-DeltaNet models like Qwen3.5/3.8 carry recurrent state with no per-token KV on most layers, so non-prefix KV reuse can't be shown on them; that degradation is a Phase 1.5 question). Reproducible via `scripts/phase1_setup.sh`; probes via `scripts/phase1_probe.sh` → `marathon.local_probe` with modes `none` / `prefix` / `blend`. Local prefix-cache baseline measured (edit-turn collapse: 0.12 s → 1.29 s prefill), CacheBlend runs end to end but only on LMCache's slow torch fallback until `c_ops` is built against torch 2.13 — see [findings.md](findings.md).
 
 Stand up vLLM with LMCache to move beyond the prefix restriction: store KV for reused text segments regardless of position and recombine with selective recomputation (CacheBlend-style blending). The delta wire format from Phase 0 becomes the input that decides which KV segments are reusable.
 
