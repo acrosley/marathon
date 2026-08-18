@@ -4,7 +4,7 @@
 
 Today's LLM interaction model retransmits and re-processes the entire conversation history every turn, even though almost all of it is byte-identical to the previous turn. Marathon replaces that with a deterministic state ledger: a trusted, content-addressed baseline of everything unchanged, carried as reusable state, with only a byte-matched diff plus the new input crossing the wire. In active-inference terms, the model ingests only prediction error — compute scales with surprise.
 
-The founding concept is in [DESIGN.md](DESIGN.md) (doc 0001). The phased roadmap and current status live in [docs/PLAN.md](docs/PLAN.md). The wire format is specified in [docs/protocol.md](docs/protocol.md).
+The founding concept is in [DESIGN.md](DESIGN.md) (doc 0001). The phased roadmap and current status live in [docs/PLAN.md](docs/PLAN.md); measured results are logged in [docs/findings.md](docs/findings.md). The wire format is specified in [docs/protocol.md](docs/protocol.md).
 
 ## Status
 

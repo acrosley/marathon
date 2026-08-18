@@ -26,7 +26,11 @@ _FILLER = (
 _SYSTEM = "You are a latency probe. Reply to every message with the single word: ok"
 
 
-def probe(turns: int = 6, model: str = "claude-3-5-haiku-latest") -> list[dict]:
+def probe(
+    turns: int = 6, model: str = "claude-haiku-4-5", edit_at: int | None = None
+) -> list[dict]:
+    """``edit_at=N``: at turn N, mutate the first user message in place — the
+    mid-session edit that invalidates naive prefix caching (Phase 1 motivation)."""
     import anthropic  # deferred: optional dependency
 
     client = anthropic.Anthropic()
@@ -35,6 +39,8 @@ def probe(turns: int = 6, model: str = "claude-3-5-haiku-latest") -> list[dict]:
 
     for t in range(turns):
         history.append({"role": "user", "text": f"Turn {t}. {_FILLER} Reply 'ok'."})
+        if t == edit_at:
+            history[0]["text"] = "[EDITED] " + history[0]["text"]
 
         # Rebuild message list each turn: cache_control breakpoint only on the
         # final block (max-4-breakpoint limit), earlier turns byte-stable.
@@ -76,9 +82,10 @@ def probe(turns: int = 6, model: str = "claude-3-5-haiku-latest") -> list[dict]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="marathon.live_probe", description=__doc__)
     parser.add_argument("--turns", type=int, default=6)
-    parser.add_argument("--model", type=str, default="claude-3-5-haiku-latest")
+    parser.add_argument("--model", type=str, default="claude-haiku-4-5")
+    parser.add_argument("--edit-at", type=int, default=None, help="mutate turn 0 at this turn")
     args = parser.parse_args(argv)
-    for row in probe(turns=args.turns, model=args.model):
+    for row in probe(turns=args.turns, model=args.model, edit_at=args.edit_at):
         print(row)
     return 0
 
