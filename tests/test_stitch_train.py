@@ -525,3 +525,151 @@ def test_checkpoint_callback_fires_on_schedule_and_at_the_end(tiny):
     for lora in loras:
         lora.lora_b.data.zero_()
         lora.lora_a.grad = lora.lora_b.grad = None
+
+
+# ------------------------------------------- iteration 3: standing bucket, memory, rule
+
+
+def test_standing_bucket_is_a_governing_instruction_flip_in_the_regime():
+    """The `dep-instruction` distribution fix: probe-shaped sessions, sized like the rest."""
+    from marathon.kvshift_eval import STANDING_KIND, build_standing_item
+
+    tok = ByteTokenizer()
+
+    def count(text):
+        return len(tok.encode(text))
+
+    placements = set()
+    for sid in range(4):
+        item = build_standing_item(
+            sid, None, seed=9001, min_tokens=600, max_tokens=900, count_tokens=count
+        )
+        assert item.edit_kind == STANDING_KIND
+        old = item.session.messages[item.msg_index]["content"]
+        # a single-span edit that flips the standing instruction and nothing else
+        assert old != item.new_content
+        assert item.msg_index == 0
+        instr_a, instr_b = item.meta["instruction"].split(" -> ")
+        assert instr_a in old and instr_b not in old
+        assert instr_b in item.new_content and instr_a not in item.new_content
+        # the instruction governs a *later* answer, so there must be history after it
+        assert len(item.session.messages) > 4
+        # open-ended questions, no forced prefix -- the edit changes the answer's form
+        assert item.queries and all(forced == "" for _, _, _, forced in item.queries)
+        placements.add(item.meta["placement"])
+        # the governing flag is what reuse_plan keys on
+        flagged = [m for m in item.session.messages if m.get("governing")]
+        assert flagged, item.meta
+    assert placements == {"system", "early-user"}
+
+
+def test_standing_items_join_the_population_and_get_their_own_bucket():
+    from marathon.kvshift_eval import SNAPSHOT, STANDING_KIND, load_corpus
+    from marathon.stitch_train import is_governing
+
+    tok, corpus = ByteTokenizer(), load_corpus(SNAPSHOT)
+    kw = dict(min_tokens=600, max_tokens=900, corpus=corpus, gov_frac=1.0)
+    plain = build_examples(tok, "cpu", 10, seed=7001, **kw)
+    # standing_frac=0 must leave the RNG stream exactly as it was, so every population
+    # built before this argument existed still reproduces item for item
+    assert [e.edit_kind for e in plain] == [
+        e.edit_kind for e in build_examples(tok, "cpu", 10, seed=7001, standing_frac=0.0, **kw)
+    ]
+    mixed = build_examples(tok, "cpu", 10, seed=7001, standing_frac=1.0, **kw)
+    assert all(e.edit_kind == STANDING_KIND for e in mixed)
+    assert all(is_governing(e) for e in mixed)  # it *is* a governing edit
+
+    # ... and the report keeps it beside the core bucket rather than folded into it
+    def row(kind, gov, base, tuned):
+        return dict(
+            sid=0,
+            edit_kind=kind,
+            family="f",
+            qtype="obey",
+            governing=gov,
+            base_stitch_kl=base,
+            tuned_stitch_kl=tuned,
+            tuned_clean_kl=0.001,
+            ref_answer_ok=None,
+            base_answer_ok=None,
+            tuned_answer_ok=None,
+        )
+
+    text = report(
+        [
+            row("governing", True, 0.04, 0.02),
+            row(STANDING_KIND, True, 0.06, 0.03),
+            row("fact", False, 0.005, 0.006),
+        ]
+    )
+    assert "standing-gov" in text and "governing+std" in text
+    assert "+std governing/non-governing" in text
+    # the core ratio must not have absorbed the new bucket: 0.04/0.005 = 8x
+    assert "governing/non-governing mean KL ratio = 8.00x" in text
+
+
+def test_memory_estimate_scales_with_tokens_and_the_grad_path(tiny):
+    from marathon.stitch_train import kv_bytes_per_token, stitch_memory_estimate
+
+    model, _ = tiny
+    # 2 layers x 2 kv heads x 8 head_dim x 4 bytes (fp32) x 2 (K and V)
+    assert kv_bytes_per_token(model) == 2 * 2 * 2 * 8 * 4
+    cheap = stitch_memory_estimate(model, 8000, False)
+    rich = stitch_memory_estimate(model, 8000, True)
+    assert rich["cache_bytes"] > cheap["cache_bytes"]
+    assert rich["cache_bytes"] == kv_bytes_per_token(model) * 8000 * rich["copies"]
+    # linear in context length: this is what makes an 8k cap decidable before a run
+    assert stitch_memory_estimate(model, 16000, True)["cache_bytes"] == 2 * rich["cache_bytes"]
+
+
+def test_grad_prefill_falls_back_on_oom_rather_than_killing_the_run(tiny, monkeypatch):
+    """A cap is a prediction; OOM is the measurement. One item must not lose the run."""
+    import marathon.stitch_train as st
+
+    model, loras = tiny
+    ex = _example()
+    calls = []
+    real = st.stitched_logits
+
+    def flaky(model_, ex_, old_kv, forced, grad_prefill=False):
+        calls.append(grad_prefill)
+        if grad_prefill:
+            raise torch.OutOfMemoryError("CUDA out of memory")
+        return real(model_, ex_, old_kv, forced, grad_prefill)
+
+    monkeypatch.setattr(st, "stitched_logits", flaky)
+    parts = st.example_losses(
+        model, loras, ex, 3, anchor=False, grad_prefill=True, grad_prefill_max_tokens=0
+    )
+    assert calls == [True, False]  # tried the expressive path, then fell back
+    assert parts["grad_prefill"] is False and parts["grad_prefill_oom"] is True
+    assert float(parts["stitch_kl"].detach()) >= 0.0
+    # an OOM on the *cheap* path is not recoverable and must propagate
+    monkeypatch.setattr(
+        st,
+        "stitched_logits",
+        lambda *a, **k: (_ for _ in ()).throw(torch.OutOfMemoryError("boom")),
+    )
+    with pytest.raises(torch.OutOfMemoryError):
+        st.example_losses(model, loras, ex, 3, anchor=False, grad_prefill=False)
+
+
+def test_select_checkpoint_follows_the_pre_registered_rule():
+    from marathon.stitch_train import select_checkpoint
+
+    def ck(step, p95, non_med, clean, base_med=0.0020):
+        return dict(
+            step=step, gov_p95=p95, non_tuned_median=non_med, non_base_median=base_med, clean=clean
+        )
+
+    history = [
+        ck(50, 0.030, 0.0021, 0.0015),  # feasible
+        ck(100, 0.012, 0.0022, 0.0018),  # feasible and the best tail  (0.0022 <= 0.0024)
+        ck(150, 0.008, 0.0030, 0.0018),  # best tail but non-gov median blows the 1.2x bar
+        ck(200, 0.009, 0.0021, 0.0031),  # best-ish tail but clean drift over 0.002
+    ]
+    assert select_checkpoint(history)["step"] == 100
+    # the rule is allowed to select nothing, and that is a result rather than an error
+    assert select_checkpoint([ck(50, 0.01, 0.9, 0.9)]) is None
+    # a run with no mid-eval rows has nothing to select from
+    assert select_checkpoint([{"step": 50}]) is None

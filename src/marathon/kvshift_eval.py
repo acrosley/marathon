@@ -160,6 +160,39 @@ _INSTRUCTIONS = [
     ("always answer in a single sentence", "always answer as exactly three bullet points"),
 ]
 
+#: The ``standing-governing`` bucket's pool: the same instruction flips, paired with a
+#: substring a *compliant* post-edit reply must contain where one is checkable inside
+#: ``--gen-tokens`` tokens. Only the prefix flip is graded — a trailing ``<<STOP>>`` marker
+#: may fall outside a 32-token window, and "in German" / "ALL CAPITALS" are not substring
+#: tests — so the rest score on KL alone, exactly like the existing ``obey`` query.
+_STANDING_INSTRUCTIONS = [
+    (
+        "always write your replies in French",
+        "always write your replies in German",
+        None,
+    ),
+    (
+        "always write your replies in all lowercase",
+        "always write your replies in ALL CAPITALS",
+        None,
+    ),
+    (
+        "always end every reply with the exact marker <<END>>",
+        "always end every reply with the exact marker <<STOP>>",
+        None,
+    ),
+    (
+        "always begin every reply with the exact prefix 'REPORT:'",
+        "always begin every reply with the exact prefix 'SUMMARY:'",
+        ["SUMMARY:"],
+    ),
+]
+
+#: A governing edit kind that is *not* in :data:`EDIT_KINDS` on purpose — adding it there
+#: would change the Phase 1 distribution eval's population, which cycles the list by ``sid``.
+#: It is built by :func:`build_standing_item` and reported as its own bucket.
+STANDING_KIND = "standing-governing"
+
 
 # ------------------------------------------------------------------- sessions
 
@@ -220,6 +253,8 @@ _PER_TURN_OVERHEAD = 60
 # with delta held near 0 in all four, so only position and the governing flag vary.
 EDIT_KINDS = ["fact", "rewrite", "insert", "delete", "governing", "early-fact", "mid-governing"]
 FAMILIES = ["code", "prose", "qa"]
+#: Every kind :func:`build_item` accepts, including the ones outside the Phase 1 population.
+ALL_EDIT_KINDS = [*EDIT_KINDS, STANDING_KIND]
 
 
 def build_item(
@@ -244,6 +279,8 @@ def build_item(
     short table lines, which is how the first 8B run produced a 10.9k-token session
     against an 8k ceiling. The default is a crude estimate, for CPU tests only.
     """
+    if edit_kind == STANDING_KIND:
+        return build_standing_item(sid, corpus, seed, min_tokens, max_tokens, count_tokens)
     count = count_tokens or (lambda s: len(s) // 3)
     rng = random.Random((seed * 1_000_003) ^ (sid * 7919) ^ (EDIT_KINDS.index(edit_kind) * 31))
     instr_a, instr_b = _INSTRUCTIONS[rng.randrange(len(_INSTRUCTIONS))]
@@ -317,6 +354,90 @@ def build_item(
         ),
     }
     item.queries = _queries(rng, facts, family, edit_kind)
+    return item
+
+
+def build_standing_item(
+    sid: int,
+    corpus: dict | None = None,
+    seed: int = 0,
+    min_tokens: int = 4000,
+    max_tokens: int = 8000,
+    count_tokens=None,
+) -> Item:
+    """A `kvshift_probe`-shaped standing-instruction session, sized to the eval regime.
+
+    Iteration 2 (findings.md 2026-08-19) trained at 4-6k on :func:`build_item` sessions and
+    then measured the adapter on `kvshift_probe`'s `dep-instruction` scenario, where it got
+    *worse* in both arms. The diagnosis was a distribution gap rather than a failure of the
+    method: the probe is a homogeneous log of `Log entry t.` turns with the standing
+    instruction in an early **user** turn and open-ended questions whose *answer format*
+    the instruction governs, while training saw repo code/prose/table bodies with the
+    instruction in the system prompt (``governing``) or a mid-history turn
+    (``mid-governing``) and mostly planted-fact questions.
+
+    This bucket closes that gap by construction: same filler generator as the probe
+    (:func:`marathon.kvshift_probe._paragraph`), same question shape, and the instruction
+    placed in the system prompt on even ``sid`` and in an early governing user turn on odd
+    ``sid`` — both placements the failure class covers. The one thing it does *not* copy is
+    the probe's fixed 20 turns: length is sized by ``count_tokens`` to ``[min_tokens,
+    max_tokens]`` so the bucket lives in the same regime as everything else in the run, and
+    the probe metric becomes comparable to training rather than off-distribution.
+
+    ``corpus`` is unused (the filler is generated, not sampled) and accepted only so this
+    is a drop-in for :func:`build_item`.
+    """
+    from .kvshift_probe import _paragraph
+
+    count = count_tokens or (lambda s: len(s) // 3)
+    rng = random.Random((seed * 1_000_003) ^ (sid * 7919) ^ (len(EDIT_KINDS) * 31))
+    instr_a, instr_b, expected = _STANDING_INSTRUCTIONS[rng.randrange(len(_STANDING_INSTRUCTIONS))]
+    standing = (
+        f"Standing instruction for this entire session: {instr_a}, "
+        "whatever the language or form of the question."
+    )
+    in_system = sid % 2 == 0
+
+    session = Session()
+    if in_system:
+        session.turn(
+            "system",
+            "You are a meticulous project assistant reading a long working log. " + standing,
+        )
+
+    target = rng.randint(min_tokens, max_tokens)
+    used = count(standing) + _PER_TURN_OVERHEAD
+    entries: list[str] = []
+    # the same floor :func:`build_item` uses: a standing instruction is only testable if a
+    # meaningful suffix was written while it was in context and then goes stale
+    while (used < target or len(entries) < 6) and len(entries) < 60:
+        t = len(entries)
+        extra = "" if (t or in_system) else f" {standing}"
+        text = f"Log entry {t}.{extra} {_paragraph(t, 6)}"
+        entries.append(text)
+        used += count(text) + _PER_TURN_OVERHEAD
+    for t, text in enumerate(entries):
+        # the instruction-bearing user turn is flagged governing, which is what
+        # ``reuse_plan`` keys on and what makes this a governing edit end to end
+        session.turn("user", text, governing=(True if t == 0 and not in_system else None))
+        session.turn("assistant", f"Noted entry {t}.")
+
+    # message 0 either way: the system prompt when there is one, else the first user turn
+    old = session.messages[0]["content"]
+    assert instr_a in old  # pragma: no cover - the instruction is written in above
+    item = Item(sid, "standing", STANDING_KIND, session, 0, old.replace(instr_a, instr_b))
+    item.meta = {
+        "n_turns": len(entries),
+        "edit_turn": 0,
+        "instruction": f"{instr_a} -> {instr_b}",
+        "placement": "system" if in_system else "early-user",
+    }
+    # open-ended questions with no forced prefix, like the probe's ``lang-*`` pair: what the
+    # edit changes is the *form* of the answer, so a forced prefix would mask the effect
+    item.queries = [
+        ("obey-standing", expected, "Describe the state of this project in one sentence.", ""),
+        ("obey-recent", expected, "What changed most recently in the log above?", ""),
+    ]
     return item
 
 
