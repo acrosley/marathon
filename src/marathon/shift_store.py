@@ -320,3 +320,27 @@ def plan_save(
     if not store.reserve(session, lo, hi - lo):
         return None
     return lo, hi
+
+
+def churn_tokens(loads: list[dict]) -> tuple[int, int]:
+    """``(changed_before_span, span_len)`` for one turn's reuse plan.
+
+    The turn-counting ceiling (``max_stale``) treats every reused edit turn as equally
+    stale, which it is not: what actually degrades reused KV is how much of the context
+    it *attended to* has since been replaced. This measures that directly.
+
+    ``span_len`` is the reused span — the tokens whose KV is being carried over.
+    ``changed_before_span`` is the tokens lying before the deepest reused segment that
+    this plan does *not* reuse, i.e. exactly the text that was rewritten in front of it.
+    On a paged turn that is the demoted message minus the stub that replaced it; on an
+    append-only turn it is 0, which is why an append-only turn cannot make anything
+    staler. Accumulate it across consecutive reused turns and divide by ``span_len`` to
+    get the churn fraction the reused KV is carrying (see ``MarathonServer.max_churn``).
+    """
+    if not loads:
+        return 0, 0
+    spans = sorted((int(d["dst_start"]), int(d["dst_end"])) for d in loads)
+    span_len = sum(hi - lo for lo, hi in spans)
+    deepest = spans[-1][0]
+    reused_before = sum(min(hi, deepest) - lo for lo, hi in spans if lo < deepest)
+    return max(0, deepest - reused_before), span_len

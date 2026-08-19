@@ -53,6 +53,7 @@ from .cold import ColdTier, TransformerEmbedder
 from .protocol import BaselineStore, ProtocolError, TurnPayload, resolve_turn
 from .reuse_plan import _lines
 from .session import Session
+from .shift_store import churn_tokens
 
 DEFAULT_MAX_TOKENS = 64
 #: chat-template markup a message carries beyond its content, for the paging budget
@@ -199,6 +200,7 @@ class MarathonServer:
         repair_first: int | None = None,
         reuse: bool = True,
         max_stale: int = 1,
+        max_churn: float | None = None,
         active_window: int | None = None,
         cold_kwargs: dict | None = None,
     ) -> None:
@@ -223,12 +225,21 @@ class MarathonServer:
         # isolated edits separated by ordinary turns are still served entirely from
         # reused KV.
         self.max_stale = max_stale
+        # The churn alternative to `max_stale`. Counting *turns* treats every reused edit
+        # turn as equally damaging, which it is not: what degrades reused KV is how much
+        # of the context it attended to has since been rewritten. When set, the ceiling
+        # is instead the accumulated fraction (tokens changed in front of the reused span
+        # since its last refresh) / (span length), and `max_stale` is not consulted. A
+        # benign repeated edit that barely disturbs the span's prefix can then keep
+        # reusing, where the turn counter would have forced a recompute.
+        self.max_churn = max_churn
         self.store = BaselineStore()
         self._lock = threading.Lock()
         # per session: previous *active* state and line -> ids cache
         self._prev: dict[str, bytes] = {}
         self._cache: dict[str, dict[bytes, list[int]]] = {}
         self._stale: dict[str, int] = {}
+        self._churn: dict[str, int] = {}  # tokens changed in front of the span, since refresh
         # cold tier (Phase 2): None keeps the full history in the active window
         self.active_window = active_window
         self.cold_kwargs = cold_kwargs or {}
@@ -312,7 +323,13 @@ class MarathonServer:
             plan = self.plan_for(session_id, state, pieces)
             loads = plan.to_kv_transfer_params() if plan else []
             stale = self._stale.get(session_id, 0)
-            refreshed = bool(loads) and stale >= self.max_stale
+            changed, span_len = churn_tokens(loads)
+            churn = self._churn.get(session_id, 0) + changed
+            churn_frac = churn / span_len if span_len else 0.0
+            if self.max_churn is not None:
+                refreshed = bool(loads) and churn_frac > self.max_churn
+            else:
+                refreshed = bool(loads) and stale >= self.max_stale
             if refreshed:
                 loads = []  # spend one honest recompute to reset the staleness clock
             phases = reuse_plan.phases(loads, self.engine.block_size, len(ids))
@@ -335,7 +352,13 @@ class MarathonServer:
                 reply = self.engine.generate(ids, session_id, self.max_tokens, save=self.reuse)
             prefill_s = time.perf_counter() - start
 
-            self._stale[session_id] = stale + 1 if loads else 0
+            if generate:
+                # A non-generating replay turn saves no KV and reuses none, so it can
+                # neither ratchet the staleness clock nor reset it. Advancing it here
+                # would make a replayed history force spurious refreshes on the real
+                # turns that follow (flagged by Track L, 2026-08-19).
+                self._stale[session_id] = stale + 1 if loads else 0
+                self._churn[session_id] = churn if loads else 0
             self._prev[session_id] = state
             return {
                 "reply": reply,
@@ -348,7 +371,8 @@ class MarathonServer:
                 "policy": plan.policy if plan else "first",
                 "reason": plan.reason if plan else "first turn of the session",
                 "phases": max(len(phases), 1),
-                "stale": self._stale[session_id],
+                "stale": self._stale.get(session_id, 0),
+                "churn": round(churn_frac, 4),
                 "refreshed": refreshed,
                 "wire_bytes": wire_bytes,
                 "state_bytes": len(state),
@@ -421,6 +445,13 @@ def main(argv: list[str] | None = None) -> int:
         "the KV (an append-only turn resets the count)",
     )
     p.add_argument(
+        "--max-churn",
+        type=float,
+        default=None,
+        help="churn ceiling instead of --max-stale: refresh once the tokens rewritten "
+        "in front of the reused span exceed this fraction of the span (e.g. 0.2)",
+    )
+    p.add_argument(
         "--active-window",
         type=int,
         default=None,
@@ -446,6 +477,7 @@ def main(argv: list[str] | None = None) -> int:
         store_tokens=args.store_tokens,
         reuse=not args.no_reuse,
         max_stale=args.max_stale,
+        max_churn=args.max_churn,
         repair_first=args.repair_first,
         active_window=args.active_window,
         cold_kwargs={

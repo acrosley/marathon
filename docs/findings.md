@@ -1118,6 +1118,42 @@ Caveats: one seed pair, one epoch, 200 training items, one model, n=120 held out
 
 @acrosley 2026-08-19
 
+## 2026-08-19 — Re-measured through `cold.py`: reuse composes (2.6×), the *refresh* turn costs 48 s, and the churn ceiling buys the same accuracy for half the price
+
+Command: `python -m marathon.cold_eval --generate-history --turns 70 --active-window 8192 --threshold 0.2` with `--conditions` / `--max-stale` / `--max-churn` per row (`scripts/cold_eval.sh`) · Model: `Qwen/Qwen3-14B-FP8`, vLLM 0.27.1, retriever `all-MiniLM-L6-v2` on CPU · history p50 25.0k / max 35.0k tokens.
+
+The previous entry asked for exactly this: `max_stale` was validated on a synthetic per-turn front demotion (`server_demo.py --demote`), not on `cold.py` with its retriever, stubs and eviction. Re-measured on the real policy, with every history turn actually prefilled.
+
+**N, honestly.** Sessions are seeded and the corpus frozen, so a session id is byte-identically the same session in every condition. Collected: cold-recall N=10, cold-nostale N=4, cold-churn0.5 N=4, cold-stale1 N=3 (the GPU was needed by another track). **The table is the matched subset — sessions 0, 1, 2 — of all four**, 213 history turns each. Full-N runs agree to within small-sample noise (cold-recall em_all 0.817 at N=10 vs 0.889 here).
+
+| condition | connector | prefill p50 | prefill mean | reuse turn | refresh turn | refresh frac | active max | em_old | em_recent | em_all | promo recall |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| cold-recall | off | 0.648 | **0.537** | — | — | 0 | 8060 | 0.889 | 0.889 | **0.889** | 0.941 |
+| cold-nostale | on, unbounded | 0.192 | **0.173** | 0.207 | — | 0 | 8060 | 0.111 | 0.111 | **0.111** | 0.941 |
+| cold-stale1 | on, `max_stale=1` | 0.479 | **19.170** | 0.523 | 48.29 | 0.393 | 8060 | 0.333 | 0.556 | **0.444** | 0.941 |
+| cold-churn0.5 | on, `max_churn=0.5` | 0.290 | **8.520** | 0.405 | 36.92 | 0.224 | 8060 | 0.222 | 0.667 | **0.444** | 0.941 |
+
+**Reuse composes; the answer to "does Phase 2 meet Phase 1" is yes for the mechanism and no for the system.** Turns actually served from re-rotated KV cost **0.207 s** against the connector-off baseline's 0.537 s mean — a genuine **2.6×** — and the whole unbounded condition runs at 0.173 s mean, **3.1×** faster than prefix caching on the same paged workload. The k+1 phase driver is not a problem either: on the unbounded run, 6-phase turns average 0.242 s and 1-phase turns 0.061 s. Paging is unaffected by any of this — active-window max is 8060 in every row and promotion recall 0.941 in every row, because retrieval is deterministic and independent of the KV path.
+
+**What breaks it is the refresh turn, and it is a serving bug, not a policy cost.** A refresh sets `loads=[]`, so `phases` is empty and the turn takes the ordinary single-request `generate(..., save=self.reuse)` branch — the same prefill cold-recall does in 0.537 s, plus a connector save. It costs **48.3 s**. Clean isolation, identical config (1 session, 40 turns, cold-shift):
+
+```
+max_stale=999 (never refreshes)     16.7 s
+max_stale=1   (the default)        731.6 s      44x
+```
+
+Early append-only turns save in 0.081 s, so saving as such is cheap; it is specifically a save *after* a reused turn, and it runs at 114 W of 575 W — memory bound, i.e. the store is being rewritten rather than extended. The previous turn re-saved `save="full"` in its coordinates and the refresh then writes into coordinates that have shifted again. Same family as the latched full-save, on the refresh path rather than the decode loop.
+
+**The churn ceiling works, and is strictly better than counting turns.** `max_churn=0.5` scores **the same exact-match as `max_stale=1` (0.444) at 2.25× less mean prefill** (8.52 s vs 19.17 s), because it refreshes on 0.224 of turns instead of 0.393: it lets a run of edits that barely disturbs the reused span's prefix keep reusing, where the turn counter refreshes on a schedule regardless. `shift_store.churn_tokens` returns the tokens in front of the deepest reused segment that the plan does *not* reuse; the server accumulates that across consecutive reused turns and refreshes at `accumulated / span_len > max_churn`. CPU calibration over six sessions predicted the refresh fractions within noise (0.253 predicted vs 0.224 measured at 0.5; 0.500 vs 0.393 for `max_stale=1`). **On present evidence the churn ceiling should be preferred to the turn counter** — same accuracy, half the bill — though that is a comparison between two losing configurations, see below.
+
+**Quality tracks the refresh rate, and none of it reaches the baseline.** 0.111 unbounded → 0.444 at both bounded settings → 0.889 connector-off. Staleness damages this workload exactly as it did the synthetic one, but `max_stale=1` does *not* restore parity here the way it did there (1.000 against a control of 1.000). The difference is the shape: the synthetic demotes once per turn against a mostly-static prefix, while `cold.py` demotes 3.19 entries per turn and promotes up to 2 more, so one honest recompute every other reused turn cannot keep up with the drift. **There is currently no setting of either ceiling that is both as accurate as connector-off and faster than it**, and the honest summary is that the cold tier still serves best with the connector off.
+
+**A reuse-plan misclassification found and fixed on the way.** `moved` keyed on "this entry's index changed", which is true of every entry after a deleted one — so a cold-tier *eviction* (dropping a stub from the view is a pure, order-preserving line deletion) was classified as 14 relocated entries and reused nothing at all. The test is ordering, not index equality: read in destination order, the matched source indices are strictly increasing exactly when nothing was reordered. Fixed in `_segments` and in `plan()`'s `relocated` (which was additionally forcing `policy="repair"` on governing entries that had merely been pushed along); genuine reorders fall back to the old, stricter rule. Measured over four 70-turn paged sessions — at an 8192 window eviction never fires and the fix is worth nothing, but at 4096 the old rule discarded **43%** of the turns that can reuse, and at 2048, **84%**. It does not affect the table above; it is what makes tighter windows viable.
+
+**One interaction fixed.** `turn(..., generate=False)` advanced the staleness counter although such a turn saves and loads nothing, so a replayed history forced spurious refreshes on the real turns after it. Both the counter and the churn accumulator are now left untouched on a non-generating turn.
+
+**Limits.** N=3 matched (N=4 and N=10 per condition available and consistent). 17 of the 18 fact questions in the subset had their answer cold, so em is over 18 questions per condition and the 0.444-vs-0.444 equality is "not distinguishable at this N" rather than a measured tie — the *cost* difference between the two ceilings is the solid result. One model, one window (8192), one threshold pair (0.5, plus 0.2 from CPU calibration only — dropped from the GPU run because it refreshes *more* than `max_stale=1` and so is the expensive end of the curve). `max_churn` between 0.5 and unbounded is unmeasured, and that is where a cheaper safe point would be once the refresh bug stops dominating the bill.
+
 ## 2026-08-19 — The paged stall is store *allocation*, not the save path — and on the real cold tier the composition is still wrong at 0.5 exact-match
 
 Track N measured refresh turns at 41.5 s mean against reuse turns at 0.90 s and plain appends at 0.08 s, and hypothesised a per-step full re-gather in the post-reuse incremental save. That hypothesis is wrong, and the CPU harness says so cheaply.
