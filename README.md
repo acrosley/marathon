@@ -80,6 +80,7 @@ src/marathon/
   server.py       end-to-end server: verify payload -> plan reuse -> drive vLLM -> reply + metrics
   client.py       the other half: keeps the history, ships deltas, in-process or over HTTP
   kvshift_eval.py distribution-level quality eval (sessions x edit kinds x conditions)
+  stitch_train.py Phase 3: LoRA consistency fine-tuning against stitched caches (self-distillation to the full-recompute teacher)
 scripts/          Phase 1 WSL2 environment: setup, LMCache source build + patches, probe runner
 tests/            full test suite incl. randomized diff round-trip properties
 docs/             plan and protocol spec
