@@ -800,3 +800,56 @@ The second edit is as fast as the first was, and matches the previous entry's si
 **Limits.** Chunked prefill would make a `"full"` save re-gather a growing prefix on every step — correct but wasteful; chunked prefill interleaved with a load was already documented as untested and the server does not produce it. The re-save assumes the whole prompt is resident in the request's blocks, which is true for the phase driver's final request and not checked. Two runs per configuration, one length sweep point each. Everything else from the previous entry still stands: single GPU, no tensor parallelism, stdlib HTTP with a lock around a blocking engine.
 
 @acrosley 2026-08-19
+
+## 2026-08-19 — Phase 2 cold tier: the window goes flat, and recall-on-miss is the whole difference between 0.008 and 0.817
+
+Command: `python -m marathon.cold_eval --sessions 20 --turns 70 --active-window 8192 --threshold 0.2` (`scripts/cold_eval.sh`) · Model: `Qwen/Qwen3-14B-FP8` in vLLM 0.27.1, retriever `sentence-transformers/all-MiniLM-L6-v2` mean-pooled on CPU · 20 sessions × 70 turns, history p50 25.0k / min 18.5k / max 35.7k tokens, 6 facts planted per session from turn 2 to turn 65, 8 questions each (old / recent / distractor) = 480 questions.
+
+`marathon.cold` keeps the model-facing view under a token budget by demoting the oldest non-governing messages to a stub carrying the message's own content address, `[cold #12 3f9a1c04: <first ~12 words>]`. The full bytes stay in the ledger, so a demotion is a *shrink edit of the view* and a promotion a *grow edit* — the shape `reuse_plan` already handles. Recall-on-miss has two triggers: exact (the turn's delta touches a demoted message) and query (top-k≤2 chunk-embedding matches above a cosine threshold).
+
+All three conditions run with the shift connector **off**, on plain vLLM prefix caching, so they differ only in the paging. Conditions share one engine and one frozen corpus.
+
+**The three exit criteria.**
+
+| condition | active p50 | active max | em old | em recent | em all | promo recall | promo precision |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| full (reference) | 13078 | 35674 | 0.900 | 0.983 | **0.942** | — | — |
+| cold-norecall | 7647 | 8062 | 0.000 | 0.017 | **0.008** | 0.00 | — |
+| cold-recall | 7681 | 8075 | 0.850 | 0.783 | **0.817** | **0.912** | 0.291 |
+
+**1. Bounded window on unbounded sessions — met.** Median active tokens by turn index, over the 20 sessions:
+
+```
+condition        turn10   turn30   turn50   turn70      max
+full               3755    11203    18352    25691    35674
+cold-norecall      3755     7830     7713     7640     8062
+cold-recall        3755     7916     7760     7655     8075
+```
+
+The reference grows linearly and the paged conditions are *flat from turn 30 on* — 7916 → 7655 as the history doubles, never exceeding the 8192 budget by more than one message (8075). At the end of a session 121 messages are cold, at 3.19 demotions per turn. Flatness needs one thing beyond stubs: a stub is ~20× smaller than the message it replaces, but 20× smaller is still O(n), so once nothing is left to demote the oldest stubs are **evicted** from the view entirely. Nothing is lost — the bytes are in the ledger and the retriever searches every demoted message, evicted or not — but this is the step that makes the window bounded rather than merely smaller, and CPU tests assert it directly over 120-turn synthetic sessions at four budgets.
+
+**2. Recall-on-miss restores demoted content — met.** 102 of the 120 fact questions had their answer in a message that was cold when the question arrived. The query trigger promoted the right message for **91.2%** of them, and that is the whole difference in the table: the same paging policy scores 0.008 without recall and 0.817 with it. Stubs alone are worthless for answering — which is the honest reading of `cold-norecall`, and the reason the design doc calls a wrong demotion a silent degradation of ground truth.
+
+Retrieval had to be scored per *chunk*, not per message. Pooling one vector over a 400–700 token turn averages away the single sentence that answers the question, and MiniLM truncates at 512 tokens anyway, so a fact late in a long turn is invisible: whole-message pooling recalled the right message **39%** of the time on this same question set. Scoring a message by its best 60-word overlapping window took it to 91%. Precision is 0.291 against a ceiling of 0.5 — `top_k=2` fires two promotions per question and only one can be the target — so the wasted promotion is a deliberate cost, not a miss.
+
+**3. Quality delta vs full-context replay — partially met, and I am not going to call it a pass.** 0.817 vs 0.942 is **−12.5 points**, recovering 87% of the reference. That is a large improvement over the naive baseline and still a real regression against full context; "efficiency that changes answers is a regression" is the rule, and a 12.5-point drop is not within any tolerance worth the name. Where it goes: 8.8% of fact questions have their answer cold *and* unpromoted, and the residue is the model failing to use a message that was correctly promoted. Note `em_recent` (0.783) is *below* `em_old` (0.850) — with `keep_last=6` on a 70-turn session even "recent" facts are cold by question time, so that column is not the in-window control it was meant to be. No condition fabricated a code on a distractor (0.000 everywhere).
+
+**The exact trigger is not exercised by this eval.** It never fires here, because the eval only appends and questions, never edits history. It is covered only by CPU tests (delta touches a demoted message → promoted regardless of similarity). A GPU eval of edit-into-cold-content is still owed.
+
+**Cost: paging makes per-turn prefill worse, not better, and the connector does not yet rescue it.** Demoting the oldest message edits the *front* of the view on every single turn, so prefix caching cannot help on any turn and each turn is a full recompute of the (smaller) window. With every history turn actually prefilled (`--generate-history`):
+
+| condition | prompt | prefill p50 | p90 | max |
+|---|---:|---:|---:|---:|
+| full, prefix caching | up to 35.7k | **0.083 s** | 0.149 | 0.23 |
+| cold, prefix caching | 8k | **0.586 s** | 18.6 | 38.3 |
+| cold, **shift connector on** | 8k | **6.18 s** | 12.1 | **382** |
+
+A 4.4× smaller window costs 7× more prefill per turn, because the reference is append-only and the paged one is not. Shifted KV reuse is precisely the mechanism that should fix this — a demotion is a shrink edit, a promotion a grow edit — and turning it on today makes it an order of magnitude worse still, with a 382 s outlier. Worse, it is not only slow: in a pilot on the same policy and sessions, connector-off scored **1.0** exact-match and connector-on **0.33**, degrading progressively across successive turns (the first three questions right, then everything after wrong). Phase 1 measured *one* edit per session; a paged session is 70 consecutive edit turns, and repeated per-turn edits through the connector are not yet correct at that depth even with the `save="full"` rebuild. **This is the Phase 2 / Phase 1 composition failing, and it is the thing to fix before the cold tier is worth serving.** Until then the cold tier is a correctness/capacity feature, not a latency one.
+
+**Two sizing traps, both of which cost hours.** The shift store is carved out of the GPU budget *before* vLLM sizes its KV cache: `store_tokens=65536` on Qwen3-14B is 10.7 GB, and at `gpu_memory_utilization=0.85` that yields `Available KV cache memory: -2.47 GiB` and a refusal to start — just under the threshold it yields a near-zero KV cache, 15–37 s prefills and preemption. A 24k store at 0.93 gives 12.66 GiB / 82,928 tokens and is what the run above uses. Separately, the retriever must not share the card: MiniLM allocating into the ~7% vLLM leaves crashes the run with `cudaErrorUnknown` mid-session, so `TransformerEmbedder` defaults to CPU, which costs nothing at 22M parameters.
+
+**One eval bug worth recording, because it inverted a result.** The first run of this eval planted each fact in the *opening words* of its message. The stub keeps the opening words. So the no-recall baseline could read the answers straight off the stubs and scored 0.5 on `em_old` — the naive baseline looked far better than it is. Facts now go after the body, and `tests/test_cold_eval.py` asserts that no planted fact is recoverable from any stub or from the paged view, over six sessions.
+
+**Limits.** One model, one window size (8192), one threshold (0.2), one `keep_last` (6); no sweep of any of them. The `full` reference comes from a separate invocation of the same seeded sessions and frozen corpus (the eval now reads `tests/data/kvshift_eval_corpus.json`, not the working tree, precisely so that runs of different conditions are comparable — building sessions from repo source meant that editing these docs moved every session). History turns in the headline run are not prefilled (`generate=False` — verify, page, render and plan all still run), which is what makes the eval affordable; the state each question is asked against is identical either way, but the `q_prefill` column therefore compares a cold-cache paged turn against a warm-cache reference turn and must not be read as a latency result. The cost table above is the one with every turn prefilled.
+
+@acrosley 2026-08-19

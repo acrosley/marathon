@@ -49,11 +49,14 @@ from typing import Any
 
 from . import reuse_plan
 from .canonical import canonical_bytes
+from .cold import ColdTier, TransformerEmbedder
 from .protocol import BaselineStore, ProtocolError, TurnPayload, resolve_turn
 from .reuse_plan import _lines
 from .session import Session
 
 DEFAULT_MAX_TOKENS = 64
+#: chat-template markup a message carries beyond its content, for the paging budget
+MESSAGE_MARKUP_TOKENS = 8
 
 
 class ChatTokenizer:
@@ -195,6 +198,8 @@ class MarathonServer:
         store_tokens: int = 16384,
         repair_first: int | None = None,
         reuse: bool = True,
+        active_window: int | None = None,
+        cold_kwargs: dict | None = None,
     ) -> None:
         if engine is None:
             if model is None:
@@ -208,9 +213,34 @@ class MarathonServer:
         self.reuse = reuse
         self.store = BaselineStore()
         self._lock = threading.Lock()
-        # per session: previous verified state and line -> ids cache
+        # per session: previous *active* state and line -> ids cache
         self._prev: dict[str, bytes] = {}
         self._cache: dict[str, dict[bytes, list[int]]] = {}
+        # cold tier (Phase 2): None keeps the full history in the active window
+        self.active_window = active_window
+        self.cold_kwargs = cold_kwargs or {}
+        self._cold: dict[str, ColdTier] = {}
+        self._full: dict[str, list[dict]] = {}  # previous full history, for the exact trigger
+        self._count_cache: dict[str, int] = {}
+
+    def _message_tokens(self, message: dict) -> int:
+        """Tokens a message costs the prompt, in the serving layer's own units."""
+        text = str(message.get("content", ""))
+        n = self._count_cache.get(text)
+        if n is None:
+            n = self._count_cache[text] = len(self.tok.encode(text))
+        return n + MESSAGE_MARKUP_TOKENS
+
+    def cold_for(self, session_id: str) -> ColdTier | None:
+        """This session's paging policy, created on first use (None if paging is off)."""
+        if self.active_window is None:
+            return None
+        tier = self._cold.get(session_id)
+        if tier is None:
+            tier = self._cold[session_id] = ColdTier(
+                active_tokens=self.active_window, count=self._message_tokens, **self.cold_kwargs
+            )
+        return tier
 
     def plan_for(self, session_id: str, state: bytes, pieces: list[list[int]]):
         """The reuse plan for this session's transition into ``state`` (None if first).
@@ -229,22 +259,51 @@ class MarathonServer:
             plan = dataclasses.replace(plan, repair_first=self.repair_first)
         return plan
 
-    def turn(self, session_id: str, payload: TurnPayload | dict) -> dict:
-        """Run one turn for ``session_id``. Returns the reply and per-turn metrics."""
+    def turn(self, session_id: str, payload: TurnPayload | dict, generate: bool = True) -> dict:
+        """Run one turn for ``session_id``. Returns the reply and per-turn metrics.
+
+        ``generate=False`` runs the whole turn *except* the engine call: the payload is
+        still verified, the cold tier still pages, the prompt is still rendered and the
+        reuse plan still computed, but nothing is prefilled and ``reply`` comes back
+        empty. It exists so a long history can be replayed to bring a session's paging
+        state up to date without paying to prefill every turn of it -- the state a
+        question is then asked against is identical either way.
+        """
         if not isinstance(payload, TurnPayload):
             payload = TurnPayload.from_dict(payload)
         wire_bytes = len(canonical_bytes(payload.to_dict()))
         with self._lock:
             state = resolve_turn(self.store, payload)  # hash-checked; raises otherwise
             messages = Session.decode(state)
-            ids, pieces = self.tok.prompt(messages)
+
+            # The cold tier pages the *verified* history down to the active view before
+            # anything is tokenized. Demotion and promotion are therefore ordinary edits
+            # of the view, and flow through the same reuse plan + shift connector below.
+            tier = self.cold_for(session_id)
+            events: list = []
+            cold_before: list[int] = []
+            if tier is not None:
+                # what was cold when the turn arrived, before recall acted on it: the
+                # eval needs it to tell a recall from a message that never left
+                cold_before = sorted(tier.demoted)
+                query = payload.new_input or (
+                    str(messages[-1].get("content", "")) if messages else ""
+                )
+                events = tier.step(messages, self._full.get(session_id), query)
+                self._full[session_id] = messages
+                view, state = tier.view(messages), tier.active_state(messages)
+            else:
+                view = messages
+            ids, pieces = self.tok.prompt(view)
 
             plan = self.plan_for(session_id, state, pieces)
             loads = plan.to_kv_transfer_params() if plan else []
             phases = reuse_plan.phases(loads, self.engine.block_size, len(ids))
 
             start = time.perf_counter()
-            if phases:
+            if not generate:
+                reply = ""
+            elif phases:
                 # every phase but the last is a max_tokens=1 warm-up whose only job is
                 # to leave its blocks in vLLM's prefix cache for the phase after it
                 for length, load in phases[:-1]:
@@ -272,6 +331,11 @@ class MarathonServer:
                 "phases": max(len(phases), 1),
                 "wire_bytes": wire_bytes,
                 "state_bytes": len(state),
+                "active_tokens": len(ids),
+                "cold_count": len(tier.demoted) if tier else 0,
+                "cold_before": cold_before,
+                "promotions": [e.as_dict() for e in events if e.kind == "promote"],
+                "demotions": [e.as_dict() for e in events if e.kind == "demote"],
             }
 
 
@@ -322,6 +386,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--gpu-util", type=float, default=0.0)
     p.add_argument("--store-tokens", type=int, default=16384)
     p.add_argument(
+        "--active-window",
+        type=int,
+        default=None,
+        help="cold tier: cap the model-facing window at N tokens, paging out old turns",
+    )
+    p.add_argument(
+        "--no-recall",
+        action="store_true",
+        help="cold tier control: demote but never promote (stubs only)",
+    )
+    p.add_argument("--embed-model", default=None, help="cold tier retriever (default: lexical)")
+    p.add_argument(
         "--no-reuse",
         action="store_true",
         help="control run: plan nothing, leaving plain vLLM prefix caching",
@@ -334,6 +410,11 @@ def main(argv: list[str] | None = None) -> int:
         gpu_util=args.gpu_util,
         store_tokens=args.store_tokens,
         reuse=not args.no_reuse,
+        active_window=args.active_window,
+        cold_kwargs={
+            "recall": not args.no_recall,
+            "embedder": TransformerEmbedder(args.embed_model) if args.embed_model else None,
+        },
     )
     http = serve(srv, args.host, args.port)
     print(f"marathon.server ready on http://{args.host}:{args.port}/v1/turn", flush=True)
