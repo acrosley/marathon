@@ -148,7 +148,10 @@ def test_edit_turn_plans_reuse_and_hands_segments_to_the_connector():
     assert r["reused_tokens"] > 0
     assert r["phases"] == 2, "one segment is handed over as a warm-up plus the real request"
     assert engine.calls[-1]["load"] is not None
-    assert engine.calls[-1]["save"] is False, "an edit turn reads the store, never writes it"
+    assert engine.calls[-1]["save"] == "full", (
+        "an edit turn moves the reused span, so the store must be rebuilt at the new "
+        "positions or the next edit plans against a layout that no longer exists"
+    )
 
 
 def test_governing_edit_switches_the_policy_to_repair():
@@ -162,17 +165,78 @@ def test_governing_edit_switches_the_policy_to_repair():
     assert r["policy"] == "repair"
 
 
-def test_store_epoch_rolls_after_an_edit():
-    """A later turn must not layer new positions over the pre-edit store layout."""
+def test_the_store_key_is_stable_across_edits():
+    """The session keeps one store: an edit rebuilds it, it does not abandon it."""
     server, engine = make_server()
     c = make_client(server)
     for i in range(6):
         c.turn("s", f"turn {i} " + LONG)
-    before = engine.calls[-1]["session"]
     c.edit("s", 0, "REWRITTEN " + LONG)
     c.turn("s", "after the edit " + LONG)
     c.turn("s", "and another " + LONG)
-    assert engine.calls[-1]["session"] != before
+    assert {call["session"] for call in engine.calls} == {"s"}
+
+
+def test_every_edit_in_a_session_gets_the_same_treatment():
+    """The 2nd and 3rd edit must reuse exactly like the 1st, not degrade to recompute."""
+    server, engine = make_server()
+    c = make_client(server)
+    edits = []
+    for i in range(21):
+        if i in (8, 14, 20):
+            c.edit("s", 0, f"REWRITTEN {i} " + LONG)
+        r = c.turn("s", f"turn {i} " + LONG)
+        if i in (8, 14, 20):
+            edits.append(r)
+
+    assert len(edits) == 3
+    for n, r in enumerate(edits):
+        assert r["reused_tokens"] > 0, f"edit {n} reused nothing"
+        assert r["phases"] == 2, f"edit {n} did not hand a segment to the connector"
+        assert r["policy"] == "reuse", f"edit {n} policy was {r['policy']}"
+    # each edit reuses more than the last, because the history is longer each time
+    assert edits[0]["reused_tokens"] < edits[1]["reused_tokens"] < edits[2]["reused_tokens"]
+    assert all(call["save"] in (True, "full") for call in engine.calls if call["max_tokens"] > 1)
+
+
+def test_full_save_after_an_edit_restores_a_contiguous_store():
+    """The bookkeeping the fix rests on, checked against the real store.
+
+    A ``"full"`` save is a save at position 0, which ``ShiftStore.reserve`` treats as a
+    truncating rewrite: afterwards the session holds ``[base, new_len)`` contiguously
+    and nothing above it, so the *next* edit's ``covers`` check succeeds over the whole
+    new sequence. Without it the store still claims the pre-edit length, and a load for
+    a position past that is declined.
+    """
+    torch = pytest.importorskip("torch")
+    assert torch  # the store imports torch; no tensors are allocated here
+    from marathon.shift_store import ShiftStore
+
+    store = ShiftStore(budget_tokens=4096, allocate=False)
+    assert store.reserve("s", 0, 1000)  # an append-only session, positions [0, 1000)
+    assert store.covers("s", 0, 1000)
+
+    # an edit turn: the new sequence is longer and everything after the edit moved
+    assert store.covers("s", 400, 600), "the pre-edit layout is what the load reads"
+    assert store.reserve("s", 0, 1200), "the full re-save rewrites from the start"
+    assert store.covers("s", 0, 1200), "the store now describes the new coordinates"
+
+    # the next edit can read anywhere in the new sequence, including past the old end
+    assert store.covers("s", 1000, 200)
+    # and an incremental save on the following append-only turn still lands
+    assert store.reserve("s", 1200, 300)
+    assert store.covers("s", 0, 1500)
+
+
+def test_store_refuses_a_save_that_would_leave_a_hole():
+    """The safety net behind the fix: a gap is refused, never silently filled."""
+    pytest.importorskip("torch")
+    from marathon.shift_store import ShiftStore
+
+    store = ShiftStore(budget_tokens=4096, allocate=False)
+    assert store.reserve("s", 0, 1000)
+    assert not store.reserve("s", 1200, 100), "a save past `filled` would leave a hole"
+    assert not store.covers("s", 900, 400), "and the span past the end is not claimed"
 
 
 # --- session isolation ------------------------------------------------------------
