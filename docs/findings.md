@@ -857,6 +857,170 @@ The next run is specified and was not made: **Qwen3-8B, 4–8k sessions, the ful
 
 Caveats: one model, one seed pair, one epoch, one query type, 120 held-out items. `gov_frac 0.5` gives ~282 governing and ~317 other training items, near the intended split but not tuned. No hyperparameter search was run — 1e-4 was a first guess and the `clean_kl` spike by step 81 suggests it is too high for r=16 across all four projections. The eval's `*_answer_ok` grades the arg-max of the teacher-forced sequence rather than a free-running greedy decode; that is comparable across base and tuned but is not `kvshift_eval`'s `exact` column. And the method distills toward full recompute, which the dependent-edit study showed is *itself* sometimes the less obedient party — so a KL improvement would not have been an accuracy improvement even had one appeared.
 
+## 2026-08-19 — Phase 2 cold tier: the window goes flat, and recall-on-miss is the whole difference between 0.008 and 0.817
+
+Command: `python -m marathon.cold_eval --sessions 20 --turns 70 --active-window 8192 --threshold 0.2` (`scripts/cold_eval.sh`) · Model: `Qwen/Qwen3-14B-FP8` in vLLM 0.27.1, retriever `sentence-transformers/all-MiniLM-L6-v2` mean-pooled on CPU · 20 sessions × 70 turns, history p50 25.0k / min 18.5k / max 35.7k tokens, 6 facts planted per session from turn 2 to turn 65, 8 questions each (old / recent / distractor) = 480 questions.
+
+`marathon.cold` keeps the model-facing view under a token budget by demoting the oldest non-governing messages to a stub carrying the message's own content address, `[cold #12 3f9a1c04: <first ~12 words>]`. The full bytes stay in the ledger, so a demotion is a *shrink edit of the view* and a promotion a *grow edit* — the shape `reuse_plan` already handles. Recall-on-miss has two triggers: exact (the turn's delta touches a demoted message) and query (top-k≤2 chunk-embedding matches above a cosine threshold).
+
+All three conditions run with the shift connector **off**, on plain vLLM prefix caching, so they differ only in the paging. Conditions share one engine and one frozen corpus.
+
+**The three exit criteria.**
+
+| condition | active p50 | active max | em old | em recent | em all | promo recall | promo precision |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| full (reference) | 13078 | 35674 | 0.900 | 0.983 | **0.942** | — | — |
+| cold-norecall | 7647 | 8062 | 0.000 | 0.017 | **0.008** | 0.00 | — |
+| cold-recall | 7681 | 8075 | 0.850 | 0.783 | **0.817** | **0.912** | 0.291 |
+
+**1. Bounded window on unbounded sessions — met.** Median active tokens by turn index, over the 20 sessions:
+
+```
+condition        turn10   turn30   turn50   turn70      max
+full               3755    11203    18352    25691    35674
+cold-norecall      3755     7830     7713     7640     8062
+cold-recall        3755     7916     7760     7655     8075
+```
+
+The reference grows linearly and the paged conditions are *flat from turn 30 on* — 7916 → 7655 as the history doubles, never exceeding the 8192 budget by more than one message (8075). At the end of a session 121 messages are cold, at 3.19 demotions per turn. Flatness needs one thing beyond stubs: a stub is ~20× smaller than the message it replaces, but 20× smaller is still O(n), so once nothing is left to demote the oldest stubs are **evicted** from the view entirely. Nothing is lost — the bytes are in the ledger and the retriever searches every demoted message, evicted or not — but this is the step that makes the window bounded rather than merely smaller, and CPU tests assert it directly over 120-turn synthetic sessions at four budgets.
+
+**2. Recall-on-miss restores demoted content — met.** 102 of the 120 fact questions had their answer in a message that was cold when the question arrived. The query trigger promoted the right message for **91.2%** of them, and that is the whole difference in the table: the same paging policy scores 0.008 without recall and 0.817 with it. Stubs alone are worthless for answering — which is the honest reading of `cold-norecall`, and the reason the design doc calls a wrong demotion a silent degradation of ground truth.
+
+Retrieval had to be scored per *chunk*, not per message. Pooling one vector over a 400–700 token turn averages away the single sentence that answers the question, and MiniLM truncates at 512 tokens anyway, so a fact late in a long turn is invisible: whole-message pooling recalled the right message **39%** of the time on this same question set. Scoring a message by its best 60-word overlapping window took it to 91%. Precision is 0.291 against a ceiling of 0.5 — `top_k=2` fires two promotions per question and only one can be the target — so the wasted promotion is a deliberate cost, not a miss.
+
+**3. Quality delta vs full-context replay — partially met, and I am not going to call it a pass.** 0.817 vs 0.942 is **−12.5 points**, recovering 87% of the reference. That is a large improvement over the naive baseline and still a real regression against full context; "efficiency that changes answers is a regression" is the rule, and a 12.5-point drop is not within any tolerance worth the name. Where it goes: 8.8% of fact questions have their answer cold *and* unpromoted, and the residue is the model failing to use a message that was correctly promoted. Note `em_recent` (0.783) is *below* `em_old` (0.850) — with `keep_last=6` on a 70-turn session even "recent" facts are cold by question time, so that column is not the in-window control it was meant to be. No condition fabricated a code on a distractor (0.000 everywhere).
+
+**The exact trigger is not exercised by this eval.** It never fires here, because the eval only appends and questions, never edits history. It is covered only by CPU tests (delta touches a demoted message → promoted regardless of similarity). A GPU eval of edit-into-cold-content is still owed.
+
+**Cost: paging makes per-turn prefill worse, not better, and the connector does not yet rescue it.** Demoting the oldest message edits the *front* of the view on every single turn, so prefix caching cannot help on any turn and each turn is a full recompute of the (smaller) window. With every history turn actually prefilled (`--generate-history`):
+
+| condition | prompt | prefill p50 | p90 | max |
+|---|---:|---:|---:|---:|
+| full, prefix caching | up to 35.7k | **0.083 s** | 0.149 | 0.23 |
+| cold, prefix caching | 8k | **0.586 s** | 18.6 | 38.3 |
+| cold, **shift connector on** | 8k | **6.18 s** | 12.1 | **382** |
+
+A 4.4× smaller window costs 7× more prefill per turn, because the reference is append-only and the paged one is not. Shifted KV reuse is precisely the mechanism that should fix this — a demotion is a shrink edit, a promotion a grow edit — and turning it on today makes it an order of magnitude worse still, with a 382 s outlier. Worse, it is not only slow: in a pilot on the same policy and sessions, connector-off scored **1.0** exact-match and connector-on **0.33**, degrading progressively across successive turns (the first three questions right, then everything after wrong). Phase 1 measured *one* edit per session; a paged session is 70 consecutive edit turns, and repeated per-turn edits through the connector are not yet correct at that depth even with the `save="full"` rebuild. **This is the Phase 2 / Phase 1 composition failing, and it is the thing to fix before the cold tier is worth serving.** Until then the cold tier is a correctness/capacity feature, not a latency one.
+
+**Two sizing traps, both of which cost hours.** The shift store is carved out of the GPU budget *before* vLLM sizes its KV cache: `store_tokens=65536` on Qwen3-14B is 10.7 GB, and at `gpu_memory_utilization=0.85` that yields `Available KV cache memory: -2.47 GiB` and a refusal to start — just under the threshold it yields a near-zero KV cache, 15–37 s prefills and preemption. A 24k store at 0.93 gives 12.66 GiB / 82,928 tokens and is what the run above uses. Separately, the retriever must not share the card: MiniLM allocating into the ~7% vLLM leaves crashes the run with `cudaErrorUnknown` mid-session, so `TransformerEmbedder` defaults to CPU, which costs nothing at 22M parameters.
+
+**One eval bug worth recording, because it inverted a result.** The first run of this eval planted each fact in the *opening words* of its message. The stub keeps the opening words. So the no-recall baseline could read the answers straight off the stubs and scored 0.5 on `em_old` — the naive baseline looked far better than it is. Facts now go after the body, and `tests/test_cold_eval.py` asserts that no planted fact is recoverable from any stub or from the paged view, over six sessions.
+
+**Limits.** One model, one window size (8192), one threshold (0.2), one `keep_last` (6); no sweep of any of them. The `full` reference comes from a separate invocation of the same seeded sessions and frozen corpus (the eval now reads `tests/data/kvshift_eval_corpus.json`, not the working tree, precisely so that runs of different conditions are comparable — building sessions from repo source meant that editing these docs moved every session). History turns in the headline run are not prefilled (`generate=False` — verify, page, render and plan all still run), which is what makes the eval affordable; the state each question is asked against is identical either way, but the `q_prefill` column therefore compares a cold-cache paged turn against a warm-cache reference turn and must not be read as a latency result. The cost table above is the one with every turn prefilled.
+
+@acrosley 2026-08-19
+
+## 2026-08-19 — The 0.6B pilot's testbed diagnosis confirmed: at 8B the governing failure is right there (8.71×), and `obey` is its worst query
+
+Command: `scripts/stitch_train_8b.sh` step 1 — `python -m marathon.stitch_train eval --model Qwen/Qwen3-8B --items 48 --seed 9001 --gov-frac 0.5 --min-tokens 4000 --max-tokens 8000 --gen-tokens 32 --attn sdpa --base-only` (WSL2, `~/marathon-venv`, torch 2.13.0+cu130, transformers 5.15.0, sdpa, bf16, RTX 5090, ~21.3 GiB peak) · Model: `Qwen/Qwen3-8B` · Cost: $0.
+
+The previous entry's pilot was negative and blamed its own testbed: at 0.6B on 3–5k sessions a governing edit cost only 1.50× a non-governing one, so the adapter had nothing to repair. That was a claim about *why* the run failed, and it needed testing before another epoch was spent. This is the gate — the base model on held-out seed 9001, 4–8k-token sessions, tuned columns skipped because an identity adapter only re-measures the base at double the price (`--base-only`).
+
+**The failure class is exactly where it was said to be.**
+
+```
+bucket          metric               n      mean    median       p95       max  >.05
+governing       base_stitch_kl      20    0.0373    0.0064    0.0845    0.4250     4
+non-governing   base_stitch_kl      28    0.0043    0.0016    0.0174    0.0222     0
+ALL             base_stitch_kl      48    0.0181    0.0030    0.0674    0.4250     4
+
+governing/non-governing KL ratio:  mean 8.71x  (0.0373 / 0.0043)   median 4.03x  (0.0064 / 0.0016)
+planted-fact ok:  governing 12/12 ref = base;  non-governing 16/18 ref = base
+clean-context KL (identity adapter): 0.0000 on all 48 items, mean/median/p95/max alike
+```
+
+**8.71× on the mean** against the 144-session eval's ~9×, and 4.03× on the median against the ~3–4.5× that run showed — both reproduce at 48 items where 120 items at 0.6B gave 1.50× and 1.35×. Four governing items clear KL 0.05 and one clears 0.2 (0.4250); **no** non-governing item clears 0.05, with a maximum of 0.0222. So the diagnosis holds: the 0.6B result was about the model and the regime, not about stitched-KV consistency fine-tuning.
+
+**The harness defect the previous entry admitted is fixed, and fixing it changed the picture.** `build_examples` took `item.queries[:k]`, and `kvshift_eval._queries` always puts `fact-at` first — which is why all 120 eval items in the 0.6B pilot asked the same question and `obey` never ran. It now rotates the entry point into the pool by session id, so a `k=1` population still covers every type. The first run with the fix says the query mattered:
+
+```
+qtype           n    base klmean   base klmedian
+obey           11       0.0570          0.0080
+fact-at        16       0.0103          0.0043
+summarise       7       0.0057          0.0017
+fact-after      8       0.0034          0.0009
+fact-before     6       0.0014          0.0010
+```
+
+`obey` is the worst bucket by a factor of 5.5 on the mean, and the three worst items in the run are `governing/obey` (0.4250), `mid-governing/obey` (0.0845) and `governing/fact-at` (0.0674). That is worth flagging because it **cuts against** the 2026-08-18 2×2 entry, which found governing damage landing on the *fact* questions rather than on `obey` (governing × obey klmean 0.0161 vs governing × other 0.0304) and concluded the mechanism is not "the edited instruction steers the answer". On this smaller sample it is the instruction-following query that suffers most. Two readings are open and this run cannot separate them: 48 items with n=11 `obey` is small enough that one 0.425 outlier moves the mean a long way (the median ordering is much flatter — 0.0080 for `obey` against 0.0043 for `fact-at`), or the earlier run's `obey` cell was diluted because *every* item there also carried `fact-at`. Not resolved; do not quote the mean ordering as settled.
+
+Also worth recording: **clean-context KL is 0.0000 across all 48 items**, exactly, which is the first confirmation on a real 8B model that the shared-`_clean_sequence` fix from the previous entry gives the damage metric a true zero rather than the ~0.005 bf16 floor it started with.
+
+**Training did not complete, twice, and both failures were mine rather than the method's.** The first died immediately: `--attn` defaulted to `eager`, which materialises the full `[heads, q, kv]` fp32 score matrix — about 8 GB for a *single* layer at 8B and 8k tokens. `kvshift_eval` has always defaulted to `sdpa` for this reason and both paths honour the explicit additive mask the stitched forward passes; the default is now `sdpa`. The second died 81 items in with `RuntimeError: CUDA driver error: device not ready`, which is not a driver fault: `dmesg` shows `misc dxg: dxgk: dxgkio_make_resident: Ioctl failed: -12`, i.e. `-ENOMEM` — WSL's GPU paravirtualisation layer reports exhaustion as "device not ready" rather than as a clean torch OOM. Worth knowing for anything else run on this box.
+
+The cause was a modelling choice with a memory price. `stitched_logits` kept the freshly computed span `E'` inside the autograd graph so `k_proj`/`v_proj` could learn what to *write* into the cache, not just how to *read* it — which costs a retained full-length K and V per layer, ~2.4 GB at 8B/8k, on top of the attention activations. It is now a flag (`--grad-prefill`) and off by default; the default runs the stitched prefill under `no_grad` and lets gradients flow only through the continuation, which is the arrangement Phase 3 was specified with (the reused KV is a constant). A test asserts the cheap path still produces a nonzero adapter gradient, because a trainer that silently no-ops is worse than a slow one.
+
+The rerun of steps 2–4 was launched and **stood down within two minutes**: Track N started another `marathon.cold_eval --sessions 20 --turns 70` sweep at 04:12 and took 32 GB, and two tenants on one 32 GB card is how both runs get corrupted. The job was killed before it allocated anything.
+
+**Verdict against the Phase 3 exit criteria: the gate is passed and the criteria remain untested.** Criterion 1 needs a governing/non-governing ratio ≤ 2× after tuning — the *before* number is now measured on the right regime at 8.71×, which is the number that run has to beat, but no adapter has been trained at 8B. Criteria 2 (clean-context KL ≤ 0.002) and 3 (no regression) likewise have their baselines and no treatment. What this entry settles is narrower and was the thing blocking everything else: **the experiment is now pointed at a population where the phenomenon exists**, the metric has a true zero, and the query pool is no longer degenerate.
+
+Caveats: 48 items, one seed, one model. Cell sizes are 20 governing / 28 non-governing, so the four >0.05 items are four events and the one >0.2 is one; the mean ratio in particular rests on that single 0.4250 item, and dropping it would take the governing mean from 0.0373 to roughly 0.017 and the ratio from 8.71× to about 4×. The median ratio (4.03×) is the more robust of the two and is the one to hold the tuned run to. `--base-only` means the tuned and clean columns in that table are copies of the base by construction and carry no information. Session lengths were 4–8k as intended but were not recorded per item in this run.
+
+@acrosley 2026-08-19
+
+## 2026-08-19 — Stitched-KV fine-tuning works on the failure class it was built for (governing mean KL −43%, p95 −61%) and fails three of the five exit criteria
+
+Command: `scripts/stitch_train_8b.sh` steps 2–4 — train 200 items seed 7001 lr 3e-5, held-out eval 60 items seed 9001, dependent-edit probe (WSL2, `~/marathon-venv`, torch 2.13.0+cu130, transformers 5.15.0, sdpa, bf16, RTX 5090, 24.4 GiB peak; training 200 items in 800 s) · Model: `Qwen/Qwen3-8B`, LoRA r=16 α=32 on q/k/v/o · Cost: $0.
+
+Completes the previous entry, which passed the gate — the base model shows the governing failure at 8.71× on 48 items — but had no adapter. This is the adapter, on held-out seed 9001 at 60 items. **Base and tuned columns come from the same run over the same examples** (adapters off is the base model bit for bit), so the comparison carries no sampling difference.
+
+```
+bucket          metric               n      mean    median       p95       max  >.05
+governing       base_stitch_kl      26    0.0372    0.0055    0.2344    0.4250     4
+governing       tuned_stitch_kl     26    0.0211    0.0050    0.0905    0.2780     2
+governing       tuned_clean_kl      26    0.0025    0.0018    0.0045    0.0152     0
+non-governing   base_stitch_kl      34    0.0051    0.0024    0.0221    0.0390     0
+non-governing   tuned_stitch_kl     34    0.0070    0.0035    0.0230    0.0394     0
+non-governing   tuned_clean_kl      34    0.0023    0.0011    0.0062    0.0092     0
+ALL             base_stitch_kl      60    0.0190    0.0034    0.0580    0.4250     4
+ALL             tuned_stitch_kl     60    0.0131    0.0038    0.0355    0.2780     2
+
+governing/non-governing ratio:  base  mean 7.25x  median 2.27x
+                                tuned mean 3.01x  median 1.42x
+planted-fact ok: 33/36 for reference, base and tuned alike (governing 15/15, non-governing 18/21)
+```
+
+**The method does something real, and it does it exactly where it was aimed.** On governing edits the mean falls 0.0372 → 0.0211 (**−43%**), p95 0.2344 → 0.0905 (**−61%**), max 0.4250 → 0.2780; items over KL 0.05 halve from 4 to 2 and items over 0.2 go from 2 to 1. 18 of 26 governing items improve. The two worst items in the run both improve substantially: `governing/obey` 0.4250 → 0.2780 and `governing/fact-at` 0.2344 → 0.0905. This is the first evidence in the project that the stale-attention failure is *trainable* rather than only avoidable by recomputation — and it is a tail effect, which is the part that matters, because the tail is what forces `reuse_plan` to refuse.
+
+**And it is bought with a real cost.** Non-governing edits get *worse*: mean 0.0051 → 0.0070 (+37%), median 0.0024 → 0.0035 (+46%), with only 13 of 34 improving. The damage is a shift of the bulk rather than new failures — no non-governing item crosses 0.05 either way and the max barely moves (0.0390 → 0.0394) — but it is the regularisation set moving the wrong way despite being half the training mix. Clean-context drift is 0.0024 mean / 0.0015 median / 0.0152 max, with 23 of 60 items over 0.002.
+
+**Against the Phase 3 exit criteria: two pass, three fail, and the failures are marginal rather than catastrophic.**
+
+| criterion | target | measured | |
+|---|---|---|---|
+| 1. failure class closes | mean ratio ≤ 2×, no item > 0.2 | 7.25× → **3.01×**; one item still at 0.278 | **fail** (large move) |
+| 2. clean context undamaged | clean KL ≤ 0.002 | **0.0024** mean (0.0015 median) | **marginal fail** |
+| 3. no regression | non-governing within ~20% | **+37%** mean, +46% median | **fail** |
+| 4. dep-instruction moves | toward the `first-512` level | 0.0133 → 0.0093, 0.0178 → 0.0104 | **pass** |
+| 5. win kept | tokens forwarded unchanged | unchanged by construction | **pass** |
+
+The honest verdict is **promising, not shippable**. Halving the tail on the one edit class that forces full recompute is the result this phase was looking for; doing it while making every other edit 37% worse is not a trade `reuse_plan` can take, because the entire point of the governing flag is that it refuses *only* the governing cases and leaves the other 191/269 alone.
+
+**Dependent-edit probe** (single runs, not a distribution):
+
+```
+scenario          question           base_kl  tuned_kl  clean_kl  ref_ok base_ok tuned_ok
+dep-instruction   lang-pipeline       0.0133    0.0093    0.0026    True    True     True
+dep-instruction   lang-scheduler      0.0178    0.0104    0.0010   False   False    False
+dep-anaphora      primary-key         0.0064    0.0095    0.0020    True    True     True
+dep-anaphora      mission             0.0036    0.0020    0.0008    True    True     True
+dep-anaphora      open                0.0187    0.0918    0.0025    None    None     None
+dep-contradict    harbor              0.0057    0.0057    0.0007    True    True     True
+dep-contradict    open                0.0137    0.0130    0.0051    None    None     None
+```
+
+Both `dep-instruction` questions improve by 30–40%, which is the scenario the adapter is for. But `dep-anaphora/open` degrades 0.0187 → 0.0918, a 5× regression on a scenario that was never broken — the same "hurts what already works" signature as the non-governing bucket, and on the open-ended question where free-running divergence is known to be generic. Note also that these `base_kl` values (0.006–0.019 klmean) are nowhere near the 0.3492 *first-token* KL the 2026-08-18 study recorded for `dep-instruction`: that was `kl_first` on a differently built session, and `klmean` over 32 tokens is a much gentler statistic. The two are not comparable, and the exit criterion should have named which one it meant.
+
+**An ambiguity worth recording rather than smoothing over.** The training curve moves the wrong way: governing `stitch_kl` median 0.0065 (first half) → 0.0114 (second half), non-governing 0.0029 → 0.0033, `clean_kl` flat at 0.0013. Yet held-out governing KL improved 43%. The likely explanation is that the second half of the shuffled training set simply held harder governing items — per-item KL varies over two orders of magnitude here, so a 200-item split-half median is not a learning curve. But it could also mean the improvement is not attributable to training in the way assumed. The check is a held-out eval at a mid-training checkpoint, which this run did not save.
+
+**Two infrastructure fixes made the run possible**, both diagnosed since the last entry. `--attn` defaulted to `eager`, which materialises the full `[heads, q, kv]` fp32 score matrix — ~8 GB for a single layer at 8B/8k — and died before the first item; it now defaults to `sdpa`, as `kvshift_eval` always did. Then training died 81 items in with `RuntimeError: CUDA driver error: device not ready`, which `dmesg` identifies as `misc dxg: dxgk: dxgkio_make_resident: Ioctl failed: -12`, i.e. `-ENOMEM` surfaced through WSL's GPU paravirtualisation layer rather than as a clean torch OOM. The cause was keeping the fresh span `E'` inside the autograd graph so `k_proj`/`v_proj` could learn what to *write* into the cache; that retains a full-length K and V per layer, ~2.4 GB at 8B/8k. It is now `--grad-prefill`, **off by default** — so the numbers above were produced with gradients flowing only through the continuation, which is the arrangement Phase 3 was specified with (the reused KV is a constant). Peak fell to 24.4 GiB and the run held ~4 s/item throughout.
+
+That matters for how the result is read: **this is the weaker of the two available training signals.** Only `q_proj`/`o_proj` and the continuation tokens' `k`/`v` were trained; the model never learned to write a louder `E'`. The −43% mean and −61% p95 on the tail came from the cheap half of the method.
+
+**What to try next, in order.** (1) Re-run with `--grad-prefill` at 4–6k sessions, where it fits — if the expressive half of the method is worth anything, that is where it shows. (2) Fix the regression before chasing the tail: the non-governing bucket getting worse while being half the training mix suggests the clean-context anchor is the wrong regulariser for it, and an explicit stitched-KV term on non-governing items (KL to teacher on cases that are already fine) is a more direct constraint. (3) Save mid-training checkpoints so the curve-versus-held-out ambiguity is resolvable. (4) Only then re-test the ratio.
+
+Caveats: 60 held-out items, one seed, one epoch, 200 training items, one model. Cells are 26 governing / 34 non-governing, and the governing mean is dominated by two items over 0.2 — dropping the single 0.4250 item takes the base governing mean from 0.0372 to about 0.022 and the base mean ratio from 7.25× to ~4.3×, so the headline −43% rests substantially on how two items moved. The base ratios are themselves unstable with sample size: the same base model measured 8.71× mean / 4.03× median on 48 items and 7.25× / 2.27× on these 60, which means the ≤2× median target was nearly met by the *base* model and the median ratio is too noisy at this n to gate on. The `>0.2` criterion is 2 events before and 1 after. `planted-fact ok` grades the arg-max of the teacher-forced sequence, not a free-running greedy decode. No hyperparameter search was done — lr 3e-5 was chosen because 1e-4 misbehaved at 0.6B, not because it was tuned here.
+
 @acrosley 2026-08-19
 
 ## 2026-08-19 — Why the connector broke on a paged session: a latched full-save and a staleness ratchet. Paged 14B now runs at exact-match 1.000 with byte-identical text

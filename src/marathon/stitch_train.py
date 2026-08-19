@@ -327,6 +327,9 @@ def build_examples(
     drawn from the other kinds as regularisation, so the adapter cannot buy governing
     robustness by wrecking the cases that already work. ``seed`` selects the population —
     train and eval must use different seeds, and the eval seed is never trained on.
+
+    ``queries_per_item`` questions are taken per session, rotating the entry point into
+    the pool by session id so the population covers every query type even at ``k=1``.
     """
     from .kvshift_eval import load_corpus
 
@@ -361,7 +364,16 @@ def build_examples(
         span = token_span(old_ids.tolist(), new_ids.tolist())
         if span.s == 0:  # pragma: no cover - nothing downstream, nothing to be stale
             continue
-        for qtype, expected, question, forced_prefix in item.queries[:queries_per_item]:
+        # Rotate the entry point into the query pool by session id rather than slicing from
+        # the front. ``kvshift_eval._queries`` always puts ``fact-at`` first and, for
+        # governing edits, ``obey`` last — so a front slice asks the *same* question for
+        # every item, which is exactly what made the 0.6B pilot's 120 eval items all
+        # ``fact-at`` and left ``obey`` (the query a governing edit most directly targets)
+        # untested. Rotation is deterministic and spreads every position evenly over the
+        # population, so a k=1 run still covers the whole pool across items.
+        pool = item.queries
+        picks = [pool[(sid + j) % len(pool)] for j in range(min(queries_per_item, len(pool)))]
+        for qtype, expected, question, forced_prefix in picks:
             out.append(
                 Example(
                     sid=sid,
@@ -442,14 +454,39 @@ def teacher_reference(model, ex: Example, gen_tokens: int) -> tuple[list[int], t
     return toks, _clean_sequence(model, ids, toks)
 
 
-def stitched_logits(model, ex: Example, old_kv, forced: list[int]) -> torch.Tensor:
-    """Student logits over the continuation, run against the stitched cache (with grad)."""
+def stitched_logits(
+    model, ex: Example, old_kv, forced: list[int], grad_prefill: bool = False
+) -> torch.Tensor:
+    """Student logits over the continuation, run against the stitched cache.
+
+    ``grad_prefill`` decides how far back gradients reach, and it is a memory decision as
+    much as a modelling one:
+
+    * ``False`` (default) — the stitched prefill of ``E'`` and the query runs under
+      ``no_grad`` and the cache is detached, so gradients flow only through the
+      continuation forward. This is the arrangement the phase was specified with: the
+      reused KV is a constant, and what is being trained is how the model *reads* a stale
+      suffix (q/o proj, plus k/v of the continuation tokens).
+    * ``True`` — the fresh span's K/V stay in the graph, so ``k_proj``/``v_proj`` also learn
+      what to *write* so the stale suffix matters less. Strictly more expressive, and it
+      costs a retained full-length K and V per layer (~2.4 GB at 8B/8k on top of the
+      attention activations). At 8B/4-8k that is what exhausted the GPU 81 items into the
+      first training run — WSL reports the exhaustion as ``dxgk ... Ioctl failed: -12``
+      surfacing in torch as "CUDA driver error: device not ready", not as a clean OOM.
+    """
     all_ids = torch.cat([ex.new_ids, ex.query_ids])
     total = int(all_ids.shape[0])
     segments = span_segments(ex.span)
     cache = grad_stitch(old_kv, segments, total, inv_freq_of(model))
     positions = fresh_positions(segments, total, all_ids.device)
-    return sequence_logits(model, cache, all_ids[positions], positions, total, forced)
+    if grad_prefill:
+        return sequence_logits(model, cache, all_ids[positions], positions, total, forced)
+    with torch.no_grad():
+        first = _forward_at(model, cache, all_ids[positions], positions, total, 1)
+    if len(forced) <= 1:
+        return first
+    rest = _continue_forced(model, cache.detached(), forced[:-1], total, all_ids.device)
+    return torch.cat([first, rest], dim=0)
 
 
 def clean_logits(model, ex: Example, forced: list[int]) -> torch.Tensor:
@@ -470,6 +507,7 @@ def example_losses(
     anchor: bool,
     backward: float | None = None,
     anchor_weight: float = 1.0,
+    grad_prefill: bool = False,
 ) -> dict:
     """(stitched KL, clean-anchor KL) for one example. Teacher is the same weights, off.
 
@@ -488,7 +526,7 @@ def example_losses(
         with torch.no_grad():
             old_kv, _ = _prefill(model, ex.old_ids)
             old_kv = [(k.detach(), v.detach()) for k, v in old_kv]
-        stitch_kl = kl_to(teacher_seq, stitched_logits(model, ex, old_kv, forced))
+        stitch_kl = kl_to(teacher_seq, stitched_logits(model, ex, old_kv, forced, grad_prefill))
         if backward is not None:
             (stitch_kl * backward).backward()
             stitch_kl = float(stitch_kl.detach())
@@ -518,6 +556,7 @@ def train(
     anchor_weight: float = 1.0,
     anchor_every: int = 2,
     accum: int = 4,
+    grad_prefill: bool = False,
     clip: float = 1.0,
     log_every: int = 20,
     on_step=None,
@@ -535,7 +574,9 @@ def train(
             ex = examples[i]
             anchor = anchor_every > 0 and step % anchor_every == 0
             # the anchor's weight rides on its own backward; the two terms never coexist
-            parts = example_losses(model, loras, ex, gen_tokens, anchor, 1.0 / accum, anchor_weight)
+            parts = example_losses(
+                model, loras, ex, gen_tokens, anchor, 1.0 / accum, anchor_weight, grad_prefill
+            )
             if n % accum == 0 or n == len(order):
                 torch.nn.utils.clip_grad_norm_(params, clip)
                 opt.step()
@@ -573,7 +614,12 @@ def train(
 
 @torch.no_grad()
 def evaluate(
-    model, loras: list[LoRALinear], examples: list[Example], tok=None, gen_tokens: int = 32
+    model,
+    loras: list[LoRALinear],
+    examples: list[Example],
+    tok=None,
+    gen_tokens: int = 32,
+    base_only: bool = False,
 ) -> list[dict]:
     """Per-example rows: reuse-all KL and clean-context KL, base vs adapted, plus accuracy.
 
@@ -592,11 +638,17 @@ def evaluate(
             old_kv, _ = _prefill(model, ex.old_ids)
             old_kv = [(k.detach(), v.detach()) for k, v in old_kv]
             base_seq = stitched_logits(model, ex, old_kv, forced)
-        with adapters(loras, True):
-            tuned_old_kv, _ = _prefill(model, ex.old_ids)
-            tuned_old_kv = [(k.detach(), v.detach()) for k, v in tuned_old_kv]
-            tuned_seq = stitched_logits(model, ex, tuned_old_kv, forced)
-            tuned_clean = clean_logits(model, ex, forced)
+        if base_only:
+            # the adapter is at identity, so the tuned columns would only re-measure the base
+            # ones at double the cost. Used for the "does the failure class even reproduce
+            # here?" run that must precede spending an epoch on training.
+            tuned_seq, tuned_clean = base_seq, teacher_seq
+        else:
+            with adapters(loras, True):
+                tuned_old_kv, _ = _prefill(model, ex.old_ids)
+                tuned_old_kv = [(k.detach(), v.detach()) for k, v in tuned_old_kv]
+                tuned_seq = stitched_logits(model, ex, tuned_old_kv, forced)
+                tuned_clean = clean_logits(model, ex, forced)
 
         def ok(seq, expected=ex.expected):
             if expected is None or tok is None:
@@ -664,6 +716,16 @@ def report(rows: list[dict]) -> str:
                 f"ref={sum(bool(r['ref_answer_ok']) for r in graded)} "
                 f"base={sum(bool(r['base_answer_ok']) for r in graded)} "
                 f"tuned={sum(bool(r['tuned_answer_ok']) for r in graded)}"
+            )
+    qtypes = sorted({r["qtype"] for r in rows})
+    if len(qtypes) > 1:
+        out.append("")
+        for qt in qtypes:
+            rs = [r for r in rows if r["qtype"] == qt]
+            a, b = _agg(rs, "base_stitch_kl"), _agg(rs, "tuned_stitch_kl")
+            out.append(
+                f"{qt:<16}{'base->tuned mean':<18}{a['n']:>4}{a['mean']:>10.4f}"
+                f"{b['mean']:>10.4f}   (median {a['median']:.4f} -> {b['median']:.4f})"
             )
     gov = [r for r in rows if r["governing"]]
     non = [r for r in rows if not r["governing"]]
@@ -772,7 +834,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("cmd", choices=["train", "eval", "probe"])
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--attn", default="eager", choices=["eager", "sdpa"])
+    # sdpa, like kvshift_eval: eager materialises the full [heads, q, kv] fp32 score matrix,
+    # which at 8B and 8k tokens is ~8 GB for a single layer and dies before the first item.
+    # Both paths honour the explicit additive mask the stitched forward passes.
+    ap.add_argument("--attn", default="sdpa", choices=["sdpa", "eager"])
     ap.add_argument("--items", type=int, default=600)
     ap.add_argument("--seed", type=int, default=7001)
     ap.add_argument("--gov-frac", type=float, default=0.5)
@@ -792,6 +857,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", default=None, help="where to write the adapter / rows")
     ap.add_argument("--jsonl", default=None)
     ap.add_argument("--probe-turns", type=int, default=20)
+    ap.add_argument("--base-only", action="store_true", help="skip the tuned columns")
+    ap.add_argument(
+        "--grad-prefill",
+        action="store_true",
+        help="backprop into the fresh span's K/V too (more expressive, far more memory)",
+    )
     args = ap.parse_args(argv)
 
     tok, model, loras = _load(
@@ -836,6 +907,7 @@ def main(argv: list[str] | None = None) -> int:
             epochs=args.epochs,
             gen_tokens=args.gen_tokens,
             anchor_weight=args.anchor_weight,
+            grad_prefill=args.grad_prefill,
             anchor_every=args.anchor_every,
             accum=args.accum,
         )

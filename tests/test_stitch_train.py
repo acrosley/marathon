@@ -195,6 +195,31 @@ def test_gradient_reaches_the_adapter_through_a_stitched_cache(tiny):
         lora.lora_a.grad = lora.lora_b.grad = None
 
 
+def test_gradient_reaches_the_adapter_without_prefill_grad(tiny):
+    """The default (memory-cheap) path must still train something.
+
+    With ``grad_prefill=False`` the stitched prefill is a constant, so q/o proj and the
+    continuation tokens' k/v carry the whole signal. If that path ever stopped producing a
+    gradient the trainer would silently no-op, which is much worse than being slow.
+    """
+    model, loras = tiny
+    ex = _example()
+    with torch.no_grad(), adapters(loras, False):
+        old_kv, _ = _prefill(model, ex.old_ids)
+        teacher = model(input_ids=torch.cat([ex.new_ids, ex.query_ids])[None]).logits[0, -4:]
+    forced = [1, 2, 3, 4]
+    with adapters(loras, True):
+        student = stitched_logits(
+            model, ex, [(k.detach(), v.detach()) for k, v in old_kv], forced, grad_prefill=False
+        )
+    assert student.shape[0] == len(forced)
+    kl_to(teacher, student).backward()
+    grads = [lora.lora_b.grad for lora in loras if lora.lora_b.grad is not None]
+    assert grads and max(float(g.abs().max()) for g in grads) > 0
+    for lora in loras:
+        lora.lora_a.grad = lora.lora_b.grad = None
+
+
 def test_clean_logits_reproduce_a_plain_forward(tiny):
     """The anchor path must be a genuine full recompute, not a second stitched run."""
     model, loras = tiny
@@ -247,6 +272,18 @@ def test_build_examples_holds_out_by_seed_and_honours_gov_frac():
     assert [e.new_ids.tolist() for e in train_ex] != [e.new_ids.tolist() for e in held]
     mixed = build_examples(tok, "cpu", 8, seed=7001, gov_frac=0.0, **kw)
     assert mixed and not any("governing" in e.edit_kind for e in mixed)
+    # the whole query pool must be represented, not just whatever sits first: a front slice
+    # gave the 0.6B pilot 120 items that all asked `fact-at` and never asked `obey`
+    wide = build_examples(tok, "cpu", 12, seed=7001, gov_frac=1.0, **kw)
+    qtypes = {e.qtype for e in wide}
+    assert len(qtypes) > 1, qtypes
+    assert "obey" in qtypes, qtypes
+    # and k>1 must not repeat one question inside a session
+    pair = build_examples(tok, "cpu", 3, seed=7001, gov_frac=1.0, queries_per_item=2, **kw)
+    by_sid: dict[int, list[str]] = {}
+    for e in pair:
+        by_sid.setdefault(e.sid, []).append(e.qtype)
+    assert all(len(v) == len(set(v)) == 2 for v in by_sid.values()), by_sid
     for e in train_ex:  # every example must actually have a downstream suffix to go stale
         assert e.span.s > 0
 
