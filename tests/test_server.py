@@ -332,3 +332,105 @@ def test_http_rejects_a_tampered_payload_without_dying():
     finally:
         http.shutdown()
         http.server_close()
+
+
+# --- cold tier (Phase 2) ---------------------------------------------------------
+
+
+class CountingTokenizer(FakeTokenizer):
+    """FakeTokenizer plus the ``encode`` the paging budget counts messages with."""
+
+    def encode(self, text):
+        return list(text.encode())
+
+
+def cold_server(**kw):
+    engine = FakeEngine()
+    return MarathonServer(engine=engine, tokenizer=CountingTokenizer(), **kw), engine
+
+
+def test_active_window_bounds_the_prompt_on_a_long_session():
+    """The exit criterion, end to end: prompt tokens stop growing with the session."""
+    server, engine = cold_server(active_window=1500)
+    c = make_client(server)
+    sizes = []
+    for i in range(40):
+        sizes.append(c.turn("s", f"Entry {i}. " + LONG)["active_tokens"])
+    assert max(sizes[20:]) <= max(sizes[:10]) * 1.3
+    assert server.cold_for("s").demoted
+    # ... and without the window it grows without bound, which is the thing being fixed
+    plain, _ = cold_server()
+    pc = make_client(plain)
+    grows = [pc.turn("p", f"Entry {i}. " + LONG)["active_tokens"] for i in range(40)]
+    assert grows[-1] > 5 * grows[0]
+
+
+def test_metrics_report_the_cold_tier_per_turn():
+    server, _ = cold_server(active_window=1500)
+    c = make_client(server)
+    out = [c.turn("s", f"Entry {i}. " + LONG) for i in range(20)]
+    assert all({"active_tokens", "cold_count", "promotions", "demotions"} <= set(o) for o in out)
+    assert out[-1]["cold_count"] > 0
+    assert any(o["demotions"] for o in out)
+    assert all("reason" in d for o in out for d in o["demotions"])
+
+
+def test_demotion_flows_through_the_reuse_plan_as_an_ordinary_edit():
+    """A demotion must be a shrink edit the plan can reuse around, not a cache wipe."""
+    # a window many messages wide, so most paging turns demote without also having to
+    # evict a stub: a demotion keeps every later message at the same index, which is a
+    # pure shift the plan can reuse around. (An eviction *deletes* a line, which
+    # relocates everything after it, and the plan recomputes relocated blocks by design.)
+    server, _ = cold_server(active_window=12000)
+    c = make_client(server)
+    rows = [c.turn("s", f"Entry {i}. " + LONG) for i in range(30)]
+    demote_only = [
+        r
+        for r in rows
+        if r["demotions"] and not any("evicted" in d["reason"] for d in r["demotions"])
+    ]
+    assert demote_only
+    assert all(r["policy"] == "reuse" for r in demote_only), [r["reason"] for r in demote_only]
+    assert all(r["reused_tokens"] > 0 for r in demote_only)
+
+
+def test_the_governing_system_prompt_is_never_paged_out():
+    server, _ = cold_server(active_window=800)
+    c = make_client(server)
+    c.turn("s", "Standing instruction: always answer in one sentence.", role="system")
+    for i in range(30):
+        c.turn("s", f"Entry {i}. " + LONG)
+    tier = server.cold_for("s")
+    assert tier.demoted and 0 not in tier.demoted
+    assert server._full["s"][0]["content"].startswith("Standing instruction")
+
+
+def test_an_edit_inside_a_demoted_message_promotes_it_back():
+    server, _ = cold_server(active_window=1500)
+    c = make_client(server)
+    for i in range(25):
+        c.turn("s", f"Entry {i}. " + LONG)
+    tier = server.cold_for("s")
+    target = sorted(tier.demoted)[0]
+    c.edit("s", target, f"CORRECTED entry. The beacon code is 4821-OMEGA. {LONG}")
+    out = c.turn("s", "carry on")
+    assert target in [p["index"] for p in out["promotions"]]
+    assert target not in tier.demoted
+
+
+def test_paging_is_isolated_per_session():
+    server, _ = cold_server(active_window=1200)
+    c = make_client(server)
+    for i in range(25):
+        c.turn("a", f"Entry {i}. " + LONG)
+    c.turn("b", "short first turn")
+    assert server.cold_for("a").demoted
+    assert not server.cold_for("b").demoted
+    assert server.cold_for("a") is not server.cold_for("b")
+
+
+def test_no_active_window_leaves_the_pipeline_untouched():
+    server, _ = cold_server()
+    out = make_client(server).turn("s", "hello " + LONG)
+    assert server.cold_for("s") is None
+    assert out["cold_count"] == 0 and out["promotions"] == [] and out["demotions"] == []
