@@ -1,6 +1,6 @@
 # Marathon — Execution Plan
 
-**Status:** Phase 1 exit criterion met 2026-08-18 (position-shifted KV reuse in vLLM: edit-turn prefill 6.1× faster, output byte-identical); multi-span/moved-block reuse and a 144-session distribution eval done 2026-08-19; see findings.md · **Updated:** 2026-08-18 · **Companion:** [DESIGN.md](../DESIGN.md) (doc 0001), [protocol.md](protocol.md), [findings.md](findings.md)
+**Status:** Phase 1 exit criterion met 2026-08-18 (position-shifted KV reuse in vLLM: edit-turn prefill 6.1× faster, output byte-identical); multi-span/moved-block reuse and a 144-session distribution eval done 2026-08-19; see findings.md, consolidated in [phase1-report.md](phase1-report.md) · **Updated:** 2026-08-19 · **Companion:** [DESIGN.md](../DESIGN.md) (doc 0001), [protocol.md](protocol.md), [findings.md](findings.md)
 
 This plan sequences the delta-encoded context architecture from pure systems work (buildable today against existing APIs) toward the research bet (training the trust contract). Each phase has explicit exit criteria; a phase is not done until its metrics are collected and its correctness gate passes.
 
