@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import pytest
 
-from marathon.kvshift import byte_span, token_span
+pytest.importorskip("torch")  # kvshift_eval imports torch at module level; CI has no torch
+
+from marathon.kvshift import byte_span, token_span  # noqa: E402
 from marathon.kvshift_eval import EDIT_KINDS, FAMILIES, SNAPSHOT, build_item, load_corpus
 
 
