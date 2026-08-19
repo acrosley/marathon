@@ -107,9 +107,20 @@ class ShiftStore:
         device: str = "cuda",
         allocate: bool = True,
         slab: int | None = None,
+        session_cap: int | None = None,
     ) -> None:
         self.budget = int(budget_tokens)
         self.slab = min(int(slab or SLAB), self.budget)
+        # Pre-sizing: when the caller knows how many positions a session will ever need
+        # (a server with a bounded active window does), the first allocation is made that
+        # big and no later save has to grow it. Growth is what hurts -- the store is
+        # carved out of a GPU vLLM has already filled to ``gpu_memory_utilization``, so a
+        # realloc holds the old and new buffers at once with no headroom and the
+        # allocator falls back on synchronising and returning blocks to the driver
+        # (measured 2026-08-19 on Qwen3-14B at util 0.93: 7-27 s on the turns that
+        # triggered a growth step, against 1.2 s once capacity settled). It is a floor,
+        # not a ceiling: a session that outgrows it still grows, geometrically.
+        self.session_cap = min(int(session_cap), self.budget) if session_cap else 0
         self.device = device
         self.allocate = allocate
         self._sessions: OrderedDict[str, _Entry] = OrderedDict()  # LRU: oldest first
@@ -146,7 +157,7 @@ class ShiftStore:
         # workload up front (or leaving the card some headroom) is what avoids that; a
         # larger fixed first allocation is not, because it made one session fill the
         # budget and evict every other one on every turn.
-        size = max(self.slab, entry.capacity * 2)
+        size = max(self.session_cap, self.slab, entry.capacity * 2)
         while size < want:
             size *= 2
         want = min(self.budget, size)
