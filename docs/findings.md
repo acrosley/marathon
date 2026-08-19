@@ -320,3 +320,30 @@ Scale changed nothing qualitatively. At 8B the independent-scenario picture is t
 Caveats: one edit per scenario and 2–4 questions each, so `==ref` counts are small and the open-ended summary question drifts from the reference under *every* policy (greedy agreement 0.06–0.15, and it is no better at 18% recompute) — free-running divergence at 40+ tokens is generic, not a reuse artefact. The instruction scenario tests one instruction type (output language) on one model. Only Qwen3 was tested, and the question tail is built with the model's own chat template, so these numbers are not portable to a model with a different template.
 
 @acrosley 2026-08-18
+
+## 2026-08-18 — `--repair-first` does not fix the grow-edit token flip, and a control shows the flip was never a reuse artefact
+
+Commands: `scripts/phase1_probe.sh --mode shift --turns 24 --edit-at 20 --edit-grow 200 --parity-tokens 16 --repair-first {0,64,256,1024,16384}` and `--repair-first 64` on the default δ=4 edit · Model: `Qwen/Qwen3-14B-FP8` · Cost: $0. GPU quiet throughout (Track B idle); every steady-state turn in every run below sits in 0.063–0.116 s, so no row is contended.
+
+New `--repair-first M` in `--mode shift`. vLLM's connector API can only express externally-matched tokens as a *prefix*, so selective recompute has to be an extra phase, not a scatter: phase 1 prefills `P + E'`, phase 2 prefills `P + E' + S[:M]` (M rounded up to a block multiple) so the head of `S` attends to `E'` instead of the replaced `E`, and the final phase loads only `S[M:]` re-rotated. `prefill_s` sums all phases.
+
+Grow edit (turn 0 gains 186 tokens; `S` = ~11.3k tokens), turn 20:
+
+```
+config                     prefill_s  reused_tok  turn20  turn21  turn23(parity)
+prefix (no reuse)            1.273         -     '<think>' '<think>'  '7391-KAPPA'
+shift, M=0                   0.214      11328     '1'      '1'        '7391-KAPPA'
+shift, M=64                  0.240      11264     '1'      '1'        '7391-KAPPA'
+shift, M=256                 0.242      11072     '1'      '1'        '7391-KAPPA'
+shift, M=1024                0.286      10304     '1'      '1'        '7391-KAPPA'
+shift, M=16384 (control)     1.243         16     ' ok'    '<think>'  '7391-KAPPA'
+```
+
+Repair costs what you would expect and buys nothing: M=0 → 1024 adds 72 ms (0.214 → 0.286 s, still 4.4× faster than prefix) and the divergent token does not move. The control settles why. M=16384 exceeds `|S|`, so `load_from` clamps to one block before the end and the connector reuses **16 tokens** — that run is a full recompute in all but name, it costs the same as prefix caching's collapse (1.243 vs 1.273 s), and it emits a *third* answer, `' ok'`. Three phase structures over byte-identical token ids give three different first tokens. So turn 20's greedy token here is a near-tie the model resolves at the numerical-noise level, and what flips it is how the prompt is chunked across requests — different batch shapes, different reduction orders in the prefill kernels — not re-rotated KV. The previous entry's "first output divergence measured" reads as a quality signal; it is not one, and this entry overturns that reading. Track B's independent finding the same day — free-running divergence at 40+ tokens is generic and no better at 18% recompute — points the same way.
+
+Default δ=4 edit with `--repair-first 64`: turn 20 is 0.209 s (11,264 tokens reused, `store[684:11948]`) and the text is `'<think>'`, identical to prefix on every turn, as expected — that case never diverged.
+
+Takeaway: `--repair-first` is implemented and measured, and it is not worth its cost on this workload — no measurable quality change at up to 1024 repaired tokens, +34% on the edit turn. That is the same conclusion the HF prototype reached about selective recompute (`eff` − `frac` bought nothing there either), now confirmed in the serving path, with the added serving-specific reason that each repair phase is a whole extra request: M=64 already costs 26 ms, most of it per-request scheduling rather than the 64 tokens of prefill.
+Caveats: the near-tie diagnosis rests on a single-token observation on one prompt — a proper statement needs teacher-forced KL against a single-pass reference, which this probe still cannot get through vLLM's offline API. `--repair-first` also cannot express the policy the prototype actually favoured (top-r tokens scattered through `S` by K deviation); the prefix-only connector API rules that out without a second, scatter-shaped load path.
+
+@acrosley 2026-08-18
