@@ -10,7 +10,18 @@ The founding concept is in [DESIGN.md](DESIGN.md) (doc 0001). The phased roadmap
 
 Phase 0 (systems groundwork) is done; Phase 1 (self-hosted vLLM, warm-tier KV reuse) has met its exit criterion. This repo currently provides the deterministic core: canonical byte-stable serialization with an append-only history guarantee, a hash-chained snapshot ledger with tamper detection, an rsync-style byte-matched delta engine, a turn protocol with cryptographic integrity verification, and a benchmark harness that measures delta savings against full resend. A session runner drives real conversations through the ledger, and a CI gate proves delta-reconstructed state is byte-identical to full-context replay at every turn.
 
-**Measured so far** (details in [docs/findings.md](docs/findings.md)): offline, a 50-turn session with edits every 10 turns resends 88.85% fewer bytes than full resend, with wire cost flat at ~1.25 KB/turn while state grows to 22 KB. Live against the Anthropic API (Haiku 4.5), append-only canonical history hits the prompt cache exactly — whole history read from cache, only the new turn written, 3 uncached tokens per turn. A one-word edit to the first message drops the provider's cache reads to zero and re-processes the full history, while Marathon's own wire payload absorbs the same edit in ~+560 bytes — the gap Phase 1 targeted. Phase 1 closes it: on self-hosted vLLM 0.27 (Qwen3-14B-FP8, RTX 5090), position-shifted KV reuse — cached keys re-rotated by the edit's token offset, only the edited span and new input recomputed — cuts the edit turn's prefill from 1.465 s to 0.242 s (6.1×) with byte-identical output, while unchanged turns keep the prefix-cache fast path. CacheBlend (LMCache) on the same stack only tied full recompute. The mechanism generalises: several edited messages per turn cost +66 ms each (not context-scaled), moved blocks are recomputed rather than transplanted, and across 144 realistic sessions on Qwen3-8B re-rotated reuse forwards 1.5% of tokens for median KL 0.003 against full recompute — the one failure class is edits to governing spans (system prompt / standing instructions), which the delta layer's `reuse_plan` flags.
+**Measured so far** (details in [docs/findings.md](docs/findings.md)). Phase 0, offline: a 50-turn session with edits every 10 turns resends 88.85% fewer bytes than full resend. Live against the Anthropic API (Haiku 4.5), append-only canonical history hits the prompt cache exactly (3 uncached tokens per turn), and a one-word edit to the first message drops cache reads to zero — the gap Phase 1 targeted.
+
+Phase 1 closes it. On self-hosted vLLM 0.27 (Qwen3-14B-FP8, one RTX 5090), **position-shifted KV reuse** — the delta engine locates the edit, unchanged history is reused with cached keys re-rotated by the token offset (an exact RoPE identity), and only the edited span plus the new input are prefilled — makes the edit turn's prefill nearly flat in context length while prefix caching's grows linearly:
+
+| history at edit turn | prefix caching | Marathon shift | speedup |
+|---:|---:|---:|---:|
+| 4k tokens | 0.42 s | 0.15 s | 2.7× |
+| 12k | 1.27 s | 0.16–0.20 s | 6.5–7.6× |
+| 16k | 1.78 s | 0.20 s | 8.9× |
+| 30k | 3.94 s | 0.26 s | **15.1×** |
+
+Unchanged turns keep the prefix-cache fast path (identical between modes); every turn's output is byte-identical to prefix mode; several edited messages per turn cost +66 ms each rather than a context-scaled recompute; moved blocks are recomputed rather than transplanted. Across 144 realistic sessions on Qwen3-8B, re-rotated reuse forwards 1.5% of tokens for median KL 0.003 against full recompute (prefix caching forwards 66% for KL 0.0015); the one failure class is edits to *governing* spans (system prompt / standing instructions), which the delta layer's `reuse_plan` flags. CacheBlend (LMCache) on the same stack only tied full recompute. The KV connector is session-keyed with LRU eviction and a fused Triton copy kernel at 1.43 TB/s.
 
 ## Quickstart
 
@@ -43,6 +54,10 @@ src/marathon/
   local_probe.py  Phase 1 probe: self-hosted vLLM, modes none / prefix / blend (LMCache) / shift (Marathon)
   kvshift.py      position-shifted KV reuse: RoPE re-rotation of cached keys, delta-located spans, stitching (HF prototype)
   vllm_shift_connector.py  vLLM KV connector implementing shifted reuse inside the paged KV cache
+  shift_store.py  session-keyed position-indexed KV store with LRU eviction
+  shift_kernels.py  fused Triton scatter+re-rotate copy kernel
+  reuse_plan.py   delta layer -> P/E'/S segments + policy (reuse / repair for governing edits / full)
+  kvshift_eval.py distribution-level quality eval (sessions x edit kinds x conditions)
 scripts/          Phase 1 WSL2 environment: setup, LMCache source build + patches, probe runner
 tests/            full test suite incl. randomized diff round-trip properties
 docs/             plan and protocol spec

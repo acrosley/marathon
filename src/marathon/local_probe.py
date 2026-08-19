@@ -15,6 +15,9 @@ edit of turn 0), but served locally so we own the KV cache. Three modes:
             token shift, so vLLM prefills only the edited messages and the new turn.
             ``--edit-count k`` edits k different messages in one turn and ``--move``
             swaps two earlier messages (which gives some segments a negative delta).
+            ``--sessions N`` runs N independent sessions interleaved turn by turn,
+            each with its own planted fact and its own store keyed by session id; a
+            store that leaked across sessions would answer with the wrong code.
 
 Wall time of a ``max_tokens=1`` generate is the prefill cost (offline engine,
 no network). Runs inside WSL2 in ``~/marathon-venv`` (see
@@ -44,7 +47,7 @@ _SEP = " # # "  # LMCache blend separator; also used as message delimiter in eve
 # Parity probe: a unique fact planted mid-history, asked about on the last turn.
 # Answering it requires actually reading turn 3's KV, so a wrong/blank answer
 # means the reused KV lost information the full recompute keeps.
-_PARITY_FACT = "The access code is 7391-KAPPA."
+_PARITY_CODES = ("7391-KAPPA", "5820-OMEGA", "1146-SIGMA", "9032-DELTA")
 _PARITY_AT = 3
 _PARITY_QUESTION = "What is the access code? Answer with only the code."
 
@@ -125,14 +128,21 @@ def _mutate(session, edit_turn: int, count: int, grow: str, move: bool, upto: in
 
 
 @contextlib.contextmanager
-def _engine(mode: str, model: str, max_model_len: int, blend_prefix: bool = False):
+def _engine(
+    mode: str,
+    model: str,
+    max_model_len: int,
+    blend_prefix: bool = False,
+    store_tokens: int = 16384,
+    gpu_util: float = 0.0,
+):
     from vllm import LLM
     from vllm.config import KVTransferConfig
 
     kwargs: dict = dict(
         model=model,
         max_model_len=max_model_len,
-        gpu_memory_utilization=0.80 if mode == "shift" else 0.85,
+        gpu_memory_utilization=gpu_util or (0.80 if mode == "shift" else 0.85),
         enable_prefix_caching=(mode in ("prefix", "shift") or (mode == "blend" and blend_prefix)),
         enforce_eager=(mode == "blend"),  # matches LMCache blend example
         disable_log_stats=False,
@@ -142,6 +152,7 @@ def _engine(mode: str, model: str, max_model_len: int, blend_prefix: bool = Fals
             kv_connector="MarathonShiftConnector",
             kv_connector_module_path="marathon.vllm_shift_connector",
             kv_role="kv_both",
+            kv_connector_extra_config={"store_tokens": store_tokens},
         )
     if mode == "blend":
         kwargs["kv_transfer_config"] = KVTransferConfig(
@@ -184,6 +195,9 @@ def probe(
     edit_count: int = 1,
     move: bool = False,
     reuse_moved: bool = False,
+    n_sessions: int = 1,
+    store_tokens: int = 16384,
+    gpu_util: float = 0.0,
 ) -> list[dict]:
     import dataclasses
 
@@ -207,99 +221,124 @@ def probe(
     tail_answer = tok.encode("\nassistant: <think>\n\n</think>\n\n", add_special_tokens=False)
     sampling = SamplingParams(temperature=0, max_tokens=1)
     parity_sampling = SamplingParams(temperature=0, max_tokens=max(parity_tokens, 1))
-    session = Session()
+    # One independent conversation per session id. With --sessions 2 the turns are
+    # interleaved (s0 turn 0, s1 turn 0, s0 turn 1, ...), both sessions plant a
+    # *different* fact and both are edited, so a store that leaked across sessions
+    # would answer with the other session's code.
+    convos = [
+        {
+            "name": f"s{i}",
+            "session": Session(),
+            "prev": None,
+            "code": _PARITY_CODES[i % len(_PARITY_CODES)],
+        }
+        for i in range(max(n_sessions, 1))
+    ]
     rows: list[dict] = []
 
-    def _sp(base: SamplingParams, **kv) -> SamplingParams:
-        """Copy of ``base`` carrying a reuse plan for the shift connector."""
+    def _sp(base: SamplingParams, name: str, **kv) -> SamplingParams:
+        """Copy of ``base`` carrying this session's reuse plan for the connector."""
         if mode != "shift":
             return base
         p = base.clone()
-        p.extra_args = {"kv_transfer_params": kv}
+        p.extra_args = {"kv_transfer_params": {"session": name, **kv}}
         return p
 
-    with _engine(mode, model, max_model_len, blend_prefix) as llm:
+    with _engine(mode, model, max_model_len, blend_prefix, store_tokens, gpu_util) as llm:
         block_size = llm.llm_engine.vllm_config.cache_config.block_size
         # warm the engine (CUDA graphs / kernels) so turn 0 isn't inflated
-        llm.generate({"prompt_token_ids": sys_ids}, _sp(sampling, save=False))
+        llm.generate({"prompt_token_ids": sys_ids}, _sp(sampling, "warmup", save=False))
         prev = _prefix_hits(llm) or (0, 0)
         line_tokens = _line_tokens(tok, sep)
-        prev_state: bytes | None = None
 
         for t in range(turns):
-            if t == edit_at:
-                grow = _GROW * max(edit_grow // len(tok.encode(_GROW, add_special_tokens=False)), 0)
-                _mutate(session, edit_turn, edit_count, grow, move, t)
-            last = t == turns - 1
-            ask = parity_tokens > 0 and last
-            fact = _PARITY_FACT + " " if parity_tokens > 0 and t == _PARITY_AT else ""
-            request = _PARITY_QUESTION if ask else "Reply 'ok'."
-            state = session.turn("user", f"Turn {t}. {fact}{_FILLER} {request}")
-            history = Session.decode(state)
+            for convo in convos:
+                name, session = convo["name"], convo["session"]
+                prev_state = convo["prev"]
+                if t == edit_at:
+                    per = len(tok.encode(_GROW, add_special_tokens=False))
+                    grow = _GROW * max(edit_grow // per, 0)
+                    _mutate(session, edit_turn, edit_count, grow, move, t)
+                last = t == turns - 1
+                ask = parity_tokens > 0 and last
+                plant = parity_tokens > 0 and t == _PARITY_AT
+                fact = f"The access code is {convo['code']}. " if plant else ""
+                request = _PARITY_QUESTION if ask else "Reply 'ok'."
+                # The session tag only appears with --sessions >1, so a single-session
+                # run stays byte-identical to every earlier measurement in findings.md.
+                tag = f"Session {name}. " if len(convos) > 1 else ""
+                state = session.turn("user", f"{tag}Turn {t}. {fact}{_FILLER} {request}")
+                history = Session.decode(state)
 
-            # prompt = system, then each message as its own separator-delimited chunk
-            chunks = [list(sys_ids)]
-            for h in history:
-                chunks.append(
-                    sep + tok.encode(f"{h['role']}: {h['content']}", add_special_tokens=False)
-                )
-            chunks.append(sep + (tail_answer if ask else tail))
-            ids = [i for c in chunks for i in c]
-
-            base = parity_sampling if ask else sampling
-            # save the KV of everything computed while history is still append-only;
-            # the store is what the edit turn re-rotates out of.
-            save = mode == "shift" and (edit_at is None or t < edit_at)
-            phases: list[tuple[int, dict | None]] = []
-            reuse = None
-            if mode == "shift" and t == edit_at and prev_state is not None:
-                reuse = reuse_plan.plan(prev_state, state, line_tokens, head_tokens=len(sys_ids))
-                if repair_first > 0:
-                    reuse = dataclasses.replace(reuse, repair_first=repair_first)
-                loads = reuse.to_kv_transfer_params(reuse_moved=reuse_moved)
-                phases = _phases(loads, block_size, len(ids))
-                print(
-                    f"[shift] turn {t}: policy={reuse.policy} segments={len(reuse.segments)} "
-                    f"deltas={[sg.delta for sg in reuse.segments]} "
-                    f"moved={[i for i, m in enumerate(reuse.moved) if m]} "
-                    f"reused={sum(sg.length for sg in reuse.segments)}/{len(ids)} "
-                    f"requests={len(phases) or 1} ({reuse.reason})",
-                    flush=True,
-                )
-            prev_state = state
-
-            start = time.perf_counter()
-            if phases:
-                # every phase but the last is a max_tokens=1 warm-up whose only job is to
-                # leave its blocks in vLLM's prefix cache for the phase after it
-                for length, load in phases[:-1]:
-                    llm.generate(
-                        {"prompt_token_ids": ids[:length]},
-                        _sp(sampling, save=False, **({"load": load} if load else {})),
+                # prompt = system, then each message as its own separator-delimited chunk
+                chunks = [list(sys_ids)]
+                for h in history:
+                    chunks.append(
+                        sep + tok.encode(f"{h['role']}: {h['content']}", add_special_tokens=False)
                     )
-                _, load = phases[-1]
-                out = llm.generate({"prompt_token_ids": ids}, _sp(base, save=False, load=load))
-            else:
-                out = llm.generate({"prompt_token_ids": ids}, _sp(base, save=save))
-            prefill_s = time.perf_counter() - start
+                chunks.append(sep + (tail_answer if ask else tail))
+                ids = [i for c in chunks for i in c]
 
-            cur = _prefix_hits(llm)
-            hit = (cur[0] - prev[0]) if cur else None
-            prev = cur or prev
-            rows.append(
-                {
-                    "turn": t,
-                    "prefill_s": round(prefill_s, 4),
-                    "prompt_tokens": len(ids),
-                    "prefix_hit_tokens": hit,
-                    "wire_bytes": len(session.last_payload.wire_bytes()),
-                    "state_bytes": len(state),
-                    "requests": max(len(phases), 1),
-                    "segments": len(reuse.segments) if reuse else 0,
-                    "text": out[0].outputs[0].text,
-                }
-            )
-            session.turn("assistant", "ok")
+                base = parity_sampling if ask else sampling
+                # save the KV of everything computed while history is still append-only;
+                # the store is what the edit turn re-rotates out of.
+                save = mode == "shift" and (edit_at is None or t < edit_at)
+                phases: list[tuple[int, dict | None]] = []
+                reuse = None
+                if mode == "shift" and t == edit_at and prev_state is not None:
+                    reuse = reuse_plan.plan(
+                        prev_state, state, line_tokens, head_tokens=len(sys_ids)
+                    )
+                    if repair_first > 0:
+                        reuse = dataclasses.replace(reuse, repair_first=repair_first)
+                    loads = reuse.to_kv_transfer_params(reuse_moved=reuse_moved)
+                    phases = _phases(loads, block_size, len(ids))
+                    print(
+                        f"[shift] {name} turn {t}: policy={reuse.policy} "
+                        f"segments={len(reuse.segments)} "
+                        f"deltas={[sg.delta for sg in reuse.segments]} "
+                        f"moved={[i for i, m in enumerate(reuse.moved) if m]} "
+                        f"reused={sum(sg.length for sg in reuse.segments)}/{len(ids)} "
+                        f"requests={len(phases) or 1} ({reuse.reason})",
+                        flush=True,
+                    )
+                convo["prev"] = state
+
+                start = time.perf_counter()
+                if phases:
+                    # every phase but the last is a max_tokens=1 warm-up whose only job is to
+                    # leave its blocks in vLLM's prefix cache for the phase after it
+                    for length, load in phases[:-1]:
+                        llm.generate(
+                            {"prompt_token_ids": ids[:length]},
+                            _sp(sampling, name, save=False, **({"load": load} if load else {})),
+                        )
+                    _, load = phases[-1]
+                    out = llm.generate(
+                        {"prompt_token_ids": ids}, _sp(base, name, save=False, load=load)
+                    )
+                else:
+                    out = llm.generate({"prompt_token_ids": ids}, _sp(base, name, save=save))
+                prefill_s = time.perf_counter() - start
+
+                cur = _prefix_hits(llm)
+                hit = (cur[0] - prev[0]) if cur else None
+                prev = cur or prev
+                rows.append(
+                    {
+                        "turn": t,
+                        "session": name,
+                        "prefill_s": round(prefill_s, 4),
+                        "prompt_tokens": len(ids),
+                        "prefix_hit_tokens": hit,
+                        "wire_bytes": len(session.last_payload.wire_bytes()),
+                        "state_bytes": len(state),
+                        "requests": max(len(phases), 1),
+                        "segments": len(reuse.segments) if reuse else 0,
+                        "text": out[0].outputs[0].text,
+                    }
+                )
+                session.turn("assistant", "ok")
     return rows
 
 
@@ -343,7 +382,23 @@ def main(argv: list[str] | None = None) -> int:
         default=0,
         help="shift mode: natively recompute the first M tokens of the reused span",
     )
+    parser.add_argument(
+        "--sessions",
+        type=int,
+        default=1,
+        help="run N independent sessions interleaved turn by turn, each with its own "
+        "planted fact and its own store (proves session isolation in shift mode)",
+    )
     parser.add_argument("--max-model-len", type=int, default=32768)
+    parser.add_argument(
+        "--store-tokens",
+        type=int,
+        default=16384,
+        help="shift mode: size of the connector's flat KV store, in tokens",
+    )
+    parser.add_argument(
+        "--gpu-util", type=float, default=0.0, help="override gpu_memory_utilization"
+    )
     parser.add_argument(
         "--recompute-ratio",
         type=float,
@@ -376,16 +431,27 @@ def main(argv: list[str] | None = None) -> int:
         args.edit_count,
         args.move,
         args.reuse_moved,
+        args.sessions,
+        args.store_tokens,
+        args.gpu_util,
     )
     print(
         f"mode={args.mode} model={args.model} edit_at={args.edit_at} "
         f"ratio={args.recompute_ratio} blend_prefix={args.blend_prefix} "
         f"edit_turn={args.edit_turn} edit_grow={args.edit_grow} "
         f"repair_first={args.repair_first} edit_count={args.edit_count} move={args.move} "
-        f"reuse_moved={args.reuse_moved}"
+        f"reuse_moved={args.reuse_moved} sessions={args.sessions}"
     )
+    if args.mode == "shift":
+        from .vllm_shift_connector import stats
+
+        # vLLM runs the engine core (and with it both connector instances) in a spawned
+        # process, so these counters are only populated when the engine happens to be
+        # in-process; the connector also logs the same dict, which the run log keeps.
+        print("store stats:", json.dumps(stats(), sort_keys=True), "(see log for the engine's own)")
     cols = [
         "turn",
+        "session",
         "prefill_s",
         "prompt_tokens",
         "prefix_hit_tokens",
