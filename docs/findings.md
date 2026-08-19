@@ -668,3 +668,62 @@ Copy is **4.4× cheaper** and now 13% of the edit turn instead of 41%; the edit 
 Caveats: one point of the sweep (30k), not the whole curve, so the new slope in context length is not measured — only its largest point. Single runs, and the earlier 74 ms run also showed several steady turns spiking to 2–4 s under contention from another agent's GPU job, which is a reminder that any single cell here is one sample. Parity is still greedy-text equality against prefix mode plus one planted fact. The kernel is bf16-only in practice (it inherits whatever dtype the cache has, but only bf16 has been run), single-GPU, and untested under tensor parallelism like everything else in the connector.
 
 @acrosley 2026-08-19
+
+## 2026-08-19 — Phase 1.5: on a Gated-DeltaNet hybrid the trick survives, but only if the linear layers get their own cache — and one new failure mode appears
+
+Commands: `scripts/kvshift_hybrid.sh --turns 20 --max-new-tokens 12 --first-m 256` and the same with `--scenario edit-turn0` (which adds `replay-mix+first256`) · Model: `Qwen/Qwen3.5-4B` (bf16, HF transformers 5.15, sdpa, RTX 5090 / WSL2) · Code: `src/marathon/kvshift_hybrid.py`, `src/marathon/kvshift_hybrid_probe.py` · Cost: $0 · logs `~/marathon-logs/kvshifthyb_*.log`
+
+PLAN.md parked hybrid degradation as a Phase 1.5 question. This is the answer, on the model an earlier entry rejected for exactly this reason. `Qwen/Qwen3.5-4B` confirmed from `config.json`: 32 layers, `full_attention_interval=4` → **24 linear (Gated DeltaNet) / 8 full attention**, `head_dim=256` with `partial_rotary_factor=0.25` (only 64 dims rotate) and interleaved mRoPE. The mRoPE turns out to be a no-op for text — all three position rows are equal, so the interleaved sections carry identical frequencies — and re-rotation still holds exactly: **max abs error 8e-6 – 1.5e-5** for δ=37, measured through `model.model.rotary_emb` itself rather than a reimplementation of it. `rerotate_keys_partial` rotates the leading 64 dims and leaves the rest alone; that is the entire delta to `kvshift.py` on the attention side. `flash-linear-attention` is **not** installed, so the recurrence runs transformers' pure-torch fp32 chunked scan — which matters for the wall-clock column and nothing else.
+
+**The structural problem.** A linear layer has no per-token KV, so there is nothing to re-rotate and no position to re-rotate it to. Its state is a running summary `[32 heads, 128, 128]` plus a 4-wide conv window. "Move S by δ" can only mean "run S's tokens through the recurrence again". Four policies (all in `kvshift_hybrid.py`; the 8 attention layers get the unchanged kvshift treatment under every one of them):
+
+- **stale-state** — linear layers reuse the state cached at the end of the *old* context and append E' to it. The naive serving baseline: E' reaches the query through the 8 attention layers, and in the linear half only as 21 tokens tacked on after S.
+- **replay-hidden** — cache, from the old turn, each linear layer's per-token *input* hidden states over S, plus the state at the end of P. On the edit: run E' fresh through all layers, then per linear layer roll only its recurrence over S from those stale inputs. Stale per-token inputs, fresh aggregation — the same staleness class as re-rotated KV. Skips the MLP, which is 63% of a linear layer's weights.
+- **replay-mix** — the same idea one level deeper: cache the old turn's post-conv `(q, k, v, beta, g)` for S. That *is* the linear layer's KV cache, and replay collapses to the bare scan.
+- **+first{M}** — extend the fresh chunk M tokens past E' into S.
+
+Measured per-token cost (parameter counts read off the loaded model): a full token-forward is **3,620 M**; one replayed S token across all 24 linear layers is **558 M for replay-hidden (15.4% of a token-forward)** and **50 M for replay-mix (1.39%)**. Those two numbers are most of the story: 15.4% is a floor you cannot get under while re-projecting the hidden states, and 1.39% is what caching the mixer's own q/k/v buys instead.
+
+Below, `kl fact` is the worst klmean over the three planted-fact questions (prefix fact in P, edit fact in E', suffix fact in S), `kl open` is klmean on the open-ended summary, `facts` counts exact answers, `flops` is the fraction of a full recompute's weight FLOPs, and `prefill_s` includes the query.
+
+```
+edit-turn0   P=41  E=17->21 (d=+4)  S=5271  N=5333
+  policy                  flops  prefill_s  vs full  kl fact   kl open  tf_top1(open)  facts
+  full-recompute          1.000     0.675     1.0x    0.0000    0.0000      1.00        3/3
+  no-rerotate (control)   0.008     0.200     3.4x    0.0083    0.0724      0.88        3/3
+  stale-state             0.008     0.189     3.6x    0.0154    0.0755      0.88        3/3
+  replay-mix              0.022     0.574     1.2x    0.0395    0.0228      0.92        2/3  <- misses the edit
+  replay-mix+first256     0.069     0.588     1.1x    0.0141    0.0166      0.90        3/3
+  replay-hidden           0.160     0.618     1.1x    0.0343    0.0211      0.92        2/3  <- misses the edit
+  replay-hidden+first256  0.200     0.633     1.1x    0.0037    0.0143      0.96        3/3
+
+edit-mid     P=2642  E=18->22 (d=+4)  S=2669  N=5333
+  full-recompute          1.000     0.664     1.0x    0.0000    0.0000      1.00        3/3
+  no-rerotate (control)   0.008     0.198     3.4x    0.0144    0.0437      0.88        3/3
+  stale-state             0.008     0.204     3.3x    0.0150    0.0451      0.90        3/3
+  replay-mix              0.015     0.420     1.6x    0.0017    0.0139      0.92        3/3
+  replay-hidden           0.085     0.476     1.4x    0.0016    0.0103      0.92        3/3
+  replay-hidden+first256  0.126     0.491     1.4x    0.0005    0.0071      0.92        3/3
+
+edit-grow    P=2642  E=257->958 (d=+701)  S=2430  N=6030
+  full-recompute          1.000     0.798     1.0x    0.0000    0.0000      1.00        3/3
+  no-rerotate (control)   0.162     0.303     2.6x    0.0231    0.0461      0.96        3/3
+  stale-state             0.162     0.312     2.6x    0.0175    0.0296      0.96        3/3
+  replay-mix              0.168     0.511     1.6x    0.0020    0.0101      0.96        3/3
+  replay-hidden           0.224     0.566     1.4x    0.0012    0.0060      1.00        3/3
+  replay-hidden+first256  0.260     0.570     1.4x    0.0026    0.0049      1.00        3/3
+```
+
+**What survives.** On a mid-history edit, `replay-mix` reaches klmean **0.0017** on facts and **0.0139** open-ended at **1.5% of full-model FLOPs**. The dense Qwen3-8B distribution eval's headline was 1.5–1.6% of tokens forwarded for a median KL of 0.0035 — so on the compute axis essentially *all* of the dense win transfers, at comparable or better KL. Re-rotation is still doing real work on the 8 attention layers: the `no-rerotate` control is worse than `stale-state` at identical cost on the scenario where δ is large (edit-grow, δ=+701: 0.0231 vs 0.0175 on facts, 0.0461 vs 0.0296 open), and roughly ties it where δ=+4, which is what a 4-token shift should look like.
+
+**What it costs that a dense model does not.** Memory. The 8 attention layers' KV for 5.3k tokens is **167 MiB (32 KB/token)**. The linear layers' mix cache over the same span is **2,988 MiB (566 KB/token)**, and the hidden-state cache **618 MiB (117 KB/token)**. Buying back the dense FLOP fraction on a hybrid costs roughly **18x the cache bytes per token**. If you will not pay that, `replay-hidden` is 5x cheaper in memory and 6x more expensive in FLOPs (8.5–22%), and `stale-state` is nearly free (0.8%) but 5–25x worse in KL.
+
+**The new failure mode, which dense models do not have.** On `edit-turn0` — the edit sits 41 tokens in, with 5,271 tokens of S after it — both replay policies answered the *pre-edit* code `7391-KAPPA` when asked for the edited fact, while `stale-state` got it right. That inversion is not noise, it is the recurrence decaying: replay rolls E' into the state and then washes it out under 5,271 replayed tokens, whereas `stale-state` appends E' *last*, so recency saves it by accident. It is the mirror image of the dense finding, where the failure class was *governing* spans and `--repair-first` did not help. Here first-M is exactly the repair that works, and it is cheap: `replay-mix+first256` restores the fact at 6.9% of FLOPs (klmean on that question 0.0395 → 0.0141), `replay-hidden+first256` at 20% (0.0343 → 0.0037). On `edit-mid` and `edit-grow`, where S is half as long, no repair is needed at all. So the rule this points at — **recompute the first M tokens of S when |S| after the edit is large relative to the state's effective memory** — is about the ratio, and one scenario is not enough to calibrate M.
+
+**Wall clock is not the FLOP number, and the reason is not the method.** `replay-mix` is only 1.2–1.6x faster than full recompute despite doing 1.5–2.2% of the weight FLOPs, because the replay runs transformers' `torch_chunk_gated_delta_rule`: a Python loop over 64-token chunks in fp32, ~40 chunks x 24 layers per edit turn, with no fused kernel behind it. `stale-state`, which does no scan at all, gets the 3.4x its FLOP count predicts. The honest reading is that the FLOP column is the method's result and the wall column is this prototype's — the same gap the dense work closed by moving `kvshift` into vLLM and then onto a Triton kernel.
+
+**Verdict.** Delta-driven reuse does survive on a GDN hybrid, but it stops being a *cache* trick and becomes half cache, half recompute: 8 layers reuse KV exactly (re-rotation is still exact under partial rotary and mRoPE), and 24 layers must replay their recurrence over S. With the linear layers' own q/k/v cached, the edit turn costs 1.5–2.2% of full-recompute FLOPs at KL comparable to the dense result — the compute win transfers — but it needs ~18x the cache memory per token, needs a fused scan kernel before the wall clock follows, and needs first-M repair for edits far from the end of a long context. `stale-state`, which is what a serving system would do without thinking about it, is 5–25x worse in KL and visibly worse in free-running text (tf_top1 0.88–0.90 against 0.92–1.00 on the summaries), so "just keep the final state" is not good enough.
+
+Caveats: one model, three scenarios, one session shape, single runs — no distribution eval like the dense 144-session one, so every cell here is one sample. HF eager prototype, not a serving engine. Facts are graded on a 12-token forced continuation and summaries on 48 greedy tokens. δ=+701 on `edit-grow` because the builder's `grow` argument is characters, not tokens. The old-turn capture prefills in two chunks (P, then E+S), so its state differs from a one-shot prefill in the last floating-point bits. Only `edit-turn0` got the `replay-mix+first256` cell.
+
+@acrosley 2026-08-19
