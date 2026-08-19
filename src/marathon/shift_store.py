@@ -13,7 +13,7 @@ out so they can be unit-tested on CPU without vLLM. Two objects live here:
     Per session, a position-indexed buffer of that session's KV, one tensor per
     layer, shaped ``[capacity, num_kv_heads, 2 * head_size]`` — index is the token's
     absolute position in the prompt, so a reuse plan's ``src_start`` is a slice.
-    Buffers grow in ``CHUNK`` steps; when the total across sessions would exceed the
+    Buffers double from a small floor; when the total across sessions would exceed the
     budget, whole sessions are evicted least-recently-used first.
 
 **Per-token cost.** One position costs ``num_layers * num_kv_heads * head_size * 2 *
@@ -38,12 +38,18 @@ from dataclasses import dataclass, field
 
 import torch
 
-# A session's buffers are allocated once, as a slab, and double only if the session
-# outgrows it. Measured 2026-08-19 on Qwen3-14B: growing a ~2 GB store in 1024-token
-# steps reallocates all 40 layer buffers every other turn, and the allocator churn slowed
-# *every* turn of the run 2-4x while cutting the load copy from 57 GB/s to 4.7 GB/s. A
-# slab wastes memory on short sessions, bounded by the budget; that is the trade.
-SLAB = 16384  # first allocation, capped at the budget; capacity doubles from there
+# A session's buffers double geometrically from a small floor, so a session pays
+# O(log n) reallocations over its whole life rather than one per turn. Measured
+# 2026-08-19 on Qwen3-14B: growing a ~2 GB store in *fixed 1024-token steps* reallocates
+# all 40 layer buffers every other turn, and the allocator churn slowed every turn of the
+# run 2-4x while cutting the load copy from 57 GB/s to 4.7 GB/s. Doubling is what fixes
+# that, not a large first allocation: allocating a fixed 16384-token slab up front made
+# *one session* fill a 24576-token budget, so a second session evicted the first and both
+# reallocated all 40 buffers on every single turn -- 2.7 GB allocated, zeroed and freed
+# per turn on 14B, which is the memory-bound stall measured on the paged workload
+# (findings 2026-08-19). The floor keeps short sessions from reallocating for a while;
+# the doubling keeps long ones from reallocating often.
+SLAB = 2048  # *floor* for a session's first allocation; capacity doubles from there
 DEFAULT_STORE_TOKENS = 32768
 
 
@@ -101,9 +107,20 @@ class ShiftStore:
         device: str = "cuda",
         allocate: bool = True,
         slab: int | None = None,
+        session_cap: int | None = None,
     ) -> None:
         self.budget = int(budget_tokens)
         self.slab = min(int(slab or SLAB), self.budget)
+        # Pre-sizing: when the caller knows how many positions a session will ever need
+        # (a server with a bounded active window does), the first allocation is made that
+        # big and no later save has to grow it. Growth is what hurts -- the store is
+        # carved out of a GPU vLLM has already filled to ``gpu_memory_utilization``, so a
+        # realloc holds the old and new buffers at once with no headroom and the
+        # allocator falls back on synchronising and returning blocks to the driver
+        # (measured 2026-08-19 on Qwen3-14B at util 0.93: 7-27 s on the turns that
+        # triggered a growth step, against 1.2 s once capacity settled). It is a floor,
+        # not a ceiling: a session that outgrows it still grows, geometrically.
+        self.session_cap = min(int(session_cap), self.budget) if session_cap else 0
         self.device = device
         self.allocate = allocate
         self._sessions: OrderedDict[str, _Entry] = OrderedDict()  # LRU: oldest first
@@ -130,7 +147,17 @@ class ShiftStore:
         return sum(e.capacity for e in self._sessions.values())
 
     def _grow(self, session: str, entry: _Entry, want: int) -> None:
-        size = self.slab
+        # Geometric from the session's current capacity, floored at the slab size: a
+        # session pays O(log n) reallocations over its life rather than one per turn, and
+        # several sessions still fit one budget. Growing is not free -- the store is
+        # carved out of a GPU vLLM has already filled to ``gpu_memory_utilization``, so a
+        # realloc holds the old and new buffers at once with no headroom. Measured
+        # 2026-08-19 on Qwen3-14B at util 0.93: the few turns that trigger a growth step
+        # cost 7-27 s against 1.2 s once capacity settles. Sizing the store to the
+        # workload up front (or leaving the card some headroom) is what avoids that; a
+        # larger fixed first allocation is not, because it made one session fill the
+        # budget and evict every other one on every turn.
+        size = max(self.session_cap, self.slab, entry.capacity * 2)
         while size < want:
             size *= 2
         want = min(self.budget, size)
@@ -304,3 +331,27 @@ def plan_save(
     if not store.reserve(session, lo, hi - lo):
         return None
     return lo, hi
+
+
+def churn_tokens(loads: list[dict]) -> tuple[int, int]:
+    """``(changed_before_span, span_len)`` for one turn's reuse plan.
+
+    The turn-counting ceiling (``max_stale``) treats every reused edit turn as equally
+    stale, which it is not: what actually degrades reused KV is how much of the context
+    it *attended to* has since been replaced. This measures that directly.
+
+    ``span_len`` is the reused span — the tokens whose KV is being carried over.
+    ``changed_before_span`` is the tokens lying before the deepest reused segment that
+    this plan does *not* reuse, i.e. exactly the text that was rewritten in front of it.
+    On a paged turn that is the demoted message minus the stub that replaced it; on an
+    append-only turn it is 0, which is why an append-only turn cannot make anything
+    staler. Accumulate it across consecutive reused turns and divide by ``span_len`` to
+    get the churn fraction the reused KV is carrying (see ``MarathonServer.max_churn``).
+    """
+    if not loads:
+        return 0, 0
+    spans = sorted((int(d["dst_start"]), int(d["dst_end"])) for d in loads)
+    span_len = sum(hi - lo for lo, hi in spans)
+    deepest = spans[-1][0]
+    reused_before = sum(min(hi, deepest) - lo for lo, hi in spans if lo < deepest)
+    return max(0, deepest - reused_before), span_len

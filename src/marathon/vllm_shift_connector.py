@@ -149,7 +149,12 @@ class MarathonShiftConnector(KVConnectorBase_V1):
             extra.get("store_tokens", os.environ.get("MARATHON_STORE_TOKENS", DEFAULT_STORE_TOKENS))
         )
         device = str(extra.get("store_device", "cuda"))
-        self._store = ShiftStore(budget, device, allocate=(role == KVConnectorRole.WORKER))
+        # positions a single session will ever need, when the caller knows: allocated
+        # once, so no save has to grow a buffer on a GPU that has no headroom left
+        cap = int(extra.get("session_tokens", 0) or 0)
+        self._store = ShiftStore(
+            budget, device, allocate=(role == KVConnectorRole.WORKER), session_cap=cap
+        )
         _STORES.append(self._store)
 
         # scheduler side

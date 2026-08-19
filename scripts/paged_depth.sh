@@ -16,6 +16,7 @@ store="16384"
 maxtok="24"
 maxstale=""
 repair=""
+window=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --model) model="$2"; shift 2;;
@@ -27,6 +28,7 @@ while [ $# -gt 0 ]; do
     --max-tokens) maxtok="$2"; shift 2;;
     --max-stale) maxstale="$2"; shift 2;;
     --repair-first) repair="$2"; shift 2;;
+    --active-window) window="$2"; shift 2;;
     *) echo "unknown arg: $1"; exit 2;;
   esac
 done
@@ -34,9 +36,12 @@ out="$HOME/marathon-logs"
 mkdir -p "$out"
 common=(--model "$model" --gpu-util "$gpu_util" --max-model-len "$mml" --turns "$turns"
         --demote "$demote" --store-tokens "$store" --max-tokens "$maxtok" --fixed-replies --fact-probe
-        ${maxstale:+--max-stale "$maxstale"} ${repair:+--repair-first "$repair"})
+        ${maxstale:+--max-stale "$maxstale"} ${repair:+--repair-first "$repair"} ${window:+--active-window "$window"})
 
 bash "$here/server_demo.sh" "${common[@]}" --json "$out/paged_reuse.json"
+# let the first engine actually release the card before the second claims it
+sleep 20
+rm -f "$out/paged_control.json"
 bash "$here/server_demo.sh" "${common[@]}" --no-reuse --json "$out/paged_control.json"
 
 "$HOME/marathon-venv/bin/python" - "$out/paged_reuse.json" "$out/paged_control.json" <<'PYEOF'
@@ -51,6 +56,18 @@ for x, y in zip(a, b):
         bad.append(x["turn"] if "turn" in x else a.index(x))
     print(f"{a.index(x):>5} {x['prompt_tokens']:>7} {x['prefill_s']:>8} {y['prefill_s']:>8} "
           f"{x['reused_tokens']:>7} {x['phases']:>3}  {'ok' if same else 'DIVERGED'}")
+import statistics as _st
+def _kinds(rows):
+    plain = [r["prefill_s"] for r in rows if not r["refreshed"] and r["reused_tokens"] == 0]
+    reuse = [r["prefill_s"] for r in rows if r["reused_tokens"] > 0]
+    refr  = [r["prefill_s"] for r in rows if r["refreshed"]]
+    for name, v in (("plain", plain), ("reuse", reuse), ("refresh", refr)):
+        if v:
+            print(f"    {name:>8}: n={len(v):>3} mean={_st.mean(v):.3f}s max={max(v):.3f}s")
+        else:
+            print(f"    {name:>8}: n=0")
+print(""); print("per-turn-kind means (reuse run):"); _kinds(a)
+print("per-turn-kind means (control run):"); _kinds(b)
 ps = sorted(r["prefill_s"] for r in a)
 qs = sorted(r["prefill_s"] for r in b)
 print(f"\nprefill p50 reuse={ps[len(ps)//2]:.3f}s max={ps[-1]:.3f}s | "

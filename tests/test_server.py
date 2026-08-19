@@ -439,3 +439,111 @@ def test_no_active_window_leaves_the_pipeline_untouched():
     out = make_client(server).turn("s", "hello " + LONG)
     assert server.cold_for("s") is None
     assert out["cold_count"] == 0 and out["promotions"] == [] and out["demotions"] == []
+
+
+# --- staleness: replay turns, and the churn ceiling ------------------------------
+
+
+def test_churn_tokens_measures_what_changed_in_front_of_the_span():
+    from marathon.shift_store import churn_tokens
+
+    assert churn_tokens([]) == (0, 0)
+    # one span starting at 500, nothing reused before it: 500 tokens changed in front
+    assert churn_tokens([{"dst_start": 500, "dst_end": 1500, "delta": -8}]) == (500, 1000)
+    # an unchanged prefix reused as its own segment is *not* churn
+    loads = [
+        {"dst_start": 0, "dst_end": 400, "delta": 0},
+        {"dst_start": 500, "dst_end": 1500, "delta": -8},
+    ]
+    assert churn_tokens(loads) == (100, 1400)
+    # append-only: a single segment from 0 changes nothing in front of itself
+    assert churn_tokens([{"dst_start": 0, "dst_end": 900, "delta": 0}]) == (0, 900)
+
+
+def test_a_replay_turn_does_not_advance_the_staleness_clock():
+    """``generate=False`` saves no KV and reuses none, so it must not ratchet.
+
+    Regression test for the interaction Track L flagged: replaying a history to bring a
+    session's paging state up to date would otherwise force spurious refreshes on the
+    real turns that follow it.
+    """
+    server, _ = cold_server(active_window=1500, max_stale=1)
+    session = mclient.Client(mclient.local(server)).session("s")
+    for i in range(12):
+        session.turn("user", f"Entry {i}. " + LONG)
+        server.turn("s", session.last_payload.to_dict(), generate=False)
+        session.messages.append({"role": "assistant", "content": "ok"})
+    assert server._stale.get("s", 0) == 0
+    assert server._churn.get("s", 0) == 0
+
+
+def test_replay_then_generate_leaves_the_clock_consistent():
+    """A replayed history must not change what the first *real* turn is allowed to do."""
+    results = {}
+    for replay in (False, True):
+        server, _ = cold_server(active_window=1500, max_stale=1)
+        c = make_client(server)
+        session = c.session("s")
+        for i in range(10):
+            session.turn("user", f"Entry {i}. " + LONG)
+            server.turn("s", session.last_payload.to_dict(), generate=not replay)
+            session.messages.append({"role": "assistant", "content": "ok"})
+        session.turn("user", "final question")
+        out = server.turn("s", session.last_payload.to_dict())
+        results[replay] = (out["stale"], out["refreshed"])
+    assert results[True] == results[False], results
+
+
+def test_max_stale_forces_a_refresh_on_consecutive_reused_edit_turns():
+    server, _ = cold_server(active_window=12000, max_stale=1)
+    c = make_client(server)
+    rows = [c.turn("s", f"Entry {i}. " + LONG) for i in range(30)]
+    reused = [r for r in rows if r["reused_tokens"]]
+    assert reused, "no turn reused anything; the test is not exercising the ceiling"
+    assert any(r["refreshed"] for r in rows)
+    # a refresh turn reuses nothing, by definition
+    assert all(r["reused_tokens"] == 0 for r in rows if r["refreshed"])
+    # and the clock never exceeds the ceiling
+    assert max(r["stale"] for r in rows) <= 1
+
+
+def test_max_churn_replaces_the_turn_counter():
+    """With ``max_churn`` set, the turn counter is not what decides a refresh."""
+    server, _ = cold_server(active_window=12000, max_stale=1, max_churn=0.2)
+    c = make_client(server)
+    rows = [c.turn("s", f"Entry {i}. " + LONG) for i in range(30)]
+    assert any(r["reused_tokens"] for r in rows)
+    assert all(r["churn"] >= 0.0 for r in rows)
+    # the ceiling holds: a turn is only allowed to reuse while accumulated churn is under
+    for r in rows:
+        if r["refreshed"]:
+            assert r["churn"] > 0.2
+    # and it is genuinely a different policy from counting turns
+    strict, _ = cold_server(active_window=12000, max_stale=1)
+    c2 = make_client(strict)
+    turn_rows = [c2.turn("t", f"Entry {i}. " + LONG) for i in range(30)]
+    assert [r["refreshed"] for r in rows] != [r["refreshed"] for r in turn_rows]
+
+
+def test_churn_accumulates_across_consecutive_reused_turns_and_resets_on_refresh():
+    """Small turns churn the span slowly, so the ceiling takes several of them to trip."""
+    short = "filler " * 40
+    server, _ = cold_server(active_window=6000, max_stale=99, max_churn=0.2)
+    c = make_client(server)
+    rows = [c.turn("s", f"Entry {i}. " + short) for i in range(60)]
+    refreshed_at = [i for i, r in enumerate(rows) if r["refreshed"]]
+    assert refreshed_at, "churn never crossed the threshold; nothing was exercised"
+    # a refresh empties the accumulator, so the next turn starts from its own churn only
+    for i in refreshed_at:
+        assert rows[i]["churn"] > 0.2
+    # within a run of consecutive reused turns the accumulator only grows
+    run: list[float] = []
+    for r in rows:
+        if r["refreshed"] or not r["reused_tokens"]:
+            assert run == sorted(run), run
+            run = []
+        else:
+            run.append(r["churn"])
+    assert run == sorted(run), run
+    # the turn counter is deliberately not the thing being enforced here
+    assert max(r["stale"] for r in rows) > 1

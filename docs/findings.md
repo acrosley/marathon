@@ -1118,6 +1118,122 @@ Caveats: one seed pair, one epoch, 200 training items, one model, n=120 held out
 
 @acrosley 2026-08-19
 
+## 2026-08-19 — Re-measured through `cold.py`: reuse composes (2.6×), the *refresh* turn costs 48 s, and the churn ceiling buys the same accuracy for half the price
+
+Command: `python -m marathon.cold_eval --generate-history --turns 70 --active-window 8192 --threshold 0.2` with `--conditions` / `--max-stale` / `--max-churn` per row (`scripts/cold_eval.sh`) · Model: `Qwen/Qwen3-14B-FP8`, vLLM 0.27.1, retriever `all-MiniLM-L6-v2` on CPU · history p50 25.0k / max 35.0k tokens.
+
+The previous entry asked for exactly this: `max_stale` was validated on a synthetic per-turn front demotion (`server_demo.py --demote`), not on `cold.py` with its retriever, stubs and eviction. Re-measured on the real policy, with every history turn actually prefilled.
+
+**N, honestly.** Sessions are seeded and the corpus frozen, so a session id is byte-identically the same session in every condition. Collected: cold-recall N=10, cold-nostale N=4, cold-churn0.5 N=4, cold-stale1 N=3 (the GPU was needed by another track). **The table is the matched subset — sessions 0, 1, 2 — of all four**, 213 history turns each. Full-N runs agree to within small-sample noise (cold-recall em_all 0.817 at N=10 vs 0.889 here).
+
+| condition | connector | prefill p50 | prefill mean | reuse turn | refresh turn | refresh frac | active max | em_old | em_recent | em_all | promo recall |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| cold-recall | off | 0.648 | **0.537** | — | — | 0 | 8060 | 0.889 | 0.889 | **0.889** | 0.941 |
+| cold-nostale | on, unbounded | 0.192 | **0.173** | 0.207 | — | 0 | 8060 | 0.111 | 0.111 | **0.111** | 0.941 |
+| cold-stale1 | on, `max_stale=1` | 0.479 | **19.170** | 0.523 | 48.29 | 0.393 | 8060 | 0.333 | 0.556 | **0.444** | 0.941 |
+| cold-churn0.5 | on, `max_churn=0.5` | 0.290 | **8.520** | 0.405 | 36.92 | 0.224 | 8060 | 0.222 | 0.667 | **0.444** | 0.941 |
+
+**Reuse composes; the answer to "does Phase 2 meet Phase 1" is yes for the mechanism and no for the system.** Turns actually served from re-rotated KV cost **0.207 s** against the connector-off baseline's 0.537 s mean — a genuine **2.6×** — and the whole unbounded condition runs at 0.173 s mean, **3.1×** faster than prefix caching on the same paged workload. The k+1 phase driver is not a problem either: on the unbounded run, 6-phase turns average 0.242 s and 1-phase turns 0.061 s. Paging is unaffected by any of this — active-window max is 8060 in every row and promotion recall 0.941 in every row, because retrieval is deterministic and independent of the KV path.
+
+**What breaks it is the refresh turn, and it is a serving bug, not a policy cost.** A refresh sets `loads=[]`, so `phases` is empty and the turn takes the ordinary single-request `generate(..., save=self.reuse)` branch — the same prefill cold-recall does in 0.537 s, plus a connector save. It costs **48.3 s**. Clean isolation, identical config (1 session, 40 turns, cold-shift):
+
+```
+max_stale=999 (never refreshes)     16.7 s
+max_stale=1   (the default)        731.6 s      44x
+```
+
+Early append-only turns save in 0.081 s, so saving as such is cheap; it is specifically a save *after* a reused turn, and it runs at 114 W of 575 W — memory bound, i.e. the store is being rewritten rather than extended. The previous turn re-saved `save="full"` in its coordinates and the refresh then writes into coordinates that have shifted again. Same family as the latched full-save, on the refresh path rather than the decode loop.
+
+**The churn ceiling works, and is strictly better than counting turns.** `max_churn=0.5` scores **the same exact-match as `max_stale=1` (0.444) at 2.25× less mean prefill** (8.52 s vs 19.17 s), because it refreshes on 0.224 of turns instead of 0.393: it lets a run of edits that barely disturbs the reused span's prefix keep reusing, where the turn counter refreshes on a schedule regardless. `shift_store.churn_tokens` returns the tokens in front of the deepest reused segment that the plan does *not* reuse; the server accumulates that across consecutive reused turns and refreshes at `accumulated / span_len > max_churn`. CPU calibration over six sessions predicted the refresh fractions within noise (0.253 predicted vs 0.224 measured at 0.5; 0.500 vs 0.393 for `max_stale=1`). **On present evidence the churn ceiling should be preferred to the turn counter** — same accuracy, half the bill — though that is a comparison between two losing configurations, see below.
+
+**Quality tracks the refresh rate, and none of it reaches the baseline.** 0.111 unbounded → 0.444 at both bounded settings → 0.889 connector-off. Staleness damages this workload exactly as it did the synthetic one, but `max_stale=1` does *not* restore parity here the way it did there (1.000 against a control of 1.000). The difference is the shape: the synthetic demotes once per turn against a mostly-static prefix, while `cold.py` demotes 3.19 entries per turn and promotes up to 2 more, so one honest recompute every other reused turn cannot keep up with the drift. **There is currently no setting of either ceiling that is both as accurate as connector-off and faster than it**, and the honest summary is that the cold tier still serves best with the connector off.
+
+**A reuse-plan misclassification found and fixed on the way.** `moved` keyed on "this entry's index changed", which is true of every entry after a deleted one — so a cold-tier *eviction* (dropping a stub from the view is a pure, order-preserving line deletion) was classified as 14 relocated entries and reused nothing at all. The test is ordering, not index equality: read in destination order, the matched source indices are strictly increasing exactly when nothing was reordered. Fixed in `_segments` and in `plan()`'s `relocated` (which was additionally forcing `policy="repair"` on governing entries that had merely been pushed along); genuine reorders fall back to the old, stricter rule. Measured over four 70-turn paged sessions — at an 8192 window eviction never fires and the fix is worth nothing, but at 4096 the old rule discarded **43%** of the turns that can reuse, and at 2048, **84%**. It does not affect the table above; it is what makes tighter windows viable.
+
+**One interaction fixed.** `turn(..., generate=False)` advanced the staleness counter although such a turn saves and loads nothing, so a replayed history forced spurious refreshes on the real turns after it. Both the counter and the churn accumulator are now left untouched on a non-generating turn.
+
+**Limits.** N=3 matched (N=4 and N=10 per condition available and consistent). 17 of the 18 fact questions in the subset had their answer cold, so em is over 18 questions per condition and the 0.444-vs-0.444 equality is "not distinguishable at this N" rather than a measured tie — the *cost* difference between the two ceilings is the solid result. One model, one window (8192), one threshold pair (0.5, plus 0.2 from CPU calibration only — dropped from the GPU run because it refreshes *more* than `max_stale=1` and so is the expensive end of the curve). `max_churn` between 0.5 and unbounded is unmeasured, and that is where a cheaper safe point would be once the refresh bug stops dominating the bill.
+
+## 2026-08-19 — The paged stall is store *allocation*, not the save path — and on the real cold tier the composition is still wrong at 0.5 exact-match
+
+Track N measured refresh turns at 41.5 s mean against reuse turns at 0.90 s and plain appends at 0.08 s, and hypothesised a per-step full re-gather in the post-reuse incremental save. That hypothesis is wrong, and the CPU harness says so cheaply.
+
+**The save path is innocent.** Instrumenting `tests/test_paged_depth.py` to count store writes per turn, over a 20-turn paged session:
+
+| turn kind | positions written per turn |
+|---|---:|
+| plain append | ~265 (O(new tokens)) |
+| reuse (`save="full"`) | ~1035 (one pass over the prompt) |
+| refresh (`save=True`) | ~1035 (one pass over the prompt) |
+
+A refresh turn writes the prompt exactly once — the same volume as a reuse turn, no 40× amplification and no per-decode-step latch. Two regression tests now pin this (`test_refresh_turn_does_not_rewrite_the_store_many_times_over`, `test_no_turn_writes_the_store_more_than_once_over`, asserting every turn writes under 1.5× its own prompt). Nothing in the save path was changed, because nothing in it was broken.
+
+**The bug is that the store reallocated its buffers on every single turn.** `SLAB = 16384` was the *fixed first allocation*, not a floor, so a session holding 235 tokens still claimed a 16384-token slab. With Track N's `store_tokens=24576`, two sessions (32768) cannot coexist, so each session's `_grow` evicted the other and both reallocated all 40 layer buffers every turn. Measured on the CPU harness, three sessions × 14 turns:
+
+| | grows | evictions |
+|---|---:|---:|
+| before | **42** — one per turn, every one from `capacity=0` | 41 |
+| after | **3** — one per session, for life | 0 |
+
+On 14B a slab is 2.7 GB, so that is 2.7 GB allocated, zeroed and freed *per turn*, which is what "41 s at 114 W, memory-bound" actually looks like. The fix is one line in `_grow` — `size = max(self.slab, entry.capacity * 2)` instead of `size = self.slab`, with `SLAB` becoming a 2048-token floor. Growth stays geometric, so the 2026-08-19 slab entry still holds: that entry blamed *fixed 1024-token steps*, and doubling is what fixed it — the large first allocation was never the part that mattered. Reverting the two lines makes the new test fail with "35 evictions: the sessions are thrashing the budget". Track N's own log corroborates the diagnosis: `used_tokens: 16384, sessions: {'cold-shift-3': 7744}` — one session occupying the entire budget while holding 7.7k tokens.
+
+**Ruled out from that log:** zero preemptions and a healthy 12.66 GiB / 82,928-token KV cache, so it is not cache starvation; zero refused saves, zero "no stored KV", zero in-flight-writer conflicts. All 214 "declining reuse" lines are the benign `nothing left after block alignment` on two-phase warm-up requests.
+
+**GPU verification, Qwen3-0.6B, 40 paged turns — criterion met.** Refresh-turn mean **0.034 s** against a connector-off control's plain-turn mean of 0.037 s; reuse turns 0.030 s; fact exact-match 10/10 both sides.
+
+**GPU verification, Qwen3-14B-FP8 on Track N's exact config** (real `cold.py` paging at `--active-window 8192`, `store_tokens 24576`, `gpu_util 0.93`, 40 turns, `max_stale=1`), against a connector-off control on the same config:
+
+| turn kind | n | mean | max |
+|---|---:|---:|---:|
+| plain (in reuse run) | 13 | 0.139 s | 0.174 |
+| reuse | 14 | 0.311 s | 0.933 |
+| refresh | 13 | **6.159 s** | 26.856 (min 1.000) |
+| control — every turn | 40 | 0.502 s | 1.014 |
+
+Refresh turns are no longer uniformly pathological — but the mean hides a shape. Turns 14–24 cost 7–27 s; from turn 26 on they settle at 1.0–1.4 s, i.e. an ordinary full prefill of an 8k window. The slow ones are the turns that happen to trigger a growth step. **Growing at all is what hurts**: the store is carved out of a GPU vLLM has already filled to `gpu_memory_utilization=0.93`, so a realloc must hold the old and new buffers at once with no headroom and the allocator falls back on synchronising and returning blocks to the driver. The remaining fix is to size the store to the workload up front, or to leave the card headroom — not to change the growth policy again. I tried "a sole session takes the whole budget", and it is wrong: the first session is always sole at allocation time, so it fills the budget and we are back to evicting everyone.
+
+**And the correctness result is negative, which matters more than the latency one.** On the real cold tier the connector scores **fact exact-match 5/10 against the control's 10/10**, with 5 of 40 turns differing in text — despite `max_stale=1`, which held at 10/10 on the synthetic shape. The difference is the workload: my synthetic demotion produces a *single* reused segment per turn, while the real policy also promotes, so a turn carries 5–6 segments across 6 phases with relocations among them. The staleness ceiling was tuned on the easy shape. **Phase 2 × Phase 1 is still not correct on the real paging policy**, and the next thing to measure is which of promotion / eviction / multi-segment phasing is responsible — the per-turn records now carry `promotions`, `demotions`, `segments` and `deltas`, so that is a read of the existing JSON rather than a new run.
+
+**Limits.** One run per cell; the 14B reuse and control runs are separate engine invocations (the first attempt's control died at engine-core init under `util 0.93` back-to-back, which is why `paged_depth.sh` now sleeps and deletes the stale JSON before the second run — a stale file had silently produced a 0.6B-vs-14B comparison). The 0.6B result is on the synthetic shape, not `cold.py`. The eviction-thrash fix is verified on CPU and by inference on GPU; no run isolates a growth event directly.
+
+@acrosley 2026-08-19
+
+## 2026-08-19 — The paged 5/10 is stale attention, not a coordinate bug: all damage is on reuse turns, and it tracks how much of the view is stubs
+
+Three CPU results on the 14B paged run's own records, plus a fingerprint harness extended to `cold.py`'s real policy.
+
+**1. Every wrong turn is a reuse turn.** Splitting the 40-turn run by turn kind, against the connector-off control on identical (teacher-forced) histories:
+
+| turn kind | n | turns diverging from control | scored turns |
+|---|---:|---:|---:|
+| plain | 13 | **0** | 3 |
+| reuse | 14 | **5** | 7 |
+| refresh | 13 | **0** | 0 |
+
+Refresh turns are byte-identical to the control, every one — the staleness ceiling's recompute does exactly what it is supposed to. All damage is in re-rotated KV.
+
+**2. The headline 5/10 was measuring the wrong thing.** The probe asks its question every 4th turn, and `max_stale=1` makes reuse and refresh alternate, so from turn 13 on *every scored turn lands on a reuse turn* — 7 scored reuse turns, 3 scored plain, **0 scored refresh**. The ceiling can never protect a scored turn, so 5/10 is "how often is a reuse turn right", not "how good is the system". The other 30 turns carry no signal at all: their replies are canned (`Understood.` / `ok`), which is also why "5 of 40 diverged" and "5 of 10 scored" are the same five turns. Any future paged eval has to sample scored turns independently of the reuse/refresh phase.
+
+**3. What predicts a wrong reuse turn: how much of the view has become stubs.**
+
+| turn | hit | segments | phases | promos | cold msgs | reused % | max abs delta |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 13 | **MISS** | 1 | 2 | 0 | 1 | **91.7%** | 566 |
+| 17 | hit | 6 | 4 | 2 | 13 | 74.5% | 5528 |
+| 21 | hit | 6 | 5 | 2 | 21 | 75.1% | 5535 |
+| 25 | **MISS** | 6 | 6 | 2 | 31 | 73.1% | 4374 |
+| 29 | **MISS** | 6 | 6 | 2 | 39 | 74.6% | 4920 |
+| 33 | **MISS** | 6 | 6 | 2 | 49 | 72.8% | 3749 |
+| 37 | **MISS** | 6 | 6 | 2 | 57 | 74.4% | 4302 |
+
+Promotions do not predict it (2 on every turn, hit and miss alike). Segment count does not (6 on both). Reused fraction does not (74.5% hits, 74.6% misses). **Cold count does**, monotonically and with a clean threshold between 21 and 31 — and turn 13 is a second regime, the one turn that reuses 92% of the prompt off a single front demotion. Both are the same underlying quantity: how much of the text a reused span attended to has since been replaced. That is churn measured in tokens, not turns, and the current ceiling counts turns.
+
+**4. The coordinates are exact — the harness says so, and it can prove it is looking.** `tests/test_paged_depth.py` now drives `marathon.cold`'s real policy (demotions, retriever promotions, stub evictions, multi-segment phasing) through the token-id-as-KV fingerprint, teacher-forced. Over 30 turns at an 1500-token window: 54 demotions, 44 evictions, 43 promotions, plans up to 6 segments, and **zero corrupted positions, zero declined loads, zero refused saves**; a 40-turn run at a 900-token window forces evictions specifically and is also clean. Injecting a one-block error into `plan_load`'s delta produces **1181 corrupted positions**, so the clean result is a measurement rather than a blind spot. Every position holds its own token under the full policy: the connector is putting KV exactly where it belongs, and the answer damage is stale attention.
+
+**5. Pre-sizing the store, so growth never happens on a full GPU.** `ShiftStore` takes a `session_cap`: when the caller knows a session's ceiling — a server with a bounded active window does — the first save allocates that much and no later save grows. It is a floor, not a ceiling (a session that outgrows it still grows geometrically), and it is off by default so multi-session budgets keep sharing. `MarathonServer` passes `active_window + max_tokens + 256` through `kv_connector_extra_config["session_tokens"]`. Three CPU tests cover it: one allocation for a session filling its window turn by turn, growth still available past the cap, and geometric behaviour unchanged when it is off. This is aimed at the 7–27 s growth-step turns measured at `gpu_util=0.93`; it is unverified on GPU.
+
+**Limits.** The predictor table is seven reuse turns from one run — cold count and turn index are confounded (both rise monotonically), so "stub fraction" is a hypothesis consistent with the data, not an isolated cause. The fingerprint model treats re-rotation as exact by construction, so it can only ever find *coordinate* errors; it cannot see attention damage, which is precisely the thing now suspected. Segment spans are now recorded per turn so a real churn metric can be computed from the next run's JSON without another GPU run. Pre-sizing and the churn-based ceiling are both untested on hardware; GPU verification is queued.
+
 ## 2026-08-19 — Iteration 3 at 4–8k: the gates fail on both hinge weights, and iteration 2's promising ratios turn out to be mostly a regime artefact
 
 Command: `scripts/stitch_train_8b.sh` (base-only n=120, then w=2) and the same with `--skip-basecheck --preserve-weight 4` (w=4) — train 200 items seed 7001 lr 3e-5, `--grad-prefill` capped at 6000 tokens, `--standing-frac 0.34`, checkpoints every 50 with a 24-item held-out eval, checkpoint chosen by the pre-registered rule, then held-out eval n=120 seed 9001 and the dependent-edit probe (WSL2, `~/marathon-venv`, torch 2.13.0+cu130, transformers 5.15.0, sdpa, bf16, RTX 5090; peak 26.86 GiB both arms) · Model: `Qwen/Qwen3-8B`, LoRA r=16 α=32 on q/k/v/o · Cost: $0.
