@@ -40,6 +40,26 @@ pip install -e ".[live]"
 ANTHROPIC_API_KEY=... python -m marathon.live_probe --turns 6
 ```
 
+### End-to-end server (needs a GPU and vLLM)
+
+`marathon.server` is the whole pipeline: it verifies a turn payload against its
+content-addressed store, plans KV reuse against the session's previous state, and drives
+vLLM with the shift connector. `marathon.client` keeps the history and ships only deltas.
+
+```bash
+python -m marathon.server --model Qwen/Qwen3-0.6B --port 8000   # POST /v1/turn
+python scripts/server_demo.py --url http://127.0.0.1:8000       # 12 turns + a mid-history edit
+bash scripts/server_demo.sh --model Qwen/Qwen3-14B-FP8 --gpu-util 0.80  # both, end to end
+```
+
+```python
+from marathon.client import Client, http
+c = Client(http("http://127.0.0.1:8000"))
+c.turn("s1", "Remember the access code 7391-KAPPA.")
+c.edit("s1", 0, "Remember the access code 5820-OMEGA.")  # takes effect next turn
+print(c.turn("s1", "What is the access code?"))          # reply + per-turn metrics
+```
+
 ## Layout
 
 ```
@@ -57,6 +77,8 @@ src/marathon/
   shift_store.py  session-keyed position-indexed KV store with LRU eviction
   shift_kernels.py  fused Triton scatter+re-rotate copy kernel
   reuse_plan.py   delta layer -> P/E'/S segments + policy (reuse / repair for governing edits / full)
+  server.py       end-to-end server: verify payload -> plan reuse -> drive vLLM -> reply + metrics
+  client.py       the other half: keeps the history, ships deltas, in-process or over HTTP
   kvshift_eval.py distribution-level quality eval (sessions x edit kinds x conditions)
 scripts/          Phase 1 WSL2 environment: setup, LMCache source build + patches, probe runner
 tests/            full test suite incl. randomized diff round-trip properties

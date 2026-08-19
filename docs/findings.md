@@ -668,3 +668,44 @@ Copy is **4.4× cheaper** and now 13% of the edit turn instead of 41%; the edit 
 Caveats: one point of the sweep (30k), not the whole curve, so the new slope in context length is not measured — only its largest point. Single runs, and the earlier 74 ms run also showed several steady turns spiking to 2–4 s under contention from another agent's GPU job, which is a reminder that any single cell here is one sample. Parity is still greedy-text equality against prefix mode plus one planted fact. The kernel is bf16-only in practice (it inherits whatever dtype the cache has, but only bf16 has been run), single-GPU, and untested under tensor parallelism like everything else in the connector.
 
 @acrosley 2026-08-19
+
+## 2026-08-19 — The pieces become a system: `marathon.server` + `marathon.client` end to end, 12.6k-token edit turn at 0.179 s vs 1.277 s over HTTP
+
+Everything measured so far was a probe driving the engine directly. This entry is the first end-to-end run of the actual thing: a client that holds a conversation and ships only deltas, an HTTP endpoint that verifies each payload against a content-addressed store, and a server that plans KV reuse from the *verified* state and drives vLLM with the shift connector. `src/marathon/server.py`, `src/marathon/client.py`, `scripts/server_demo.sh`. The phase driver is no longer duplicated — `local_probe._phases` moved to `reuse_plan.phases` and both callers use it.
+
+**Qwen/Qwen3-0.6B, 12 turns, edit at turn 9, over `POST /v1/turn`** (`gpu_memory_utilization=0.30`):
+
+```
+turn  wire_bytes  state_bytes  prompt_tokens  prefill_s  reused  phases  policy   reply
+   0        7122         2987            600     0.2327       0       1  first    'Reply: Ok.'
+   1        3398         6018           1202     0.0185       0       1  reuse    'Reply: Ok.'
+   4        3321        15142           3021     0.0195       0       1  reuse    'Reply: Ok.'
+   8        3321        27266           5429     0.0213       0       1  reuse    'Reply: Ok.'
+   9        3519        30375           6049     0.0322    4829       2  reuse    'Reply: Ok.'   <- edit turn
+  10        3397        33407           6652     0.0247       0       1  reuse    'Reply: Ok.'
+  11        3495        36481           7264     0.0303       0       1  reuse    '7391-KAPPA'   <- planted fact
+```
+
+**Qwen/Qwen3-14B-FP8, 24 turns, edit at turn 20, with the reuse control (`--no-reuse`, plain vLLM prefix caching) run separately:**
+
+```
+turn  prompt_tokens  shift prefill_s  control prefill_s  reused tokens  phases
+   0            600          0.1778             0.1793              0       1
+  10           6604          0.0907             0.0912              0       1
+  19          12004          0.1090             0.1078              0       1
+  20          12622          0.1793             1.2770          11404       2   <- edit turn, 7.1x
+  21          13222          0.1230             0.1175              0       1
+  23          14431          0.2020             0.1957              0       1   <- parity: '7391-KAPPA' both
+```
+
+**The headline is the edit turn: 1.277 s → 0.179 s, 7.1×, through the full protocol path** — payload verification, delta reconstruction, chat-template rendering, plan, k+1 connector requests and generation, not a probe shortcut. It lands inside the 0.16–0.25 s band the direct probe measured at this length, so the protocol layer costs nothing detectable. Every non-edit turn is within noise of the control, which is what it must be: nothing changes on an unchanged turn. Both runs answer the planted fact `7391-KAPPA` on the last turn, so the reuse did not lose the fact it stitched over.
+
+**The wire column is the other half of the claim, and it is the one only an end-to-end run can show.** State grows from 3 KB to 72 KB across 24 turns; the payload stays at ~3.3 KB every single turn, including the edit turn (3529 bytes — a rewritten opening message costs 200 bytes over an append). Per-turn wire cost is flat while the conversation grows linearly, which is the DESIGN.md claim stated as bytes rather than as prefill.
+
+**A real bug the end-to-end path found that no probe could have.** The reuse plan needs the token ids *each message contributes*, and the obvious way to get them from a chat template — render `messages[:k+1]`, subtract `messages[:k]` — is wrong, because chat templates are not append-only. Qwen3 renders a *trailing* assistant message with an empty `<think>` block and silently drops it once another message follows. Every coordinate after the first assistant turn would have been shifted by four tokens, and the connector would have transplanted KV into the wrong slots — a plausible-looking prompt with quietly corrupted reuse. `ChatTokenizer` now renders each prefix with a throwaway sentinel message appended, so no real message is ever last; the sentinel's rendered block is derived from the template rather than hardcoded, the prefix property is checked per message rather than trusted, and the ids fed to the engine are always a single encode of the full prompt with the pieces supplying only lengths. The probes never hit this because they built their own `role: content` prompt layout and never went through a chat template at all.
+
+**Session handling.** Previous state, per-line token cache and connector store key are all keyed by session id, and CPU tests (`tests/test_server.py`, fake engine, no vLLM) cover the three properties that matter: a tampered delta or a bad `target_hash` raises before the engine is ever called, two interleaved sessions plan independently (an edit in one leaves the other append-only), and an append-only turn asks the KV layer for nothing — one segment, zero reused tokens handed to the connector, one request, because the leading prefix is vLLM's own cache and not ours.
+
+**Honest limits.** The connector store key carries an epoch that rolls after an edit turn, so a session's *second* edit re-saves under a fresh key with partial coverage and the store declines what it does not hold — safe (a recompute, never a wrong answer) but not fast. v1 therefore accelerates the first edit in a session and degrades gracefully after it; making repeated edits fast needs a save path that can write the loaded segments' new positions, which is not built. The demo is one run per configuration, not a distribution. The client advances its baseline when it builds a payload, so a rejected turn leaves it ahead of the server and the documented recovery is to drop the session. Single GPU, no tensor parallelism, and the HTTP layer is stdlib `http.server` with a lock around a blocking single-tenant engine — correct for one conversation at a time, not a serving front end.
+
+@acrosley 2026-08-19
