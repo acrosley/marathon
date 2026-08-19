@@ -222,7 +222,7 @@ def build_dep_contradict(turns: int):
             " The valid harbor code is",
             12,
         ),
-        ("open", None, "\nuser: Summarise the log so far.\nassistant:", 48),
+        ("open", None, "Summarise the log so far.", "", 48),
     ]
     return session, src * 2, new, qs
 

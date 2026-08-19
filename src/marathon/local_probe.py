@@ -270,6 +270,12 @@ def main(argv: list[str] | None = None) -> int:
         default=0,
         help="which turn's user message --edit-at mutates (default 0)",
     )
+    parser.add_argument(
+        "--edit-grow",
+        type=int,
+        default=0,
+        help="make the edit add roughly this many tokens (default: a ~4-token shift)",
+    )
     parser.add_argument("--max-model-len", type=int, default=32768)
     parser.add_argument(
         "--recompute-ratio",
@@ -298,6 +304,7 @@ def main(argv: list[str] | None = None) -> int:
         args.blend_prefix,
         args.parity_tokens,
         args.edit_turn,
+        args.edit_grow,
     )
     print(
         f"mode={args.mode} model={args.model} edit_at={args.edit_at} "

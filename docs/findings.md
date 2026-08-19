@@ -238,3 +238,42 @@ Takeaway: the Phase 1 exit criterion is met on the append-only-plus-one-edit wor
 Caveats, all real: (1) single request, single writer, no eviction, one GPU — this is a probe, not a scheduler-safe connector. (2) The reuse region is copied in whole blocks only, so a sub-block head of `S` is folded into phase 1 and a sub-block tail is recomputed; that is why phase 1 pads up to a block boundary. (3) `S` here is semantically independent of the edited span, the friendly case, same caveat as the HF entry — quality is asserted only by output parity and one planted fact, not by a KL measurement at this scale. (4) The two-phase split is the probe's job, not the connector's; a real server would need the edit's token span from the delta engine directly. (5) A mid-history variant (`--edit-turn 10`, so `P` is 6.5k tokens and `S` is 5.4k) ran correctly — `loaded 5360 tokens x 40 layers from store[6588:11948], delta=4` — but every wall time in that run was contended by another agent's GPU job (steady-state turns at 0.7–5.4 s in two separate attempts), so no timing is quoted from it and the mid-history position remains unmeasured.
 
 @acrosley 2026-08-18
+
+## 2026-08-18 — Shifted KV reuse holds on a mid-history edit (4.7×) and a +186-token grow edit (5.9×); the grow edit flips one token
+
+Commands: `scripts/phase1_probe.sh --mode {shift,prefix} --turns 24 --edit-at 20 --parity-tokens 16` with `--edit-turn 10` (mid-history) and with `--edit-grow 200` (grow) · Model: `Qwen/Qwen3-14B-FP8`, same stack · Cost: $0. New `--edit-grow N` flag prepends filler to the edited message so the edit *adds* ~N tokens instead of shifting by ~4, which is the harder case for re-rotation.
+
+**Mid-history edit** (`--edit-turn 10`: `P` = 6.6k tokens, the connector reuses `S` = 5,360 tokens, `loaded 5360 tokens x 40 layers from store[6588:11948], delta=4`). Prefix caching is *not* fully collapsed here — it hits `P` (5,984 tokens) and recomputes the 6,577 after the edit, so its edit turn is 0.95 s rather than 1.46 s. Shift still wins:
+
+```
+turn  prompt_tokens   prefix_s  prefix_hit   shift_s  prefix_hit   text
+ 17      10766          0.111      10160      0.161      10160     '<think>'
+ 18      11363          0.114      10752      0.103      10752     '<think>'
+ 19      11960          0.109      11344      0.098      11344     '<think>'
+ 20      12561          0.950       5984      0.200      12576     '<think>'   <- edit of turn 10
+ 21      13158          0.138      12544      0.108      12544     '<think>'
+ 22      13755          0.134      13152      2.246*     13152     '<think>'
+ 23      14364          0.231      13744      0.265      13744     '7391-KAPPA'
+```
+
+**0.950 s → 0.200 s, 4.7×.** A second shift run reproduced turn 20 at 0.223 s. `*` turn 22 is contended (Track B); so were turns 5/6/15 of that run, and a whole repeat run spiked to 27 s — every quoted row above except the starred one sat in a stretch of clean neighbours, and the prefix run was fully clean (0.076–0.138 s across turns 0–19).
+
+**Grow edit** (`--edit-grow 200` on turn 0: the edited message gains 186 tokens, `loaded 11328 tokens x 40 layers from store[614:11942], delta=186` — a 46× larger shift than the default). Both runs fully clean, no contention:
+
+```
+turn  prompt_tokens   prefix_s  prefix_hit   shift_s  prefix_hit   prefix_text  shift_text
+ 17      10766          0.096      10160      0.098      10160     '<think>'    '<think>'
+ 18      11363          0.101      10752      0.103      10752     '<think>'    '<think>'
+ 19      11960          0.097      11344      0.097      11344     '<think>'    '<think>'
+ 20      12743          1.273          0      0.214        816     '<think>'    '1'        <- edit, delta=+186
+ 21      13340          0.101      12736      0.102      12736     '<think>'    '1'
+ 22      13937          0.111      13328      0.110      13328     '<think>'    '<think>'
+ 23      14546          0.198      13920      0.196      13920     '7391-KAPPA' '7391-KAPPA'
+```
+
+**1.273 s → 0.214 s, 5.9×** — the speedup is indifferent to how big the shift is, as expected, since re-rotation is a fixed-cost angle regardless of `delta`. But this is the first output divergence measured: on turns 20 and 21 the single greedy token differs (`'1'` vs `'<think>'`), converging again at turn 22, and the planted-fact answer at turn 23 is still exact in both modes. Turn 21 inherits the difference because it prefix-hits the blocks the connector wrote on turn 20.
+
+Takeaway: the win is robust to edit position (4.7× when prefix caching still gets a partial hit) and to edit size (5.9× at δ=+186). The honest crack is the divergence: the HF prototype predicted this — it measured per-position top-1 agreement at 0.92–1.00, i.e. occasional flips — and at δ=+186 a flip lands on the very first sampled token. The residual is not re-rotation (that is exact) but the fact that `S`'s KV attended to `E`, not `E'`; the prototype showed a first-M or CacheBlend-style selective recompute of `S` cuts the KL 2–4× further, and the connector has no such policy yet. That is the next thing to build, and this measurement is the reason to build it.
+Caveats: as the previous entry, plus — one greedy token per turn is a very coarse quality probe; a real check needs teacher-forced KL at 14B scale against a full recompute, which this probe cannot do through vLLM's offline API.
+
+@acrosley 2026-08-18
