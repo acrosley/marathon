@@ -7,9 +7,11 @@ from ``vllm_shift_connector``.
 
 from __future__ import annotations
 
-import torch
+import pytest
 
-from marathon.shift_store import SessionTable, ShiftStore, slots
+torch = pytest.importorskip("torch")
+
+from marathon.shift_store import SessionTable, ShiftStore, slots  # noqa: E402
 
 
 def _kv(n: int, value: float, heads: int = 2, dim: int = 4) -> torch.Tensor:

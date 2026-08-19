@@ -15,10 +15,11 @@ scattered non-contiguous destination blocks (a real block table is not sorted).
 from __future__ import annotations
 
 import pytest
-import torch
 
-from marathon import shift_kernels
-from marathon.kvshift import rerotate_keys
+torch = pytest.importorskip("torch")  # noqa: E402
+
+from marathon import shift_kernels  # noqa: E402
+from marathon.kvshift import rerotate_keys  # noqa: E402
 
 DELTAS = [-3000, -4, 0, 4, 186, 10000]
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel needs CUDA")
