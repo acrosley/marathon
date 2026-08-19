@@ -46,6 +46,10 @@ _PARITY_FACT = "The access code is 7391-KAPPA."
 _PARITY_AT = 3
 _PARITY_QUESTION = "What is the access code? Answer with only the code."
 
+# Prepended by --edit-grow to make the edit *grow* the history rather than shift it
+# by a handful of tokens: a bigger delta is the harder case for re-rotation.
+_GROW = "Amended note: this span was revised later in the session. "
+
 
 def _configure(mode: str, recompute_ratio: float) -> None:
     if mode != "blend":
@@ -148,6 +152,7 @@ def probe(
     blend_prefix: bool = False,
     parity_tokens: int = 0,
     edit_turn: int = 0,
+    edit_grow: int = 0,
 ) -> list[dict]:
     from transformers import AutoTokenizer
     from vllm import SamplingParams
@@ -188,7 +193,8 @@ def probe(
         for t in range(turns):
             if t == edit_at:
                 i = 2 * edit_turn
-                session.edit(i, "[EDITED] " + session.messages[i]["content"])
+                grow = _GROW * max(edit_grow // len(tok.encode(_GROW, add_special_tokens=False)), 0)
+                session.edit(i, "[EDITED] " + grow + session.messages[i]["content"])
             last = t == turns - 1
             ask = parity_tokens > 0 and last
             fact = _PARITY_FACT + " " if parity_tokens > 0 and t == _PARITY_AT else ""
