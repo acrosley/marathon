@@ -65,8 +65,19 @@ def _read(pattern: str) -> list[tuple[str, str]]:
     return out
 
 
-def load_corpus() -> dict[str, list]:
-    """Real repo text, chopped into turn-sized chunks. Deterministic (sorted paths)."""
+#: Frozen sample of the live corpus. The tests build sessions from this, not from the
+#: working tree, so editing repo source cannot change what they assert.
+SNAPSHOT = REPO / "tests" / "data" / "kvshift_eval_corpus.json"
+
+
+def load_corpus(snapshot: Path | str | None = None) -> dict[str, list]:
+    """Real repo text, chopped into turn-sized chunks. Deterministic (sorted paths).
+
+    Pass ``snapshot`` to read a frozen sample instead of the working tree.
+    """
+    if snapshot is not None:
+        data = json.loads(Path(snapshot).read_text(encoding="utf-8"))
+        return {k: [tuple(x) for x in v] for k, v in data.items()}
     code = []
     for name, text in [x for p in _CODE_FILES for x in _read(p)]:
         lines = text.splitlines()
@@ -196,6 +207,10 @@ _USER_ASK = {
     ],
 }
 
+# tokens a user/assistant pair costs beyond its body: the ask, the reply, the
+# planted-fact sentence, the filler sentence, and the chat template's own markup.
+_PER_TURN_OVERHEAD = 60
+
 EDIT_KINDS = ["fact", "rewrite", "insert", "delete", "governing"]
 FAMILIES = ["code", "prose", "qa"]
 
@@ -208,6 +223,7 @@ def build_item(
     seed: int,
     min_tokens: int = 4000,
     max_tokens: int = 8000,
+    count_tokens=None,
 ) -> Item:
     """Build one session (~4-8k tokens), plant three facts, and stage one edit.
 
@@ -215,7 +231,13 @@ def build_item(
     the same three fact questions are askable under every edit kind. The edited message
     always keeps its fact sentence in its first line; edits other than ``fact`` operate
     around it, never on the code itself.
+
+    ``count_tokens`` maps a string to a token count and sizes the session. Pass the real
+    tokenizer: a chars/N estimate overshoots badly on code and on the ``qa`` family's
+    short table lines, which is how the first 8B run produced a 10.9k-token session
+    against an 8k ceiling. The default is a crude estimate, for CPU tests only.
     """
+    count = count_tokens or (lambda s: len(s) // 3)
     rng = random.Random((seed * 1_000_003) ^ (sid * 7919) ^ (EDIT_KINDS.index(edit_kind) * 31))
     instr_a, instr_b = _INSTRUCTIONS[rng.randrange(len(_INSTRUCTIONS))]
     system = (
@@ -229,11 +251,16 @@ def build_item(
     session = Session()
     session.turn("system", system)  # governing=True by default for the system role
 
-    # how many user/assistant pairs fit the token budget (~3.2 chars/token for this mix)
+    # how many user/assistant pairs fit the token budget, measured not estimated.
+    # _PER_TURN_OVERHEAD covers the ask, the assistant reply and the template markup
+    # that every pair carries on top of its body.
     target = rng.randint(min_tokens, max_tokens)
     bodies: list[tuple[str, str]] = []
-    while sum(len(b[1]) for b in bodies) // 3 < target and len(bodies) < 60:
-        bodies.append(_body(rng, family, corpus))
+    used = count(system) + _PER_TURN_OVERHEAD
+    while used < target and len(bodies) < 60:
+        body = _body(rng, family, corpus)
+        bodies.append(body)
+        used += count(body[1]) + _PER_TURN_OVERHEAD
     n_turns = max(6, len(bodies))
     edit_turn = rng.randrange(2, max(3, n_turns - 2))
     before_turn = rng.randrange(0, edit_turn)
@@ -480,6 +507,7 @@ def main(argv: list[str] | None = None) -> int:
             args.seed,
             args.min_tokens,
             args.max_tokens,
+            lambda s: len(tok.encode(s, add_special_tokens=False)),
         )
         for sid in range(args.sessions)
     ]

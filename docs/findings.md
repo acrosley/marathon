@@ -347,3 +347,60 @@ Takeaway: `--repair-first` is implemented and measured, and it is not worth its 
 Caveats: the near-tie diagnosis rests on a single-token observation on one prompt — a proper statement needs teacher-forced KL against a single-pass reference, which this probe still cannot get through vLLM's offline API. `--repair-first` also cannot express the policy the prototype actually favoured (top-r tokens scattered through `S` by K deviation); the prefix-only connector API rules that out without a second, scatter-shaped load path.
 
 @acrosley 2026-08-18
+
+## 2026-08-18 — Distribution eval, 60 sessions: re-rotated reuse costs 1.6% of tokens for a median KL of 0.0035, and the governing-span rule is right about *where* but wrong about *why*
+
+Command: `scripts/kvshift_eval.sh --model Qwen/Qwen3-8B --sessions 60 --gen-tokens 32 --seed 1234` → new `marathon.kvshift_eval` (WSL2, `~/marathon-venv`, torch 2.13.0+cu130, transformers 5.15.0, sdpa, bf16, peak 19.6 GiB, 1297 s) · Model: `Qwen/Qwen3-8B` · Cost: $0.
+
+The previous two entries measured position-shifted reuse on six hand-built scenarios. This is the population version a reviewer would ask for: **60 seeded sessions** (4,378–8,207 tokens, median 6,311) across three families — coding-assistant sessions whose history is real source chunks from this repo, prose sessions built from `docs/*.md`/`DESIGN.md`/`README.md` paragraphs, and Q&A sessions over seeded fact tables — each rendered through Qwen3's chat template. Each session gets **one** edit at a random earlier turn, one of five kinds: `fact` (identifier swap, δ≈0), `rewrite` (body swap, δ −135…+137), `insert` (δ≈+29), `delete` (δ≈−14), and `governing` (the system prompt's standing instruction, δ≈0–1) as its own bucket. Three codes are planted strictly before / inside / after the edited message so the same fact questions are askable under every edit kind. Queries are drawn from a template pool (`fact-before/at/after`, `summarise`, `obey` = "give me a one-line status", `continue-code`) plus, on ~1/3 of items, a question the model wrote itself under full recompute. 200 (session, edit, query) items × 4 conditions.
+
+`klmean` is mean KL over 32 **teacher-forced** continuation tokens of the reference's own greedy output; `kl1` is first-token KL; `tf_top1` per-position top-1 agreement; `exact` is exact match of the 32-token free-running greedy answer against full recompute; `frac` is tokens forwarded. `prefix-equiv` is what vLLM prefix caching can do — reuse `P` only, recompute everything from the edit onward — and it is here for its *cost*, not its quality.
+
+```
+overall            n   klmean    klmed    klp95    klmax  kl1mean   kl1max  tf_top1  exact   frac  >.05  >.2
+full-recompute   200   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000    1.000   1.00  1.000     0    0
+reuse-all        200   0.0142   0.0035   0.0599   0.6382   0.0453   4.1928    0.985   0.64  0.016    11    1
+no-rerotate      200   0.0675   0.0128   0.3021   1.5246   0.1479   6.6726    0.969   0.45  0.016    53   18
+prefix-equiv     200   0.0017   0.0011   0.0038   0.0452   0.0017   0.0609    0.992   0.80  0.664     0    0
+```
+
+```
+by edit kind           n   klmean(reuse)  klmean(no-rr)   klp95    klmax  tf_top1  exact    frac
+fact                  41      0.0023         0.0025      0.0057   0.0093   0.990    0.76   0.005
+insert                41      0.0067         0.0182      0.0245   0.0303   0.988    0.66   0.009
+delete                39      0.0115         0.1161      0.0337   0.1352   0.985    0.59   0.004
+rewrite               41      0.0167         0.1637      0.0886   0.1419   0.985    0.71   0.058
+governing             38      0.0350         0.0372      0.0715   0.6382   0.975    0.45   0.004
+```
+
+```
+by query type (reuse-all)   n   klmean    klp95    klmax  kl1mean   kl1max  tf_top1  exact
+fact-after                 23   0.0048   0.0172   0.0331   0.0021   0.0303    0.995   0.74
+summarise                  22   0.0059   0.0154   0.0246   0.0019   0.0290    0.989   0.59
+model-written              20   0.0095   0.0479   0.0838   0.1548   2.5864    0.988   0.65
+fact-at                    60   0.0114   0.0653   0.0994   0.0004   0.0107    0.988   0.72
+continue-code              10   0.0136   0.0457   0.0457   0.0128   0.0687    0.981   0.70
+obey                       37   0.0220   0.1137   0.1419   0.1545   4.1928    0.970   0.32
+fact-before                28   0.0274   0.0235   0.6382   0.0001   0.0028    0.985   0.79
+```
+
+**The claim holds at population scale.** Re-rotated reuse forwards **1.6%** of tokens for a median KL of 0.0035 and a p95 of 0.060; prefix caching's equivalent forwards **66.4%**. 11/200 items clear KL 0.05 and exactly one clears 0.2. Planted-fact retrieval is untouched: 105/111 correct under reuse-all against 106/111 under full recompute — one item's difference, across facts before, inside and after the edit.
+
+**The re-rotation control is now decisive where it can be.** Over the whole population no-rerotate is 4.8× worse in mean KL and puts 53/200 items over 0.05 and 18/200 over 0.2, against reuse-all's 11 and 1, at identical cost. But the per-kind split shows *why*, and it is the useful part: re-rotation only helps where the edit actually shifts positions. On `rewrite` (δ −135…+137) it is a 10× improvement (0.0167 vs 0.1637) and on `delete` (δ≈−14) 10× (0.0115 vs 0.1161); on `fact` and `governing`, where δ ∈ {−1,0,1}, reuse-all and no-rerotate are the same number to three decimals. That is exactly the predicted behaviour of a fixed-angle rotation, measured across 200 items rather than asserted.
+
+**On the governing-span question the rule survives, but its stated mechanism does not.** Governing edits are the worst bucket (klmean 0.0350, exact 0.45, and both the largest KL in the run and the only item over 0.2), and at 19% of items they carry 5 of the 11 over-0.05 items — a 2.4× enrichment. So `reuse_plan`'s refusal is pointed at a real tail. But three things in this data say the reason is not "instructions govern later generation":
+
+1. Governing edits shift nothing (δ ∈ {0,1}), so re-rotation is a no-op there and reuse-all ≡ no-rerotate. Whatever hurts is pure stale attention, not position.
+2. The failures land on **fact questions**, not on the instruction-following question. Cross-tabbed: governing × `obey` is 0.0138 mean KL, while governing × every other query is **0.0448**, including the run's worst item (`sid=34`, a governing edit asked `fact-before`, KL 0.638 — with a first-token KL of 0.001, i.e. the divergence is late in the continuation, not at the first token). The 0.35 first-token KL of the hand-built `dep-instruction` scenario does not reproduce anywhere in 60 sessions.
+3. The confound is size. The system prompt sits at position 0, so a governing edit leaves `P`≈27 tokens and puts the **entire** history into `S` — `sid=34` has S=7,053. Every token of `S` carries stale attention to the changed span. The other kinds edit a middle turn and leave a real prefix intact. Governing edits are not a semantically special class in this data; they are the class where 100% of the context is downstream of the edit.
+
+The honest restatement is therefore: **the predictor is how much of the context sits after the edit, and "governing" is a proxy for "at the very front".** The two are perfectly confounded here because a standing instruction is always message 0. `reuse_plan` refusing on governing spans still refuses on the right items — it just should not be sold as instruction-awareness, and an edit to a large early *non*-governing turn should be expected to behave the same way. Untested, and the cheapest next experiment.
+
+**The `obey` cell is real but half of it is not reuse's fault.** `obey` is the worst query type for reuse-all — exact 0.32, kl1mean 0.155 with a 4.19 outlier — and the natural read is that a short "one-line status" answer is where a standing instruction bites. But `prefix-equiv` on the same cell only reaches exact 0.59 (0.56 on non-governing × obey), and `prefix-equiv` is mathematically a full recompute of everything that could have changed. So roughly half the disagreement on `obey` is the reference's own instability under a different chunking of the same tokens — the same near-tie effect the `--repair-first` entry diagnosed, now quantified on a population.
+
+**Calibration that a reviewer should hold onto:** `prefix-equiv` scores KL 0.0017 (not 0) and exact-match **0.80** (not 1.00) against a single-pass reference over byte-identical token ids. Free-running 32-token exact match is a metric with a ~20% noise floor on this workload, so reuse-all's 0.64 is to be read against 0.80, not against 1.00 — while the teacher-forced KL, which has no such floor, separates the conditions cleanly (0.0017 / 0.0142 / 0.0675). This is why the KL columns carry the argument and the exact-match column does not.
+
+Takeaway: over 60 realistic sessions and 200 graded items, position-shifted re-rotated reuse diverges from full recompute at a rate of 11/200 above KL 0.05 and 1/200 above 0.2, for 1.6% of the compute prefix caching would spend on the same edits. Re-rotation is what buys that on every edit kind that moves positions. The governing-span rule catches the tail, but the mechanism is span *position and size*, not instruction semantics, and the entry that proposed it (2026-08-18, "instruction spans, not fact spans") is narrowed by this one rather than confirmed.
+Caveats: one model (`Qwen3-8B` bf16, sdpa) and one seed — the governing-vs-rewrite ordering rests on 38 vs 41 items and a second seed was not run. Sessions are synthetic, and although their material is real repo text, the turn structure is templated. `continue-code` is n=10 and `governing × obey` is n=12; those cells are indicative only. The three planted codes are the only hard-graded answers; `summarise`, `obey`, `continue-code` and `model-written` are graded solely by agreement with full recompute, which the `prefix-equiv` floor shows is a noisy target. And the position/size-vs-semantics reinterpretation above is an inference from a confounded design, not a controlled result: it needs a run that edits a large early non-governing turn.
+
+@acrosley 2026-08-18

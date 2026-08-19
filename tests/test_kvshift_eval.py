@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 from marathon.kvshift import byte_span, token_span
-from marathon.kvshift_eval import EDIT_KINDS, FAMILIES, build_item, load_corpus
+from marathon.kvshift_eval import EDIT_KINDS, FAMILIES, SNAPSHOT, build_item, load_corpus
 
 
 def _byte_tokens(data: bytes) -> list[int]:
@@ -21,7 +21,18 @@ def _byte_tokens(data: bytes) -> list[int]:
 
 @pytest.fixture(scope="module")
 def corpus():
-    return load_corpus()
+    """The frozen sample, so editing repo source cannot change what these assert."""
+    return load_corpus(SNAPSHOT)
+
+
+def test_live_corpus_matches_the_snapshot_shape():
+    """The snapshot is only useful if the real loader still produces the same shape."""
+    live, snap = load_corpus(), load_corpus(SNAPSHOT)
+    assert live.keys() == snap.keys()
+    for key in live:
+        assert live[key], f"live corpus has no {key} entries"
+        assert all(isinstance(x, tuple) and len(x) == 2 for x in live[key])
+        assert all(len(text) > 400 for _, text in live[key])
 
 
 @pytest.mark.parametrize("kind", EDIT_KINDS)
