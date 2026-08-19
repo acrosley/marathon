@@ -136,9 +136,16 @@ class ShiftStore:
         return sum(e.capacity for e in self._sessions.values())
 
     def _grow(self, session: str, entry: _Entry, want: int) -> None:
-        # geometric from the session's *current* capacity, floored at the slab size:
-        # never allocate a session more than it has shown it needs, and never grow it
-        # by a constant step either
+        # Geometric from the session's current capacity, floored at the slab size: a
+        # session pays O(log n) reallocations over its life rather than one per turn, and
+        # several sessions still fit one budget. Growing is not free -- the store is
+        # carved out of a GPU vLLM has already filled to ``gpu_memory_utilization``, so a
+        # realloc holds the old and new buffers at once with no headroom. Measured
+        # 2026-08-19 on Qwen3-14B at util 0.93: the few turns that trigger a growth step
+        # cost 7-27 s against 1.2 s once capacity settles. Sizing the store to the
+        # workload up front (or leaving the card some headroom) is what avoids that; a
+        # larger fixed first allocation is not, because it made one session fill the
+        # budget and evict every other one on every turn.
         size = max(self.slab, entry.capacity * 2)
         while size < want:
             size *= 2
