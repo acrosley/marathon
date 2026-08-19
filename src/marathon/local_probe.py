@@ -153,6 +153,7 @@ def probe(
     parity_tokens: int = 0,
     edit_turn: int = 0,
     edit_grow: int = 0,
+    repair_first: int = 0,
 ) -> list[dict]:
     from transformers import AutoTokenizer
     from vllm import SamplingParams
@@ -227,13 +228,24 @@ def probe(
                 phase1_len, dst_end, delta = plan
                 # phase 1: prefill P + E' at native speed so it lands in the prefix cache
                 llm.generate({"prompt_token_ids": ids[:phase1_len]}, _sp(sampling, save=False))
-                # phase 2: prefix-hit P + E', connector supplies S, vLLM prefills the rest
+                # phase 2 (repair): prefill the first M tokens of S natively, so they
+                # attend to E' instead of carrying attention to the replaced E. vLLM's
+                # connector API can only express matched tokens as a prefix, so the
+                # repaired head has to be a separate, block-aligned request.
+                load_from = phase1_len
+                if repair_first > 0:
+                    repair = -(-repair_first // block_size) * block_size
+                    load_from = min(phase1_len + repair, dst_end - block_size)
+                    load_from -= load_from % block_size
+                    llm.generate({"prompt_token_ids": ids[:load_from]}, _sp(sampling, save=False))
+                # final phase: prefix-hit everything computed so far, connector supplies
+                # the rest of S re-rotated, vLLM prefills the new turn and the query
                 out = llm.generate(
                     {"prompt_token_ids": ids},
                     _sp(
                         base,
                         save=False,
-                        load={"dst_start": phase1_len, "dst_end": dst_end, "delta": delta},
+                        load={"dst_start": load_from, "dst_end": dst_end, "delta": delta},
                     ),
                 )
             else:
@@ -276,6 +288,12 @@ def main(argv: list[str] | None = None) -> int:
         default=0,
         help="make the edit add roughly this many tokens (default: a ~4-token shift)",
     )
+    parser.add_argument(
+        "--repair-first",
+        type=int,
+        default=0,
+        help="shift mode: natively recompute the first M tokens of the reused span",
+    )
     parser.add_argument("--max-model-len", type=int, default=32768)
     parser.add_argument(
         "--recompute-ratio",
@@ -305,10 +323,12 @@ def main(argv: list[str] | None = None) -> int:
         args.parity_tokens,
         args.edit_turn,
         args.edit_grow,
+        args.repair_first,
     )
     print(
         f"mode={args.mode} model={args.model} edit_at={args.edit_at} "
-        f"ratio={args.recompute_ratio} blend_prefix={args.blend_prefix}"
+        f"ratio={args.recompute_ratio} blend_prefix={args.blend_prefix} "
+        f"edit_turn={args.edit_turn} edit_grow={args.edit_grow} repair_first={args.repair_first}"
     )
     cols = ["turn", "prefill_s", "prompt_tokens", "prefix_hit_tokens", "wire_bytes", "state_bytes"]
     print(" ".join(f"{c:>17}" for c in cols), " text")

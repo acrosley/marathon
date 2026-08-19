@@ -277,3 +277,46 @@ Takeaway: the win is robust to edit position (4.7× when prefix caching still ge
 Caveats: as the previous entry, plus — one greedy token per turn is a very coarse quality probe; a real check needs teacher-forced KL at 14B scale against a full recompute, which this probe cannot do through vLLM's offline API.
 
 @acrosley 2026-08-18
+
+## 2026-08-18 — Where re-rotated KV reuse actually breaks: instruction spans, not fact spans (Qwen3-8B + 0.6B)
+
+Command: `python -m marathon.kvshift_probe --model Qwen/Qwen3-8B --turns 20` (WSL2, `~/marathon-venv`, torch 2.13.0+cu130, transformers 5.15.0, sdpa, bf16, peak 18.5 GiB) · Models: `Qwen/Qwen3-8B` and `Qwen/Qwen3-0.6B` · Cost: $0.
+
+Follow-up to the previous entry, which measured position-shifted KV reuse only where `S` was semantically independent of the edit. Three new scenarios make `S` depend on the edited span: **dep-anaphora** (turn 2 states a code; later turns say "that mission code is from now on the primary key" without repeating the value, so `S` must resolve a reference into `E'`), **dep-instruction** (turn 0 flips a standing "always reply in French" to "in German", which governs the final answer 5k tokens later), **dep-contradict** (an authoritative correction is inserted mid-history revoking a code that a *later* turn still instructs the model to quote). Same metrics as before, plus `==ref`: does the policy produce the same answer as full recompute.
+
+One harness bug had to be fixed first, and it invalidated the dependent scenarios' first run: the probe rendered history as a plain `role: content` transcript, so the model *continued the log* instead of obeying it — at full recompute the 0.6B model ignored the language instruction entirely, which silently turns every instruction-following test into a no-op. The probe now renders through the model's own chat template (`--raw` keeps the old behaviour), and only then does full recompute exhibit the behaviour we are trying to preserve. The independent scenarios were re-run under the template too, so all numbers below are comparable.
+
+```
+Qwen3-8B, worst case over each scenario's questions
+scenario         policy          frac    eff   klmean   kl_first  tf_top1  QA/lang  ==ref
+edit-turn0       full-recompute  1.000  1.000   0.0000    0.0000    1.00     4/4     4/4
+ (S independent) reuse-all       0.008  0.008   0.0115    ~0.01     0.94     4/4     3/4
+                 first-512       0.104  0.104   0.0067    ~0.01     1.00     4/4     3/4
+edit-mid         reuse-all       0.008  0.008   0.0051    ~0.01     0.96     4/4     3/4
+edit-grow        reuse-all       0.088  0.088   0.0035    ~0.01     1.00     4/4     4/4
+dep-anaphora     full-recompute  1.000  1.000   0.0000    0.0000    1.00     3/3     3/3
+ (S -> E' ref)   no-rerotate     0.005  0.005   0.0145    0.0199    0.94     3/3     2/3
+                 reuse-all       0.005  0.005   0.0145    0.0199    0.94     3/3     2/3
+                 first-512       0.100  0.100   0.0039    0.0199    0.96     3/3     2/3
+dep-contradict   full-recompute  1.000  1.000   0.0000    0.0000    1.00     2/2     2/2
+ (override)      reuse-all       0.014  0.014   0.0122    0.0579    0.96     2/2     1/2
+                 first-512       0.109  0.109   0.0172    0.0414    0.98     2/2     1/2
+dep-instruction  full-recompute  1.000  1.000   0.0000    0.0000    1.00    en,en    2/2
+ (governing)     reuse-all       0.004  0.004   0.0118    0.3492    0.95    de,de    0/2
+                 first-32        0.010  0.010   0.0036    0.0384    0.98    de,en    1/2
+                 first-512       0.100  0.100   0.0014    0.0177    0.98    de,en    1/2
+                 blend-r0.30     0.300  0.355   0.0051    0.1761    0.95    de,de    0/2
+```
+
+Verdict, in two halves. **Fact-level dependence does not break re-rotated reuse.** In dep-anaphora every policy — including plain `reuse-all` at **0.5%** recompute — resolves "that mission code" to the *new* value 9902-SIGMA, exactly as full recompute does; in dep-contradict every policy honours the inserted override and answers 4417-TANGO rather than the revoked code that later text still tells it to quote. The reason is structural: the query attends to `E'` directly, so a fact only has to survive in `E'`, and `S`'s stale hidden states carry the *pointer*, which the edit did not change. First-token KL does rise (0.02 and 0.058, vs ~0.01 in the independent scenarios) — the strain is visible — but not enough to change an answer.
+
+**Governing instructions are where it breaks.** In dep-instruction, `reuse-all` diverges from full recompute on the *first generated token* at KL **0.35** — 30× the ~0.01 of every other scenario — and produces a different language than the reference in 2/2 questions. Recomputing the first tokens of `S` cuts that first-token KL about 10× (0.35 → 0.038 at first-32, → 0.018 at first-512, i.e. 10% of `S`) and restores agreement in half the cases; no policy we tried restores it reliably, and the `blend` selector was the *worst* of the selective options here (0.176 at r=0.30, 35% effective recompute) because it picks tokens by layer-1 K deviation, which the instruction flip barely moves. So the repair is real but partial, and it is bought with an order of magnitude more compute than the fact cases need.
+
+An honest complication on that scenario: the reference is the shakier party. At full recompute the 8B model **ignored** the standing German instruction and answered in English, while the reuse paths answered in German — i.e. the reuse path was arguably the more obedient one. What these runs establish is that reuse *changes behaviour* on a governing-instruction edit; they do not establish which behaviour is correct, and long-context instruction drift at full recompute is a confound we did not control.
+
+For the delta engine the answer is therefore not "mark every downstream span that mentions the edit". Fact-carrying edits need nothing extra — the value is fetched from `E'` on demand. What needs marking is a much narrower class: edits inside spans that *govern* later generation (system/standing instructions, persona, output-format and language directives, tool-use policy). For those, re-rotated reuse should be refused or backed by a recompute of a leading chunk of `S`. That is a cheap classification — such spans are usually the system prompt and the first turn, and the delta engine already knows the byte offsets — and it is a far smaller tax than the dependency-tracking the previous entry's caveat implied.
+
+Scale changed nothing qualitatively. At 8B the independent-scenario picture is the same as at 0.6B (`reuse-all` klmean 0.0035–0.0115, QA 4/4), and dep-anaphora/dep-contradict behave the same in both. Scale does make the speed number meaningful: at 8B and ~5.3k tokens the prefill is 0.42–0.53 s full versus **0.04 s** reused (~11×), 0.08 s at first-512 and 0.19 s at blend-r0.30 — unlike the 0.6B run, this is compute-bound enough that the recompute fraction and the wall clock finally agree.
+Caveats: one edit per scenario and 2–4 questions each, so `==ref` counts are small and the open-ended summary question drifts from the reference under *every* policy (greedy agreement 0.06–0.15, and it is no better at 18% recompute) — free-running divergence at 40+ tokens is generic, not a reuse artefact. The instruction scenario tests one instruction type (output language) on one model. Only Qwen3 was tested, and the question tail is built with the model's own chat template, so these numbers are not portable to a model with a different template.
+
+@acrosley 2026-08-18
