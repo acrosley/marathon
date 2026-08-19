@@ -70,8 +70,8 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     edit_at = [int(x) for x in str(args.edit_at).split(",") if x != ""]
-    if args.demote:
-        edit_at = []  # demotion drives the edits instead
+    if args.demote or args.fact_probe:
+        edit_at = []  # paging drives the edits instead
     # a code goes in a few turns before each edit, so each one has to survive every
     # edit that follows it
     plant_at = {max(e - 3, 0): CODES[i % len(CODES)] for i, e in enumerate(edit_at)}
@@ -98,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
         # attending over the *reused* span. "Reply ok." would compare 'Ok.' against
         # 'Ok.' and call a corrupted cache a match.
         want = None
-        if args.demote and args.fact_probe:
+        if args.fact_probe:
             # Exactly one code is alive at a time: it is planted every 4th turn and the
             # previous one has already been demoted to a stub by the time the next is
             # planted, so "the access code" is unambiguous and a 0.6B can answer it.
@@ -159,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
         scored = [r for r in rows if r["hit"] is not None]
         hits = sum(1 for r in scored if r["hit"])
         print(f"fact exact-match: {hits}/{len(scored)} = {hits / max(len(scored), 1):.3f}")
-    if args.demote:
+    if args.demote or args.fact_probe:
         edited = [r for r in rows if r["reused_tokens"] > 0]
         pre = [r["prefill_s"] for r in rows]
         pre_sorted = sorted(pre)
@@ -176,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
             f"edit turn {t:>2}: {e['prefill_s']:>7}s  {e['reused_tokens']:>6} tokens reused  "
             f"({e['policy']}: {e['reason']})"
         )
-    if args.demote and not plant_at:
+    if (args.demote or args.fact_probe) and not plant_at:
         return 0
     planted = [plant_at[t] for t in sorted(plant_at)]
     missing = [code for code in planted if code not in answer]

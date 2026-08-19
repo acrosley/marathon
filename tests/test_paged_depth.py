@@ -59,6 +59,7 @@ class FingerprintEngine:
         self.refused_saves = 0
         self.corruptions: list[tuple[int, int, int, int]] = []  # (turn, pos, want, got)
         self.saved_token_steps = 0  # positions written to the store, summed over steps
+        self.saves: list[tuple[int, int, int]] = []  # (turn, lo, hi) of every store write
         self.turn = -1
 
     # ---------------------------------------------------------------- paged cache
@@ -142,6 +143,7 @@ class FingerprintEngine:
             params["save"] = True
         lo, hi = window
         values = self._read(blocks, lo, hi)
+        self.saves.append((self.turn, lo, hi))
         self.store.write(
             session, "L0", lo, torch.tensor(values, dtype=torch.float32).reshape(-1, 1, 1)
         )
@@ -269,3 +271,77 @@ def test_staleness_budget_off_reuses_every_turn():
         rows.append(c.turn("s", f"Turn {t}. {FILLER * 3}"))
     assert not any(r["refreshed"] for r in rows)
     assert engine.corruptions == []
+
+
+def _saved_per_turn(engine: FingerprintEngine) -> dict[int, int]:
+    out: dict[int, int] = {}
+    for turn, lo, hi in engine.saves:
+        out[turn] = out.get(turn, 0) + (hi - lo)
+    return out
+
+
+def test_refresh_turn_does_not_rewrite_the_store_many_times_over():
+    """A refresh turn recomputes the prompt, so it saves it once — not once per step.
+
+    Bug 1 (findings 2026-08-19) was a ``save="full"`` that stayed latched and re-gathered
+    the whole prompt on every decode step. The refresh branch saves with a plain ``True``
+    and must not regress into the same shape: its whole-turn write volume is one pass
+    over the prompt plus one position per generated token.
+    """
+    engine = FingerprintEngine()
+    rows, _, _ = run_paged_session(20, engine, max_tokens=8)
+    per_turn = _saved_per_turn(engine)
+    for t, r in enumerate(rows):
+        if r["refreshed"]:
+            assert per_turn.get(t, 0) <= r["prompt_tokens"] + 8 + BLOCK, (
+                f"refresh turn {t} wrote {per_turn.get(t)} positions for a "
+                f"{r['prompt_tokens']}-token prompt"
+            )
+
+
+def test_no_turn_writes_the_store_more_than_once_over():
+    """Every turn, of every kind, writes at most one pass over its own prompt."""
+    engine = FingerprintEngine()
+    rows, _, _ = run_paged_session(20, engine, max_tokens=8)
+    per_turn = _saved_per_turn(engine)
+    worst = max((per_turn.get(t, 0) / max(r["prompt_tokens"], 1), t) for t, r in enumerate(rows))
+    assert worst[0] < 1.5, f"turn {worst[1]} wrote {worst[0]:.1f}x its prompt into the store"
+
+
+def test_sessions_coexist_instead_of_evicting_each_other_every_turn():
+    """The store must not reallocate a session's whole buffer set on every turn.
+
+    A fixed first allocation made one session fill the whole budget, so a second session
+    evicted the first and both reallocated all 40 layer buffers every turn — 2.7 GB
+    allocated, zeroed and freed per turn on 14B. Buffers now double from a small floor,
+    so a session pays O(log n) reallocations over its life and several sessions fit.
+    """
+    engine = FingerprintEngine(budget_tokens=24576)
+    server = MarathonServer(engine=engine, tokenizer=FakeTokenizer(), max_tokens=4)
+    c = mclient.Client(mclient.local(server))
+
+    grows: list[tuple] = []
+    original = ShiftStore._grow
+
+    def counted(self, session, entry, want):
+        grows.append((session, entry.capacity, want))
+        return original(self, session, entry, want)
+
+    ShiftStore._grow = counted
+    try:
+        sessions = ["s0", "s1", "s2"]
+        for t in range(12):
+            for sid in sessions:
+                engine.turn = t
+                if t >= 4:
+                    c.edit(sid, 2 * (t - 4), f"[cold #{t - 4} {t - 4:08x}]")
+                c.turn(sid, f"Turn {t}. {FILLER * 3}")
+    finally:
+        ShiftStore._grow = original
+
+    assert engine.store.evictions == 0, (
+        f"{engine.store.evictions} evictions: the sessions are thrashing the budget"
+    )
+    # one allocation per session, not one per turn
+    assert len(grows) <= 2 * len(sessions), f"{len(grows)} reallocations for 36 turns: {grows[:6]}"
+    assert all(engine.store._sessions[s].capacity > 0 for s in sessions)

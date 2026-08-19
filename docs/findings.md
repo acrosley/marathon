@@ -1154,4 +1154,46 @@ Early append-only turns save in 0.081 s, so saving as such is cheap; it is speci
 
 **Limits.** N=3 matched (N=4 and N=10 per condition available and consistent). 17 of the 18 fact questions in the subset had their answer cold, so em is over 18 questions per condition and the 0.444-vs-0.444 equality is "not distinguishable at this N" rather than a measured tie — the *cost* difference between the two ceilings is the solid result. One model, one window (8192), one threshold pair (0.5, plus 0.2 from CPU calibration only — dropped from the GPU run because it refreshes *more* than `max_stale=1` and so is the expensive end of the curve). `max_churn` between 0.5 and unbounded is unmeasured, and that is where a cheaper safe point would be once the refresh bug stops dominating the bill.
 
+## 2026-08-19 — The paged stall is store *allocation*, not the save path — and on the real cold tier the composition is still wrong at 0.5 exact-match
+
+Track N measured refresh turns at 41.5 s mean against reuse turns at 0.90 s and plain appends at 0.08 s, and hypothesised a per-step full re-gather in the post-reuse incremental save. That hypothesis is wrong, and the CPU harness says so cheaply.
+
+**The save path is innocent.** Instrumenting `tests/test_paged_depth.py` to count store writes per turn, over a 20-turn paged session:
+
+| turn kind | positions written per turn |
+|---|---:|
+| plain append | ~265 (O(new tokens)) |
+| reuse (`save="full"`) | ~1035 (one pass over the prompt) |
+| refresh (`save=True`) | ~1035 (one pass over the prompt) |
+
+A refresh turn writes the prompt exactly once — the same volume as a reuse turn, no 40× amplification and no per-decode-step latch. Two regression tests now pin this (`test_refresh_turn_does_not_rewrite_the_store_many_times_over`, `test_no_turn_writes_the_store_more_than_once_over`, asserting every turn writes under 1.5× its own prompt). Nothing in the save path was changed, because nothing in it was broken.
+
+**The bug is that the store reallocated its buffers on every single turn.** `SLAB = 16384` was the *fixed first allocation*, not a floor, so a session holding 235 tokens still claimed a 16384-token slab. With Track N's `store_tokens=24576`, two sessions (32768) cannot coexist, so each session's `_grow` evicted the other and both reallocated all 40 layer buffers every turn. Measured on the CPU harness, three sessions × 14 turns:
+
+| | grows | evictions |
+|---|---:|---:|
+| before | **42** — one per turn, every one from `capacity=0` | 41 |
+| after | **3** — one per session, for life | 0 |
+
+On 14B a slab is 2.7 GB, so that is 2.7 GB allocated, zeroed and freed *per turn*, which is what "41 s at 114 W, memory-bound" actually looks like. The fix is one line in `_grow` — `size = max(self.slab, entry.capacity * 2)` instead of `size = self.slab`, with `SLAB` becoming a 2048-token floor. Growth stays geometric, so the 2026-08-19 slab entry still holds: that entry blamed *fixed 1024-token steps*, and doubling is what fixed it — the large first allocation was never the part that mattered. Reverting the two lines makes the new test fail with "35 evictions: the sessions are thrashing the budget". Track N's own log corroborates the diagnosis: `used_tokens: 16384, sessions: {'cold-shift-3': 7744}` — one session occupying the entire budget while holding 7.7k tokens.
+
+**Ruled out from that log:** zero preemptions and a healthy 12.66 GiB / 82,928-token KV cache, so it is not cache starvation; zero refused saves, zero "no stored KV", zero in-flight-writer conflicts. All 214 "declining reuse" lines are the benign `nothing left after block alignment` on two-phase warm-up requests.
+
+**GPU verification, Qwen3-0.6B, 40 paged turns — criterion met.** Refresh-turn mean **0.034 s** against a connector-off control's plain-turn mean of 0.037 s; reuse turns 0.030 s; fact exact-match 10/10 both sides.
+
+**GPU verification, Qwen3-14B-FP8 on Track N's exact config** (real `cold.py` paging at `--active-window 8192`, `store_tokens 24576`, `gpu_util 0.93`, 40 turns, `max_stale=1`), against a connector-off control on the same config:
+
+| turn kind | n | mean | max |
+|---|---:|---:|---:|
+| plain (in reuse run) | 13 | 0.139 s | 0.174 |
+| reuse | 14 | 0.311 s | 0.933 |
+| refresh | 13 | **6.159 s** | 26.856 (min 1.000) |
+| control — every turn | 40 | 0.502 s | 1.014 |
+
+Refresh turns are no longer uniformly pathological — but the mean hides a shape. Turns 14–24 cost 7–27 s; from turn 26 on they settle at 1.0–1.4 s, i.e. an ordinary full prefill of an 8k window. The slow ones are the turns that happen to trigger a growth step. **Growing at all is what hurts**: the store is carved out of a GPU vLLM has already filled to `gpu_memory_utilization=0.93`, so a realloc must hold the old and new buffers at once with no headroom and the allocator falls back on synchronising and returning blocks to the driver. The remaining fix is to size the store to the workload up front, or to leave the card headroom — not to change the growth policy again. I tried "a sole session takes the whole budget", and it is wrong: the first session is always sole at allocation time, so it fills the budget and we are back to evicting everyone.
+
+**And the correctness result is negative, which matters more than the latency one.** On the real cold tier the connector scores **fact exact-match 5/10 against the control's 10/10**, with 5 of 40 turns differing in text — despite `max_stale=1`, which held at 10/10 on the synthetic shape. The difference is the workload: my synthetic demotion produces a *single* reused segment per turn, while the real policy also promotes, so a turn carries 5–6 segments across 6 phases with relocations among them. The staleness ceiling was tuned on the easy shape. **Phase 2 × Phase 1 is still not correct on the real paging policy**, and the next thing to measure is which of promotion / eviction / multi-segment phasing is responsible — the per-turn records now carry `promotions`, `demotions`, `segments` and `deltas`, so that is a read of the existing JSON rather than a new run.
+
+**Limits.** One run per cell; the 14B reuse and control runs are separate engine invocations (the first attempt's control died at engine-core init under `util 0.93` back-to-back, which is why `paged_depth.sh` now sleeps and deletes the stale JSON before the second run — a stale file had silently produced a 0.6B-vs-14B comparison). The 0.6B result is on the synthetic shape, not `cold.py`. The eviction-thrash fix is verified on CPU and by inference on GPU; no run isolates a growth event directly.
+
 @acrosley 2026-08-19
