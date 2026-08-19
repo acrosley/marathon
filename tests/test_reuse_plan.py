@@ -274,3 +274,103 @@ def test_relocated_segments_are_not_handed_to_the_connector_by_default():
     }
     assert not (moved_starts & {ld["dst_start"] for ld in safe})
     assert moved_starts <= {ld["dst_start"] for ld in bold}
+
+
+# --- order-preserving shifts are not relocations ---------------------------------
+
+
+def _otok(line: bytes) -> list[int]:
+    return [0] * (len(line) // 4)
+
+
+def _ostate(messages):
+    from marathon.canonical import serialize_history
+
+    return serialize_history(messages)
+
+
+def _omsgs(n: int, width: int = 40):
+    return [{"role": "user", "content": f"Entry {i}. " + f"w{i} " * width} for i in range(n)]
+
+
+def test_deleting_a_line_is_a_shift_not_a_relocation():
+    """A deletion moves every later line by the same delta, in the same order.
+
+    Regression test for a misclassification that cost a paged session all of its reuse:
+    ``moved`` used to key on "this line's index changed", which is true of every line
+    after a deleted one, so an eviction turn produced an empty load list instead of one
+    shifted segment.
+    """
+    old = _omsgs(8)
+    new = old[:2] + old[3:]  # drop one line from the middle
+    plan = reuse_plan.plan(_ostate(old), _ostate(new), _otok)
+    assert plan.policy == "reuse", plan.reason
+    assert not any(plan.moved), plan.reason
+    assert "relocated" not in plan.reason
+    # everything after the deletion comes back as one shifted segment
+    loads = plan.to_kv_transfer_params()
+    assert len(loads) == 1
+    assert loads[0]["delta"] < 0
+    tail = sum(seg.length for seg, mv in zip(plan.segments, plan.moved, strict=True) if not mv)
+    assert tail > 0.6 * plan.total
+
+
+def test_deleting_the_first_stub_of_a_paged_view_still_reuses():
+    """The eviction turn the cold tier actually produces, end to end."""
+    from marathon.cold import ColdTier
+
+    messages = [{"role": "system", "content": "sys", "governing": True}]
+    for i in range(30):
+        messages.append({"role": "user", "content": f"Entry {i}. " + f"w{i} " * 40})
+        messages.append({"role": "assistant", "content": f"Noted {i}."})
+
+    tier = ColdTier(active_tokens=600, keep_last=4)
+    tier.step(messages, None, "q")
+    assert tier.stubbed(), "nothing is stubbed; the test is not exercising eviction"
+    before = tier.active_state(messages)
+
+    tier.evicted.add(sorted(tier.stubbed())[0])  # evict one stub: a pure line deletion
+    after = tier.active_state(messages)
+    assert after.count(b"\n") == before.count(b"\n") - 1
+
+    plan = reuse_plan.plan(before, after, _otok)
+    assert plan.policy == "reuse", plan.reason
+    assert not any(plan.moved), plan.reason
+    loads = plan.to_kv_transfer_params()
+    assert loads, "an eviction turn must still reuse the content after the deleted stub"
+    assert all(d["delta"] < 0 for d in loads)
+
+
+def test_a_genuine_reorder_is_still_refused():
+    """Ordering is the test, so swapping two blocks must stay conservative."""
+    old = _omsgs(8)
+    new = old[:2] + [old[4], old[3], old[2], old[5]] + old[6:]
+    plan = reuse_plan.plan(_ostate(old), _ostate(new), _otok)
+    assert any(plan.moved), plan.reason
+    assert "relocated" in plan.reason
+    # a block that jumps wholesale past other content is refused too
+    jumped = reuse_plan.plan(_ostate(old), _ostate(old[4:] + old[:4]), _otok)
+    assert all(jumped.moved), jumped.reason
+    assert not jumped.to_kv_transfer_params()
+
+
+def test_a_governing_entry_that_only_shifted_does_not_force_repair():
+    """A standing instruction pushed along by a deletion still governs the same text."""
+    messages = _omsgs(8)
+    messages[1] = {**messages[1], "governing": True}
+    new = messages[:3] + messages[4:]  # delete *after* the governing entry
+    plan = reuse_plan.plan(_ostate(messages), _ostate(new), _otok)
+    assert plan.policy == "reuse", plan.reason
+    assert plan.repair_first == 0
+    # but genuinely reordering it past other content is still repaired
+    moved = [messages[0], messages[2], messages[1], *messages[3:]]
+    assert reuse_plan.plan(_ostate(messages), _ostate(moved), _otok).policy == "repair"
+
+
+def test_a_mid_history_insert_is_not_called_append_only():
+    old = _omsgs(6)
+    new = old[:3] + [{"role": "user", "content": "inserted"}] + old[3:]
+    plan = reuse_plan.plan(_ostate(old), _ostate(new), _otok)
+    assert not any(plan.moved)
+    assert "inserted" in plan.reason and "append-only" not in plan.reason
+    assert reuse_plan.plan(_ostate(old), _ostate([*old, old[0]]), _otok).reason == "append-only"

@@ -176,14 +176,31 @@ def _segments(
 ) -> tuple[list[Segment], list[bool]]:
     """Maximal runs of consecutively-matched lines, as token-coordinate segments.
 
-    The second list flags the runs whose entries *relocated* (their index in the history
-    changed), as opposed to merely shifting because something before them got longer.
+    The second list flags the runs that genuinely *relocated* — whose content moved past
+    other content — as opposed to merely shifting because something before them changed
+    length. Only the first is unsafe to transplant: a shifted run still summarises the
+    same material in the same order, and re-rotating its keys by the run's own delta is
+    exact, while a relocated run's KV summarises a prefix that is no longer there.
+
+    The test is ordering, not index equality. Read in destination order, the matched
+    source indices are strictly increasing exactly when nothing was reordered — a
+    deletion or an insertion earlier in the history shifts every later index by a
+    constant without disturbing that order. Keying on ``matches[j] != j`` instead treats
+    every line after a deleted one as relocated, which on a paged session means an
+    eviction turn reuses *nothing* (measured 2026-08-19: deleting one stub line flagged
+    14 entries relocated and produced an empty load list, where the correct answer is one
+    shifted segment at delta -16). When the order genuinely is disturbed we keep the old,
+    stricter rule, so a real reorder is no less conservative than it was.
     """
     old_off, new_off = [head_tokens], [head_tokens]
     for n in old_len:
         old_off.append(old_off[-1] + n)
     for n in new_len:
         new_off.append(new_off[-1] + n)
+
+    # strictly increasing matched source indices <=> nothing was reordered
+    seq = [m for m in matches if m is not None]
+    ordered = all(a < b for a, b in zip(seq, seq[1:], strict=False))
 
     segs: list[Segment] = []
     moved: list[bool] = []
@@ -197,7 +214,7 @@ def _segments(
             return
         i0, i1 = matches[run[0]], matches[run[-1]]
         segs.append(Segment(old_off[i0], old_off[i1 + 1], new_off[run[0]]))
-        moved.append(any(matches[j] != j for j in run))
+        moved.append(False if ordered else any(matches[j] != j for j in run))
         run.clear()
 
     for j, m in enumerate(matches):
@@ -256,9 +273,20 @@ def plan(
             (), (), total, "full", 0, f"no reusable entries ({len(old_lines)} dropped)"
         )
 
-    relocated = [m for j, m in enumerate(matches) if m is not None and m != j]
-    if not dropped and not relocated:
+    # Same ordering test as ``_segments``: an entry whose index merely shifted because
+    # something earlier changed length has not moved past anything, still governs the
+    # same downstream text, and must not be reported as relocated -- otherwise a paged
+    # session's eviction turns are permanently classified "repair" on account of a
+    # governing entry that never actually moved.
+    seq = [m for m in matches if m is not None]
+    ordered = all(a < b for a, b in zip(seq, seq[1:], strict=False))
+    relocated = [] if ordered else [m for j, m in enumerate(matches) if m is not None and m != j]
+    last_matched = max((j for j, m in enumerate(matches) if m is not None), default=-1)
+    appended_only = all(j > last_matched for j, m in enumerate(matches) if m is None)
+    if not dropped and not relocated and appended_only:
         what = "append-only"
+    elif not dropped and not relocated:
+        what = f"{n_fresh} inserted entries, {len(segments)} segments"
     elif not dropped:
         what = f"{len(relocated)} relocated entries, {len(segments)} segments (moved blocks)"
     else:

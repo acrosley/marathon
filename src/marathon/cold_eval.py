@@ -20,10 +20,15 @@ three run on plain vLLM prefix caching so that they differ *only* in the paging:
     cold-norecall   paging on, recall off -- stubs only. The naive baseline: this is
                     what a window cap alone costs you.
     cold-recall     paging on, recall-on-miss on (exact + query triggers). The claim.
-    cold-shift      the same policy *with* the shift connector on. A promotion is a
-                    mid-history grow edit, which is exactly what position-shifted reuse
-                    is for, so this is where the two phases should compose. Not in the
-                    default condition set -- pass it explicitly.
+    cold-shift      the same policy *with* the shift connector on, bounded by Track L's
+                    ``max_stale`` turn counter. A demotion is a shrink edit and a
+                    promotion a grow edit, so this is where Phase 1 and Phase 2 compose.
+    cold-churn      the same, with the churn ceiling (``max_churn``) instead: refresh
+                    once the text rewritten in front of the reused span exceeds a
+                    fraction of the span, rather than after a fixed number of turns.
+
+    Neither is in the default condition set -- pass them explicitly. Comparing serving
+    cost between them needs ``--generate-history``, which prefills every turn.
 
     python -m marathon.cold_eval --model Qwen/Qwen3-14B-FP8 --sessions 20
 
@@ -254,6 +259,10 @@ def drive(
 
 def _metrics(out: dict) -> dict:
     return {
+        "refreshed": out.get("refreshed", False),
+        "phases": out.get("phases", 1),
+        "segments": out.get("segments", 0),
+        "churn": out.get("churn", 0.0),
         "active_tokens": out["active_tokens"],
         "prefill_s": out["prefill_s"],
         "cold_count": out["cold_count"],
@@ -301,7 +310,13 @@ def summarise(rows: list[dict]) -> list[dict]:
                 "active_p50": _median(r["active_tokens"] for r in tail),
                 "active_max": max((r["active_tokens"] for r in hist), default=0),
                 "prefill_p50": round(_median(r["prefill_s"] for r in tail), 4),
+                "prefill_mean": round(_mean(r["prefill_s"] for r in tail), 4),
                 "prefill_max": round(max((r["prefill_s"] for r in hist), default=0), 4),
+                # the two halves of the staleness ceiling: turns served from reused KV
+                # and turns spent on an honest recompute
+                "reuse_s": round(_mean(r["prefill_s"] for r in tail if r["reused_tokens"]), 4),
+                "refresh_s": round(_mean(r["prefill_s"] for r in tail if r["refreshed"]), 4),
+                "refresh_frac": round(_mean(bool(r["refreshed"]) for r in tail), 3),
                 "em_old": round(_mean(r["correct"] for r in old), 4),
                 "em_recent": round(_mean(r["correct"] for r in recent), 4),
                 "em_all": round(_mean(r["correct"] for r in facts), 4),
@@ -358,6 +373,8 @@ def main(argv: list[str] | None = None) -> int:
     # editing any file in the repo (these docs included) would silently move every
     # session and make two runs of different conditions incomparable
     p.add_argument("--corpus", choices=("snapshot", "worktree"), default="snapshot")
+    p.add_argument("--max-stale", type=int, default=1, help="cold-shift staleness ceiling")
+    p.add_argument("--max-churn", type=float, default=0.2, help="cold-churn churn ceiling")
     p.add_argument(
         "--generate-history",
         action="store_true",
@@ -434,6 +451,14 @@ def main(argv: list[str] | None = None) -> int:
             "active_window": args.active_window,
             "cold_kwargs": cold_kwargs,
             "reuse": True,
+            "max_stale": args.max_stale,
+        },
+        # the same, with the churn ceiling instead of the turn counter
+        "cold-churn": {
+            "active_window": args.active_window,
+            "cold_kwargs": cold_kwargs,
+            "reuse": True,
+            "max_churn": args.max_churn,
         },
     }
 
