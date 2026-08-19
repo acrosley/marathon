@@ -1057,4 +1057,63 @@ Per-turn: the 19 reused turns average **0.171 s** against the control's 0.954 s 
 
 **Limits.** `max_stale=1` is the strongest setting short of disabling reuse, chosen because 4 still scored 0.500; between 1 and 4 is unmeasured and there may be a cheaper safe point on a less aggressive paging policy. The staleness counter counts *turns*, not drift — a better ceiling would measure how much of the reused span's attended context actually changed (the churn fraction), which would let benign repeated edits keep reusing and would probably beat 1.66×. This is a synthetic paged shape (a per-turn front demotion driven by `scripts/server_demo.py --demote`), not Track N's `cold.py` policy with its retriever and eviction, so the composition should be re-measured through `cold_eval` before the cold tier is called fixed. One model per shape, one run per cell, one window size.
 
+## 2026-08-19 — Iteration 2: the hinge kills the regression and both arms clear every item over KL 0.05, but the ratio gate still misses on the median
+
+Command: `scripts/stitch_arm.sh A` and `scripts/stitch_arm.sh B --grad-prefill` — train 200 items seed 7001 lr 3e-5 hinge 1.0, checkpoints every 50 with a 16-item held-out eval, then held-out eval n=120 seed 9001, then the dependent-edit probe (WSL2, torch 2.13.0+cu130, transformers 5.15.0, sdpa, bf16, RTX 5090; arm B peak 27.4 GiB, ~4 s/item; ~35 min per arm) · Model: `Qwen/Qwen3-8B` · Cost: $0.
+
+Three changes since the last entry, all aimed at named failures in it. **(1) The do-no-harm hinge.** Iteration 1 cut governing KL 43% while *raising* non-governing 37%, despite non-governing being half the training mix — they were present but defenceless, starting at `klmean` ~0.005 against a governing item's ~0.037, so plain `stitch_kl` gave them almost no gradient. Non-governing items are now asked only not to get *worse* than the frozen base on that same item: `relu(klmean_student − klmean_base − slack)`, zero while the adapter is at least as good, costing one extra base stitched forward per item. **(2) `--grad-prefill`, memory-safe.** Iteration 1's numbers came from the cheap half of the method — only `q_proj`/`o_proj` and the continuation's `k`/`v` were trained, never what the fresh span `E'` *writes* into the cache. That is now available and bounded by a context cap rather than gradient checkpointing (checkpointing would re-enter the cache scatter during backward). **(3) Mid-training checkpoints**, to settle whether the improvement actually tracks training. Both arms run at **4–6k tokens** so they are comparable to each other; the base column is measured inside each eval on the identical items.
+
+**Held-out, n=120 (57 governing / 63 non-governing), same items and same base for both arms:**
+
+```
+                          n     mean   median      p95      max   >.05   >.2
+base    governing        57   0.0172   0.0070   0.0483   0.1480      3     0
+  arm A governing        57   0.0109   0.0064   0.0353   0.0489      0     0
+  arm B governing        57   0.0084   0.0068   0.0213   0.0281      0     0
+base    non-governing    63   0.0046   0.0020   0.0128   0.0465      0     0
+  arm A non-governing    63   0.0052   0.0025   0.0173   0.0460      0     0
+  arm B non-governing    63   0.0054   0.0030   0.0158   0.0483      0     0
+  arm A clean drift     120   0.0019   0.0015   0.0046   0.0077      -     -
+  arm B clean drift     120   0.0024   0.0016   0.0059   0.0137      -     -
+
+gov/non-gov ratio    base 3.74x mean / 3.51x median
+                    arm A 2.10x mean / 2.53x median      arm B 1.56x mean / 2.26x median
+planted-fact ok      72/72 for reference, base, arm A and arm B alike
+governing improved   arm A 33/57   arm B 36/57
+```
+
+**The headline: every item over KL 0.05 is gone, in both arms.** The base has 3 governing items over 0.05 with a worst of 0.1480; arm A's worst is 0.0489 and arm B's is 0.0281. That is the number `reuse_plan` actually cares about — the tail is what forces it to refuse governing edits, and on this population the tail is now inside the band where non-governing edits already live.
+
+**The hinge worked.** Non-governing regression falls from iteration 1's **+37% mean / +46% median** to **+13% / +25%** (arm A) and **+17% / +50%** (arm B), and arm A now passes the ≤20% mean bar outright. Clean drift also improved, arm A to **0.0019**, which clears the 0.002 gate for the first time. Planted-fact retrieval is 72/72 everywhere — reference, base and both adapters — with no item lost.
+
+**Arm B (the expressive half) is clearly the stronger learner, and the checkpoint curves show it is not close:**
+
+```
+checkpoint (16 held-out items)      50       100       150       200
+arm A governing   base 0.0446   0.0507    0.0456    0.0366    0.0226
+arm B governing   base 0.0446   0.0238    0.0193    0.0242    0.0123
+```
+
+Arm A is still *worse than the base* at checkpoint 50 and does not clearly beat it until 150; arm B is at half the base's KL by checkpoint 50 and ends at 0.0123. Letting gradients reach what `E'` writes into the cache is worth roughly a 2× head start throughout, and 200 items of the cheap signal buys about what 50 items of the expressive one does. This also answers iteration 1's unresolved ambiguity — where split-half training medians moved the wrong way while held-out KL improved, with no way to tell which was real. With actual intermediate measurements the held-out curve is **non-monotone but genuinely downward** (arm B: 0.0238 → 0.0193 → 0.0242 → 0.0123), so the improvement does track training; the split-half training median remains the misleading statistic, not the result.
+
+**Against the pre-registered gates** (all `klmean`, both statistics reported, n=120 as required):
+
+| criterion | target | arm A | arm B |
+|---|---|---|---|
+| 1. failure class closes | ratio ≤ 2× mean **and** median; no item > 0.2 | 2.10× / 2.53× — **fail** | **1.56×** / 2.26× — **fail (median)** |
+| 2. clean context | ≤ 0.002 mean | **0.0019 — pass** | 0.0024 — fail |
+| 3. no regression | non-gov within 20%, mean and median | +13% / +25% — **fail (median)** | +17% / +50% — fail |
+| 4. dep-instruction | ≥ 30% fall vs same-run base | 0.0133→0.0315, 0.0178→0.0229 — **fail** | 0.0133→0.0271, 0.0178→0.0120 — **fail** |
+| 5. win kept | tokens forwarded unchanged | pass | pass |
+
+**Neither arm passes, and the two fail differently: arm B buys the tail, arm A protects the collateral.** Arm B has the better ratio (1.56× mean, and it is the only run in the project to clear the ≤2× mean bar) and the better tail (max 0.0281); arm A has the better clean drift (0.0019, passing) and the smaller non-governing median regression. Neither dominates, which is itself informative — the expressive half is a stronger lever *and* a blunter one, and the honest next move is arm B's signal with arm A's restraint (a stronger hinge weight, or early stopping around checkpoint 100–150 where arm B's non-governing had drifted less).
+
+**The `dep-instruction` probe got worse in both arms and this is the clearest negative result here.** `lang-pipeline` goes 0.0133 → 0.0315 (arm A) and → 0.0271 (arm B); only arm B's `lang-scheduler` improves (0.0178 → 0.0120). `dep-anaphora/open` also degrades badly in both (0.0187 → 0.0732 / 0.0133). The likely reason is distribution: the probe scenarios are 20-turn sessions of ~600-token filler messages, materially longer and structurally different from the 4–6k training sessions, so the adapter is being asked to generalise off-distribution — exactly the overfitting-to-synthetic-edits risk that was written down before any of this ran. It is not evidence the method fails on governing edits; it is evidence the adapter learned something narrower than "read stitched caches correctly".
+
+**An important caveat about the regime, which cuts against reading these ratios as progress over iteration 1.** Both arms ran at 4–6k, where the *base* failure is much milder: base ratio 3.74× mean / 3.51× median here, against 7.25× / 2.27× at 4–8k (n=60) and 8.71× / 4.03× at 4–8k (n=48). The gate is easier to approach in this regime because there is less to fix. Arm B's 1.56× is a real number against a real same-run base, but it is not directly comparable to iteration 1's 3.01×, and the ≤2× target was chosen against a ~9× base. Any claim that the gate is nearly met has to be re-made at 4–8k.
+
+**What to try next.** (1) Arm B's signal at a higher hinge weight (2–4) or with early stopping near checkpoint 100–150, to keep the tail win without the non-governing median drift. (2) Re-run the winner at **4–8k**, where the base failure is 2× larger, before believing the ratio. (3) Add the probe scenarios' *shape* to the training mix — longer sessions, filler-message structure — since the current failure there is plainly a distribution gap and the criteria treat it as a gate. (4) Only then consider whether `reuse_plan` could downgrade governing edits from `repair` to `reuse`; on the tail evidence alone (0 items over 0.05 in either arm) that conversation is now worth having, but not on one seed.
+
+Caveats: one seed pair, one epoch, 200 training items, one model, n=120 held out. The mid-training curve uses a 16-item slice, so its individual points are noisy — the 0.0242 at arm B checkpoint 150 is 16 items. Cells are 57/63, and the base tail is 3 events. `planted-fact ok` grades the arg-max of the teacher-forced sequence, not a free-running greedy decode. The hinge costs one extra base forward per non-governing item, so arm timings are not comparable to iteration 1's. And the dep-probe rows remain single runs on hand-built scenarios, not a distribution.
+
 @acrosley 2026-08-19

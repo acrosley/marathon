@@ -499,6 +499,11 @@ def clean_logits(model, ex: Example, forced: list[int]) -> torch.Tensor:
     return _clean_sequence(model, torch.cat([ex.new_ids, ex.query_ids]), forced)
 
 
+def is_governing(ex: Example) -> bool:
+    """Whether this example edits a span that governs later generation."""
+    return "governing" in ex.edit_kind
+
+
 def example_losses(
     model,
     loras: list[LoRALinear],
@@ -508,8 +513,30 @@ def example_losses(
     backward: float | None = None,
     anchor_weight: float = 1.0,
     grad_prefill: bool = False,
+    preserve_weight: float = 0.0,
+    preserve_slack: float = 0.0,
+    grad_prefill_max_tokens: int = 6000,
 ) -> dict:
     """(stitched KL, clean-anchor KL) for one example. Teacher is the same weights, off.
+
+    ``preserve_weight`` turns on the **do-no-harm term** for non-governing items, which is
+    the direct answer to the 8B run's one real regression: governing KL fell 43% while
+    non-governing rose 37%, even though non-governing items were half the training mix.
+    They were in the mix, but they could not defend themselves — a non-governing item starts
+    at KL ~0.005 against a governing item's ~0.037, so plain ``stitch_kl`` gives the cases
+    that are already fine almost no gradient, and the optimiser is free to spend them.
+
+    The fix is to change what is asked of them. A governing item is asked to get *better*
+    (minimise ``stitch_kl``); a non-governing item is asked only not to get *worse* than the
+    frozen base model already is on that same item:
+
+        loss = relu(stitch_kl_student - stitch_kl_base - slack)
+
+    which is exactly zero while the adapter is at least as good as the base and grows only
+    when it regresses. That costs one extra base-model stitched forward per non-governing
+    item (adapters off, no grad), and it is a hinge rather than a KL-to-base term on purpose:
+    matching the base *exactly* on non-governing items would also forbid the incidental
+    improvements, and the goal is a floor, not a leash.
 
     ``backward`` is the gradient scale (``1/accum``); when given, each term is backpropagated
     and freed *as soon as it is computed* rather than summed first. That is not a style
@@ -520,15 +547,50 @@ def example_losses(
     independent, so backpropagating them separately is arithmetically identical and halves
     the footprint. With ``backward=None`` the tensors are returned instead, for tests.
     """
+    governing = is_governing(ex)
+    guard = preserve_weight > 0 and not governing
+    base_kl = None
     with adapters(loras, False), torch.no_grad():
         forced, teacher_seq = teacher_reference(model, ex, gen_tokens)
+        if guard:
+            base_old_kv, _ = _prefill(model, ex.old_ids)
+            base_kl = float(
+                kl_to(
+                    teacher_seq,
+                    stitched_logits(
+                        model, ex, [(k, v) for k, v in base_old_kv], forced, grad_prefill=False
+                    ),
+                )
+            )
+            del base_old_kv
     with adapters(loras, True):
         with torch.no_grad():
             old_kv, _ = _prefill(model, ex.old_ids)
             old_kv = [(k.detach(), v.detach()) for k, v in old_kv]
-        stitch_kl = kl_to(teacher_seq, stitched_logits(model, ex, old_kv, forced, grad_prefill))
+        # `grad_prefill` is capped by context length rather than checkpointed. Gradient
+        # checkpointing would re-run each decoder layer during backward, and those re-runs
+        # call `Cache.update` again -- re-entering the scatter that this module's cache
+        # performs -- so the safe, verifiable bound is "only keep the fresh span in the graph
+        # while the context is small enough to afford it". Items over the cap silently fall
+        # back to the cheap path and are counted, so a run always reports how much of the
+        # expressive half of the method it actually got.
+        total_tokens = int(ex.new_ids.shape[0] + ex.query_ids.shape[0])
+        used_grad_prefill = grad_prefill and (
+            grad_prefill_max_tokens <= 0 or total_tokens <= grad_prefill_max_tokens
+        )
+        stitch_kl = kl_to(
+            teacher_seq, stitched_logits(model, ex, old_kv, forced, used_grad_prefill)
+        )
+        # governing: get better. non-governing: just do not get worse than the base already is.
+        term = (
+            torch.clamp(stitch_kl - (base_kl + preserve_slack), min=0.0) * preserve_weight
+            if guard
+            else stitch_kl
+        )
         if backward is not None:
-            (stitch_kl * backward).backward()
+            if term.requires_grad:
+                (term * backward).backward()
+            term = float(term.detach())
             stitch_kl = float(stitch_kl.detach())
         del old_kv
 
@@ -539,7 +601,16 @@ def example_losses(
                 clean_kl = float(clean_kl.detach())
         else:
             clean_kl = 0.0 if backward is not None else torch.zeros(())
-    return {"stitch_kl": stitch_kl, "clean_kl": clean_kl, "forced": forced}
+    return {
+        "stitch_kl": stitch_kl,
+        "clean_kl": clean_kl,
+        "base_stitch_kl": base_kl,
+        "penalty": term,
+        "governing": governing,
+        "grad_prefill": used_grad_prefill,
+        "tokens": total_tokens,
+        "forced": forced,
+    }
 
 
 # --------------------------------------------------------------------------- train
@@ -557,8 +628,13 @@ def train(
     anchor_every: int = 2,
     accum: int = 4,
     grad_prefill: bool = False,
+    preserve_weight: float = 0.0,
+    preserve_slack: float = 0.0,
+    grad_prefill_max_tokens: int = 6000,
     clip: float = 1.0,
     log_every: int = 20,
+    checkpoint_every: int = 0,
+    on_checkpoint=None,
     on_step=None,
 ) -> list[dict]:
     """One pass (or ``epochs``) of stitched-KV consistency fine-tuning. Returns the log."""
@@ -575,7 +651,17 @@ def train(
             anchor = anchor_every > 0 and step % anchor_every == 0
             # the anchor's weight rides on its own backward; the two terms never coexist
             parts = example_losses(
-                model, loras, ex, gen_tokens, anchor, 1.0 / accum, anchor_weight, grad_prefill
+                model,
+                loras,
+                ex,
+                gen_tokens,
+                anchor,
+                1.0 / accum,
+                anchor_weight,
+                grad_prefill,
+                preserve_weight,
+                preserve_slack,
+                grad_prefill_max_tokens,
             )
             if n % accum == 0 or n == len(order):
                 torch.nn.utils.clip_grad_norm_(params, clip)
@@ -587,6 +673,11 @@ def train(
                 "edit_kind": ex.edit_kind,
                 "stitch_kl": parts["stitch_kl"],
                 "clean_kl": parts["clean_kl"] if anchor else None,
+                "base_stitch_kl": parts["base_stitch_kl"],
+                "penalty": parts["penalty"],
+                "governing": parts["governing"],
+                "grad_prefill": parts["grad_prefill"],
+                "tokens": parts["tokens"],
                 "elapsed_s": time.perf_counter() - t0,
             }
             log.append(row)
@@ -606,6 +697,14 @@ def train(
             # the varying 3-6k session sizes from fragmenting the allocator.
             if ex.old_ids.device.type == "cuda" and step % 25 == 0:
                 torch.cuda.empty_cache()
+            # Mid-training checkpoints exist to settle a specific ambiguity from the 8B run:
+            # the split-half training medians moved the *wrong* way while held-out KL improved
+            # 43%, and with no intermediate evaluation there was no way to tell a hard second
+            # half from an improvement that was not really coming from training.
+            if checkpoint_every and on_checkpoint and step % checkpoint_every == 0:
+                on_checkpoint(step, log)
+    if checkpoint_every and on_checkpoint:
+        on_checkpoint(step, log)  # final point, so the curve always ends on a measurement
     return log
 
 
@@ -863,6 +962,28 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="backprop into the fresh span's K/V too (more expressive, far more memory)",
     )
+    ap.add_argument(
+        "--grad-prefill-max-tokens",
+        type=int,
+        default=6000,
+        help="items longer than this fall back to the cheap path (0 = no cap)",
+    )
+    ap.add_argument(
+        "--preserve-weight",
+        type=float,
+        default=0.0,
+        help="do-no-harm weight on non-governing items: relu(student - base) hinge",
+    )
+    ap.add_argument("--preserve-slack", type=float, default=0.0)
+    ap.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=0,
+        help="save the adapter and run a held-out mid-training eval every N items",
+    )
+    ap.add_argument(
+        "--mid-eval-items", type=int, default=24, help="sessions in each mid-training eval"
+    )
     args = ap.parse_args(argv)
 
     tok, model, loras = _load(
@@ -899,6 +1020,47 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.cmd == "train":
+        mid: list[Example] = []
+        if args.checkpoint_every and args.mid_eval_items:
+            # a *held-out* slice: same seed as the final eval, so the mid-training curve and
+            # the final number are measured on the same population
+            mid = build_examples(
+                tok,
+                dev,
+                args.mid_eval_items,
+                args.seed + 2000,
+                args.gov_frac,
+                args.min_tokens,
+                args.max_tokens,
+                args.queries_per_item,
+            )
+            print(f"mid-training eval slice: {len(mid)} held-out examples", flush=True)
+
+        history: list[dict] = []
+
+        def on_checkpoint(step, _log):
+            path = f"{args.out}.step{step}" if args.out else None
+            if path:
+                torch.save(lora_state(loras), path)
+            row = {"step": step}
+            if mid:
+                rows = evaluate(model, loras, mid, tok, args.gen_tokens)
+                g = [r for r in rows if r["governing"]]
+                n = [r for r in rows if not r["governing"]]
+                for tag, rs in (("gov", g), ("non", n)):
+                    if rs:
+                        row[f"{tag}_base"] = statistics.fmean([r["base_stitch_kl"] for r in rs])
+                        row[f"{tag}_tuned"] = statistics.fmean([r["tuned_stitch_kl"] for r in rs])
+                row["clean"] = statistics.fmean([r["tuned_clean_kl"] for r in rows])
+                print(
+                    f"[checkpoint {step}] gov {row.get('gov_base', float('nan')):.4f}->"
+                    f"{row.get('gov_tuned', float('nan')):.4f}  non "
+                    f"{row.get('non_base', float('nan')):.4f}->"
+                    f"{row.get('non_tuned', float('nan')):.4f}  clean {row['clean']:.4f}",
+                    flush=True,
+                )
+            history.append(row)
+
         log = train(
             model,
             loras,
@@ -908,6 +1070,11 @@ def main(argv: list[str] | None = None) -> int:
             gen_tokens=args.gen_tokens,
             anchor_weight=args.anchor_weight,
             grad_prefill=args.grad_prefill,
+            grad_prefill_max_tokens=args.grad_prefill_max_tokens,
+            preserve_weight=args.preserve_weight,
+            preserve_slack=args.preserve_slack,
+            checkpoint_every=args.checkpoint_every,
+            on_checkpoint=on_checkpoint if args.checkpoint_every else None,
             anchor_every=args.anchor_every,
             accum=args.accum,
         )
@@ -918,6 +1085,16 @@ def main(argv: list[str] | None = None) -> int:
             with open(args.jsonl, "w", encoding="utf-8") as f:
                 for row in log:
                     f.write(json.dumps(row) + "\n")
+        if history:
+            with open(f"{args.jsonl}.checkpoints", "w", encoding="utf-8") as f:
+                for row in history:
+                    f.write(json.dumps(row) + "\n")
+        downgraded = sum(1 for r in log if args.grad_prefill and not r["grad_prefill"])
+        if args.grad_prefill:
+            print(
+                f"grad-prefill: {len(log) - downgraded}/{len(log)} items kept the fresh span "
+                f"in the graph (cap {args.grad_prefill_max_tokens} tokens)"
+            )
         gov = [r["stitch_kl"] for r in log if "governing" in r["edit_kind"]]
         if gov:
             half = len(gov) // 2

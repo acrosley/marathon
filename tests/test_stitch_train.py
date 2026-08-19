@@ -398,3 +398,130 @@ def test_probe_examples_carry_the_dependent_edit_scenarios():
         for e in exs
     ]
     assert "dep-instruction" in probe_report(rows)
+
+
+# --------------------------------------------------- do-no-harm term / checkpoints
+
+
+def _nongov_example(**kw):
+    ex = _example(**kw)
+    return Example(
+        sid=ex.sid,
+        edit_kind="fact",
+        family=ex.family,
+        old_ids=ex.old_ids,
+        new_ids=ex.new_ids,
+        query_ids=ex.query_ids,
+        qtype=ex.qtype,
+        expected=ex.expected,
+        span=ex.span,
+    )
+
+
+def test_preserve_term_is_zero_while_the_adapter_matches_the_base(tiny):
+    """The hinge must not push a non-governing item that is already as good as the base.
+
+    At identity the student *is* the base, so student-minus-base is 0 and the penalty must
+    be exactly 0 -- otherwise the term would be a leash that forbids the incidental
+    improvements, rather than the floor it is meant to be.
+    """
+    model, loras = tiny
+    parts = example_losses(
+        model, loras, _nongov_example(), gen_tokens=4, anchor=False, preserve_weight=1.0
+    )
+    assert parts["governing"] is False
+    assert parts["base_stitch_kl"] is not None
+    assert float(parts["stitch_kl"].detach()) == pytest.approx(parts["base_stitch_kl"], abs=1e-6)
+    assert float(parts["penalty"].detach()) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_preserve_term_activates_once_the_adapter_regresses(tiny):
+    model, loras = tiny
+    for lora in loras:  # move the adapter off identity so the student differs from the base
+        lora.lora_b.data.normal_(0, 0.05)
+    parts = example_losses(
+        model, loras, _nongov_example(), gen_tokens=4, anchor=False, preserve_weight=2.0
+    )
+    excess = float(parts["stitch_kl"].detach()) - parts["base_stitch_kl"]
+    expected = max(0.0, excess) * 2.0
+    assert float(parts["penalty"].detach()) == pytest.approx(expected, abs=1e-6)
+    for lora in loras:
+        lora.lora_b.data.zero_()
+
+
+def test_governing_items_keep_the_plain_objective(tiny):
+    """A governing item must still be asked to get *better*, not merely not-worse."""
+    model, loras = tiny
+    parts = example_losses(
+        model, loras, _example(), gen_tokens=4, anchor=False, preserve_weight=1.0
+    )
+    assert parts["governing"] is True
+    assert parts["base_stitch_kl"] is None  # no extra base pass is paid for
+    assert float(parts["penalty"].detach()) == pytest.approx(
+        float(parts["stitch_kl"].detach()), abs=1e-9
+    )
+
+
+def test_grad_prefill_cap_downgrades_long_items(tiny):
+    """Over the cap the fresh span leaves the graph; the run must say so, not fail."""
+    model, loras = tiny
+    ex = _example()
+    total = int(ex.new_ids.shape[0] + ex.query_ids.shape[0])
+    over = example_losses(
+        model, loras, ex, 3, anchor=False, grad_prefill=True, grad_prefill_max_tokens=total - 1
+    )
+    under = example_losses(
+        model, loras, ex, 3, anchor=False, grad_prefill=True, grad_prefill_max_tokens=total
+    )
+    assert over["grad_prefill"] is False and under["grad_prefill"] is True
+    assert over["tokens"] == total
+    off = example_losses(model, loras, ex, 3, anchor=False, grad_prefill=False)
+    assert off["grad_prefill"] is False
+    uncapped = example_losses(
+        model, loras, ex, 3, anchor=False, grad_prefill=True, grad_prefill_max_tokens=0
+    )
+    assert uncapped["grad_prefill"] is True  # 0 means no cap
+
+
+def test_grad_prefill_reaches_the_fresh_spans_kv(tiny):
+    """With the cap satisfied, k/v proj must actually receive gradient.
+
+    This is the difference between the two halves of the method: the cheap path trains only
+    how the model *reads* a stale suffix, this one also trains what it *writes*.
+    """
+    model, loras = tiny
+    ex = _example()
+    with torch.no_grad(), adapters(loras, False):
+        old_kv, _ = _prefill(model, ex.old_ids)
+        teacher = model(input_ids=torch.cat([ex.new_ids, ex.query_ids])[None]).logits[0, -4:]
+    kvs = [m for name, m in model.named_modules() if name.endswith(("k_proj", "v_proj"))]
+    with adapters(loras, True):
+        out = stitched_logits(
+            model, ex, [(k.detach(), v.detach()) for k, v in old_kv], [1, 2, 3, 4], True
+        )
+    kl_to(teacher, out).backward()
+    assert max(float(m.lora_b.grad.abs().max()) for m in kvs if m.lora_b.grad is not None) > 0
+    for lora in loras:
+        lora.lora_a.grad = lora.lora_b.grad = None
+
+
+def test_checkpoint_callback_fires_on_schedule_and_at_the_end(tiny):
+    model, loras = tiny
+    seen = []
+    train(
+        model,
+        loras,
+        [_example(), _nongov_example(n=52, q=5), _example(n=50, q=4)],
+        lr=1e-3,
+        gen_tokens=3,
+        anchor_every=0,
+        accum=1,
+        log_every=0,
+        checkpoint_every=2,
+        on_checkpoint=lambda step, log: seen.append(step),
+    )
+    assert seen and seen[-1] == 3, seen  # final point always measured
+    assert 2 in seen  # and the scheduled one fired
+    for lora in loras:
+        lora.lora_b.data.zero_()
+        lora.lora_a.grad = lora.lora_b.grad = None

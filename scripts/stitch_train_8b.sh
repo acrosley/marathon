@@ -15,11 +15,14 @@ LOGS=~/marathon-logs
 MODEL=Qwen/Qwen3-8B
 CHECK_ITEMS=48
 ITEMS=200
-EVAL_ITEMS=60
+EVAL_ITEMS=120    # >=120: ratios at n~50 are unstable (base moved 4.03x -> 2.27x between samples)
 TRAIN_SEED=7001
 EVAL_SEED=9001
 GOV_FRAC=0.5
 LR=3e-5           # 1e-4 spiked clean_kl to 0.0223 by step 81 at 0.6B; back it off
+PRESERVE=1.0      # do-no-harm hinge on non-governing items (the 8B run regressed them 37%)
+CKPT=50           # mid-training checkpoint + held-out eval every N items
+GRAD_PREFILL=""   # --grad-prefill: also trains what E' *writes*; needs <=6k contexts
 MIN_TOK=4000
 MAX_TOK=8000
 NAME=stitch_8b
@@ -30,6 +33,8 @@ while [ $# -gt 0 ]; do
     --items) ITEMS="$2"; shift 2;;
     --eval-items) EVAL_ITEMS="$2"; shift 2;;
     --lr) LR="$2"; shift 2;;
+    --preserve-weight) PRESERVE="$2"; shift 2;;
+    --grad-prefill) GRAD_PREFILL=1; shift;;
     --min-tokens) MIN_TOK="$2"; shift 2;;
     --max-tokens) MAX_TOK="$2"; shift 2;;
     *) echo "unknown flag $1"; exit 2;;
@@ -52,8 +57,9 @@ run python -m marathon.stitch_train eval "${COMMON[@]}" --items "$CHECK_ITEMS" \
 
 echo "=== step 2/4: train (seed $TRAIN_SEED, lr $LR) ==="
 run python -m marathon.stitch_train train "${COMMON[@]}" --items "$ITEMS" \
-  --seed "$TRAIN_SEED" --lr "$LR" --out "$LOGS/${NAME}.pt" \
-  --jsonl "$LOGS/${NAME}_train.jsonl"
+  --seed "$TRAIN_SEED" --lr "$LR" --preserve-weight "$PRESERVE" \
+  --checkpoint-every "$CKPT" --mid-eval-items 24 ${GRAD_PREFILL:+--grad-prefill} \
+  --out "$LOGS/${NAME}.pt" --jsonl "$LOGS/${NAME}_train.jsonl"
 
 echo "=== step 3/4: held-out eval, base vs tuned vs clean drift ==="
 run python -m marathon.stitch_train eval "${COMMON[@]}" --items "$EVAL_ITEMS" \
