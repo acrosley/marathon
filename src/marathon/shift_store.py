@@ -237,3 +237,70 @@ class ShiftStore:
             "loaded_token_layers": self.loaded_token_layers,
             "saved_token_layers": self.saved_token_layers,
         }
+
+
+@dataclass(frozen=True)
+class LoadDecision:
+    """A resolved load: destination ``[lo, hi)``, source at ``lo - delta``."""
+
+    lo: int
+    hi: int
+    delta: int
+
+    @property
+    def src_start(self) -> int:
+        return self.lo - self.delta
+
+
+def plan_load(
+    store: ShiftStore,
+    session: str | None,
+    request: dict | None,
+    num_computed: int,
+    num_prompt_tokens: int,
+    block_size: int,
+) -> tuple[LoadDecision | None, str]:
+    """Decide whether a request's ``load`` can be served. Returns ``(decision, why)``.
+
+    Pure bookkeeping, factored out of the connector's ``get_num_new_matched_tokens`` so
+    the same code can be driven on CPU without vLLM (``tests/test_paged_depth.py``).
+    A ``None`` decision always means *recompute*, never *guess*: every rejection path
+    here costs prefill and none of them can produce wrong KV.
+    """
+    if not session or not request:
+        return None, "no session or no load requested"
+    lo, dst_end, delta = (
+        int(num_computed),
+        int(request["dst_end"]),
+        int(request["delta"]),
+    )
+    if num_computed < int(request["dst_start"]):
+        # vLLM's own prefix hit stops before the reuse region starts; we cannot ask it
+        # to compute a hole in the middle, so decline and let it recompute.
+        return None, f"local hit {num_computed} < dst_start {request['dst_start']}"
+    # whole blocks only, and always leave at least one token for vLLM to compute
+    hi = min(dst_end, (num_prompt_tokens - 1) // block_size * block_size)
+    hi -= hi % block_size
+    if hi <= lo:
+        return None, f"nothing left after block alignment (hi={hi} <= lo={lo})"
+    if not store.covers(session, lo - delta, hi - lo):
+        return None, f"store no longer holds [{lo - delta},{hi - delta})"
+    return LoadDecision(lo, hi, delta), "ok"
+
+
+def plan_save(
+    store: ShiftStore, session: str | None, mode: object, lo: int, hi: int
+) -> tuple[int, int] | None:
+    """Decide the position range a step should save. Factored out of ``_plan_save``.
+
+    ``mode="full"`` widens the save to ``[0, hi)``: an edit turn moves everything after
+    the edit, so the store — a flat position-indexed buffer — has to be rewritten in the
+    new coordinates or the next edit plans against a layout that no longer exists.
+    """
+    if hi <= lo or not session or not mode:
+        return None
+    if mode == "full":
+        lo = 0
+    if not store.reserve(session, lo, hi - lo):
+        return None
+    return lo, hi

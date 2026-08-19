@@ -16,6 +16,12 @@ turns="12"
 edit_at="9"
 port="8${RANDOM:0:3}"
 extra=""
+demote=""
+json=""
+maxstale=""
+fixed=""
+factprobe=""
+repair=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --model) model="$2"; shift 2;;
@@ -27,6 +33,12 @@ while [ $# -gt 0 ]; do
     --edit-at) edit_at="$2"; shift 2;;
     --port) port="$2"; shift 2;;
     --no-reuse) extra="--no-reuse"; shift;;
+    --demote) demote="$2"; shift 2;;
+    --json) json="$2"; shift 2;;
+    --fixed-replies) fixed="--fixed-replies"; shift;;
+    --fact-probe) factprobe="--fact-probe"; shift;;
+    --max-stale) maxstale="$2"; shift 2;;
+    --repair-first) repair="$2"; shift 2;;
     *) echo "unknown arg: $1"; exit 2;;
   esac
 done
@@ -40,14 +52,14 @@ export PYTHONPATH="$repo/src${PYTHONPATH:+:$PYTHONPATH}"
 export VLLM_USE_V2_MODEL_RUNNER=0
 py="$HOME/marathon-venv/bin/python"
 mkdir -p "$HOME/marathon-logs"
-tag="serverdemo_$(echo "$model$extra" | tr -c "a-zA-Z0-9" "_")"
+tag="serverdemo_$(echo "$model$extra$demote" | tr -c "a-zA-Z0-9" "_")"
 log="$HOME/marathon-logs/$tag.log"
 
 echo "=== $model $extra on port $port (server log: $log) ==="
 cd "$HOME"
 "$py" -m marathon.server --model "$model" --port "$port" --gpu-util "$gpu_util" \
   --max-model-len "$max_model_len" --store-tokens "$store_tokens" \
-  --max-tokens "$max_tokens" $extra > "$log" 2>&1 &
+  --max-tokens "$max_tokens" $extra ${maxstale:+--max-stale "$maxstale"} ${repair:+--repair-first "$repair"} > "$log" 2>&1 &
 srv=$!
 trap 'kill $srv 2>/dev/null' EXIT
 
@@ -58,7 +70,7 @@ for _ in $(seq 1 180); do
 done
 grep -q "marathon.server ready" "$log" || { echo "server never came up"; tail -30 "$log"; exit 1; }
 
-"$py" "$here/server_demo.py" --url "http://127.0.0.1:$port" --turns "$turns" --edit-at "$edit_at"
+"$py" "$here/server_demo.py" --url "http://127.0.0.1:$port" --turns "$turns" --edit-at "$edit_at" ${demote:+--demote "$demote"} ${json:+--json "$json"} $fixed $factprobe
 rc=$?
 echo "demo exit=$rc  server log=$log"
 exit $rc
