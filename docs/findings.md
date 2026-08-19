@@ -212,3 +212,29 @@ Takeaway: the recompute ratio is the wrong knob — 0.15 → 0.02 buys ~1.7× on
 Caveats: the box is shared with another agent's GPU work — runs contended by it show 5–40 s spikes and were discarded and re-run (`none` turn 13 at 22.0 s is one survivor; ignore it). A partial `Qwen3-8B` download is still in the WSL HF cache — deleting it was blocked by the permission classifier, so the lead should `rm -rf ~/.cache/huggingface/hub/models--Qwen--Qwen3-8B`.
 
 @acrosley 2026-08-18
+
+## 2026-08-18 — Position-shifted KV reuse inside vLLM: the edit turn drops from 1.46 s to 0.24 s (Qwen3-14B-FP8)
+
+Commands: `scripts/phase1_probe.sh --mode shift --turns 24 --edit-at 20 --parity-tokens 8` and the same with `--mode prefix` · Model: `Qwen/Qwen3-14B-FP8`, same WSL2 stack as the previous entries (vLLM 0.27.1, torch 2.13.0+cu130, `VLLM_USE_V2_MODEL_RUNNER=0`) · Cost: $0.
+
+The HF prototype's re-rotation identity, moved into the serving path. New `src/marathon/vllm_shift_connector.py` is a `KVConnectorBase_V1` (`MarathonShiftConnector`, loaded via `kv_connector_module_path`, `kv_role=kv_both`) that does two things for one session and one writer. SAVE: on every turn it gathers the KV of the tokens vLLM actually computed out of the paged cache into a flat per-layer `[16384, 8, 256]` GPU buffer indexed by absolute position (2.7 GB for 40 layers; `gpu_memory_utilization=0.80` leaves room) — history is append-only, so by the edit turn the buffer holds the previous turn's full KV. LOAD: the request carries `{"load": {"dst_start", "dst_end", "delta"}}` in `SamplingParams.extra_args["kv_transfer_params"]`; `get_num_new_matched_tokens` reports `dst_end - num_computed_tokens` as externally available so vLLM skips prefilling them, and `start_load_kv` copies them in from the buffer — V verbatim, K re-rotated by `delta` (`kvshift.rerotate_keys` as a torch op on vLLM's fused `[num_blocks, num_kv_heads, block_size, 2*head_size]` layout, GPU→GPU, K is `content[:head_size]`).
+
+The probe's edit turn is two phases and `prefill_s` is the sum of both: first a `max_tokens=1` generate of `P + E'` rounded up to a block boundary (native prefill, lands in vLLM's prefix cache), then the real request, on which vLLM prefix-hits `P + E'`, the connector supplies `S` re-rotated, and vLLM prefills only the new turn and the query. On non-edit turns `--mode shift` is plain prefix caching plus the save.
+
+```
+turn  prompt_tokens   prefix_s  prefix_hit   shift_s  prefix_hit   text
+ 17      10766          0.129      10160      0.125      10160     '<think>'
+ 18      11363          0.124      10752      0.137      10752     '<think>'
+ 19      11960          0.132      11344      0.128      11344     '<think>'
+ 20      12561          1.465          0      0.242        640     '<think>'   <- edit of turn 0
+ 21      13158          0.135      12544      0.138      12544     '<think>'
+ 22      13755          0.134      13152      0.126      13152     '<think>'
+ 23      14364          0.236      13744      0.236      13744     '7391-KAPPA'  <- parity question
+```
+
+On turn 20 the connector logs `loaded 11328 tokens x 40 layers from store[620:11948], delta=4`: of the 12,561-token prompt, 11,328 tokens (90.2%) are copied-and-re-rotated, 624 are phase-1 prefill of the edited message, and ~610 are the new turn — 9.8% of the prompt forwarded, matching the HF prototype's predictor. **1.465 s → 0.242 s, a 6.1× win on the edit turn**, and the first thing in this project to beat the prefix-cache collapse rather than tie it. Steady-state turns are unchanged (0.12–0.14 s both modes; the per-turn save costs nothing measurable because prefix caching means only ~600 new tokens are ever gathered). Parity: turn 23 answers `7391-KAPPA` in both modes — and it reads that fact through turn 20's re-rotated KV, since turns 21–23 prefix-hit the blocks the connector wrote. Every turn's generated text is byte-identical between the two modes, and identical again on a Qwen3-0.6B bf16 sanity run (10 turns, edit at 8). A sharper version of the parity check — the question asked *on* the edit turn, so the answer can only come from the re-rotated KV that was written moments earlier and never through a later full prefill — also returns `7391-KAPPA` in both modes (Qwen3-0.6B, 9 turns, edit at 8; `loaded 4160 tokens x 28 layers`).
+
+Takeaway: the Phase 1 exit criterion is met on the append-only-plus-one-edit workload — 6.1× TTFT on the edit turn at unchanged output, versus CacheBlend's tie. The mechanism is exactly DESIGN.md's claim: the delta engine knows which byte range moved, RoPE makes the move exact for K, V doesn't care, and only the changed span plus the new tokens need a forward pass.
+Caveats, all real: (1) single request, single writer, no eviction, one GPU — this is a probe, not a scheduler-safe connector. (2) The reuse region is copied in whole blocks only, so a sub-block head of `S` is folded into phase 1 and a sub-block tail is recomputed; that is why phase 1 pads up to a block boundary. (3) `S` here is semantically independent of the edited span, the friendly case, same caveat as the HF entry — quality is asserted only by output parity and one planted fact, not by a KL measurement at this scale. (4) The two-phase split is the probe's job, not the connector's; a real server would need the edit's token span from the delta engine directly. (5) A mid-history variant (`--edit-turn 10`, so `P` is 6.5k tokens and `S` is 5.4k) ran correctly — `loaded 5360 tokens x 40 layers from store[6588:11948], delta=4` — but every wall time in that run was contended by another agent's GPU job (steady-state turns at 0.7–5.4 s in two separate attempts), so no timing is quoted from it and the mid-history position remains unmeasured.
+
+@acrosley 2026-08-18
