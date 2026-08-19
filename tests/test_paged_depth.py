@@ -26,7 +26,13 @@ from marathon.server import MarathonServer
 
 torch = pytest.importorskip("torch")
 
-from marathon.shift_store import ShiftStore, plan_load, plan_save, slots  # noqa: E402
+from marathon.shift_store import (  # noqa: E402
+    SLAB,
+    ShiftStore,
+    plan_load,
+    plan_save,
+    slots,
+)
 
 BLOCK = 16
 FILLER = "deterministic filler that makes a message worth several blocks of tokens "
@@ -34,6 +40,10 @@ FILLER = "deterministic filler that makes a message worth several blocks of toke
 
 class FakeTokenizer:
     """One token per byte of the rendered message; distinct messages, distinct ids."""
+
+    def encode(self, text, add_special_tokens=False):
+        """The cold tier sizes its window with this, so it must agree with ``prompt``."""
+        return list(str(text).encode())
 
     def prompt(self, messages):
         pieces = [list(f"{m['role']}: {m['content']}\n".encode()) for m in messages]
@@ -345,3 +355,123 @@ def test_sessions_coexist_instead_of_evicting_each_other_every_turn():
     # one allocation per session, not one per turn
     assert len(grows) <= 2 * len(sessions), f"{len(grows)} reallocations for 36 turns: {grows[:6]}"
     assert all(engine.store._sessions[s].capacity > 0 for s in sessions)
+
+
+# --------------------------------------------------------------- the real cold policy
+
+
+def run_cold_session(turns: int, engine: FingerprintEngine, active_window: int = 1500):
+    """Drive ``marathon.cold``'s actual paging policy, not a synthetic front edit.
+
+    The synthetic demotion in ``run_paged_session`` rewrites one message per turn and
+    produces a single reused segment. The real policy also *promotes* on a retrieval miss
+    and *evicts* stubs once nothing else can shrink, which relocates entries and yields
+    five or six segments across as many phases -- the shape the 14B run scored 5/10 on.
+    """
+    server = MarathonServer(
+        engine=engine,
+        tokenizer=FakeTokenizer(),
+        max_tokens=3,
+        active_window=active_window,
+        cold_kwargs={"keep_last": 3},
+    )
+    c = mclient.Client(mclient.local(server))
+    rows = []
+    for t in range(turns):
+        engine.turn = t
+        # a distinct fact per turn, then a question that makes the retriever promote
+        if t % 4 == 0:
+            text = f"Turn {t}. The access code is {7000 + t}-KAPPA. {FILLER * 2}"
+        elif t % 4 == 1:
+            text = f"Turn {t}. What is the access code? {FILLER * 2}"
+        else:
+            text = f"Turn {t}. {FILLER * 2}"
+        rows.append(c.turn("s", text))
+        # teacher forcing: identical histories regardless of what the engine returned
+        c.session("s").messages[-1]["content"] = "Understood."
+    return rows, server, c
+
+
+def test_real_cold_policy_keeps_coordinates_exact():
+    """The decisive test for the 14B 5/10: are the *coordinates* still right?
+
+    If every position still holds its own token under demotions, promotions, evictions
+    and multi-segment phasing, then the connector is placing KV exactly where it belongs
+    and the measured answer damage is stale *attention* -- the reused span attending to
+    text that has since been stubbed out -- not a bookkeeping bug.
+    """
+    engine = FingerprintEngine()
+    rows, server, _ = run_cold_session(30, engine)
+
+    tier = server.cold_for("s")
+    assert tier is not None
+    # the run has to actually exercise the hard shapes, or this proves nothing
+    assert tier.demoted, "no message was ever demoted"
+    assert sum(len(r["promotions"]) for r in rows) > 0, "the retriever never promoted"
+    assert max(r["segments"] for r in rows) >= 3, "never produced a multi-segment plan"
+
+    assert engine.corruptions == [], (
+        f"{len(engine.corruptions)} positions held the wrong token; "
+        f"first three (turn, pos, want, got): {engine.corruptions[:3]}"
+    )
+    assert engine.refused_saves == 0
+
+
+def test_real_cold_policy_exercises_evictions_without_corruption():
+    """Push the window hard enough that stubs are evicted, which relocates entries."""
+    engine = FingerprintEngine()
+    rows, server, _ = run_cold_session(40, engine, active_window=900)
+    tier = server.cold_for("s")
+    assert tier.evicted, "no stub was ever evicted; the relocation path is untested"
+    assert engine.corruptions == [], (
+        f"{len(engine.corruptions)} corrupted positions with evictions in play; "
+        f"first three: {engine.corruptions[:3]}"
+    )
+
+
+# ------------------------------------------------------------------ store pre-sizing
+
+
+def test_presizing_allocates_once_and_never_grows_again():
+    """A bounded session should cost exactly one allocation, whatever it then does.
+
+    Growth is the expensive event: the store lives on a GPU vLLM has already filled to
+    ``gpu_memory_utilization``, so a realloc has no headroom to work in. When the caller
+    knows the ceiling — a server with an active window does — ``session_cap`` makes the
+    first save allocate it and every later save fit.
+    """
+    store = ShiftStore(budget_tokens=24576, device="cpu", session_cap=8192)
+    grows = []
+    original = ShiftStore._grow
+
+    def counted(self, session, entry, want):
+        grows.append((session, entry.capacity, want))
+        return original(self, session, entry, want)
+
+    ShiftStore._grow = counted
+    try:
+        for hi in range(256, 8192, 256):  # a session filling its window turn by turn
+            assert store.reserve("s", 0, hi)
+    finally:
+        ShiftStore._grow = original
+
+    assert len(grows) == 1, f"expected one allocation, got {len(grows)}: {grows}"
+    assert store._sessions["s"].capacity == 8192
+    assert store.evictions == 0
+
+
+def test_presizing_is_a_floor_not_a_ceiling():
+    """A session that outgrows its cap still grows, geometrically, rather than failing."""
+    store = ShiftStore(budget_tokens=24576, device="cpu", session_cap=4096)
+    assert store.reserve("s", 0, 4000)
+    assert store._sessions["s"].capacity == 4096
+    assert store.reserve("s", 0, 9000)
+    assert store._sessions["s"].capacity >= 9000
+    assert store.covers("s", 0, 9000)
+
+
+def test_presizing_off_by_default_keeps_geometric_growth():
+    store = ShiftStore(budget_tokens=24576, device="cpu")
+    assert store.session_cap == 0
+    assert store.reserve("s", 0, 100)
+    assert store._sessions["s"].capacity == SLAB

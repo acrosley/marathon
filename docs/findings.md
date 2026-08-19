@@ -1197,3 +1197,41 @@ Refresh turns are no longer uniformly pathological — but the mean hides a shap
 **Limits.** One run per cell; the 14B reuse and control runs are separate engine invocations (the first attempt's control died at engine-core init under `util 0.93` back-to-back, which is why `paged_depth.sh` now sleeps and deletes the stale JSON before the second run — a stale file had silently produced a 0.6B-vs-14B comparison). The 0.6B result is on the synthetic shape, not `cold.py`. The eviction-thrash fix is verified on CPU and by inference on GPU; no run isolates a growth event directly.
 
 @acrosley 2026-08-19
+
+## 2026-08-19 — The paged 5/10 is stale attention, not a coordinate bug: all damage is on reuse turns, and it tracks how much of the view is stubs
+
+Three CPU results on the 14B paged run's own records, plus a fingerprint harness extended to `cold.py`'s real policy.
+
+**1. Every wrong turn is a reuse turn.** Splitting the 40-turn run by turn kind, against the connector-off control on identical (teacher-forced) histories:
+
+| turn kind | n | turns diverging from control | scored turns |
+|---|---:|---:|---:|
+| plain | 13 | **0** | 3 |
+| reuse | 14 | **5** | 7 |
+| refresh | 13 | **0** | 0 |
+
+Refresh turns are byte-identical to the control, every one — the staleness ceiling's recompute does exactly what it is supposed to. All damage is in re-rotated KV.
+
+**2. The headline 5/10 was measuring the wrong thing.** The probe asks its question every 4th turn, and `max_stale=1` makes reuse and refresh alternate, so from turn 13 on *every scored turn lands on a reuse turn* — 7 scored reuse turns, 3 scored plain, **0 scored refresh**. The ceiling can never protect a scored turn, so 5/10 is "how often is a reuse turn right", not "how good is the system". The other 30 turns carry no signal at all: their replies are canned (`Understood.` / `ok`), which is also why "5 of 40 diverged" and "5 of 10 scored" are the same five turns. Any future paged eval has to sample scored turns independently of the reuse/refresh phase.
+
+**3. What predicts a wrong reuse turn: how much of the view has become stubs.**
+
+| turn | hit | segments | phases | promos | cold msgs | reused % | max abs delta |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 13 | **MISS** | 1 | 2 | 0 | 1 | **91.7%** | 566 |
+| 17 | hit | 6 | 4 | 2 | 13 | 74.5% | 5528 |
+| 21 | hit | 6 | 5 | 2 | 21 | 75.1% | 5535 |
+| 25 | **MISS** | 6 | 6 | 2 | 31 | 73.1% | 4374 |
+| 29 | **MISS** | 6 | 6 | 2 | 39 | 74.6% | 4920 |
+| 33 | **MISS** | 6 | 6 | 2 | 49 | 72.8% | 3749 |
+| 37 | **MISS** | 6 | 6 | 2 | 57 | 74.4% | 4302 |
+
+Promotions do not predict it (2 on every turn, hit and miss alike). Segment count does not (6 on both). Reused fraction does not (74.5% hits, 74.6% misses). **Cold count does**, monotonically and with a clean threshold between 21 and 31 — and turn 13 is a second regime, the one turn that reuses 92% of the prompt off a single front demotion. Both are the same underlying quantity: how much of the text a reused span attended to has since been replaced. That is churn measured in tokens, not turns, and the current ceiling counts turns.
+
+**4. The coordinates are exact — the harness says so, and it can prove it is looking.** `tests/test_paged_depth.py` now drives `marathon.cold`'s real policy (demotions, retriever promotions, stub evictions, multi-segment phasing) through the token-id-as-KV fingerprint, teacher-forced. Over 30 turns at an 1500-token window: 54 demotions, 44 evictions, 43 promotions, plans up to 6 segments, and **zero corrupted positions, zero declined loads, zero refused saves**; a 40-turn run at a 900-token window forces evictions specifically and is also clean. Injecting a one-block error into `plan_load`'s delta produces **1181 corrupted positions**, so the clean result is a measurement rather than a blind spot. Every position holds its own token under the full policy: the connector is putting KV exactly where it belongs, and the answer damage is stale attention.
+
+**5. Pre-sizing the store, so growth never happens on a full GPU.** `ShiftStore` takes a `session_cap`: when the caller knows a session's ceiling — a server with a bounded active window does — the first save allocates that much and no later save grows. It is a floor, not a ceiling (a session that outgrows it still grows geometrically), and it is off by default so multi-session budgets keep sharing. `MarathonServer` passes `active_window + max_tokens + 256` through `kv_connector_extra_config["session_tokens"]`. Three CPU tests cover it: one allocation for a session filling its window turn by turn, growth still available past the cap, and geometric behaviour unchanged when it is off. This is aimed at the 7–27 s growth-step turns measured at `gpu_util=0.93`; it is unverified on GPU.
+
+**Limits.** The predictor table is seven reuse turns from one run — cold count and turn index are confounded (both rise monotonically), so "stub fraction" is a hypothesis consistent with the data, not an isolated cause. The fingerprint model treats re-rotation as exact by construction, so it can only ever find *coordinate* errors; it cannot see attention damage, which is precisely the thing now suspected. Segment spans are now recorded per turn so a real churn metric can be computed from the next run's JSON without another GPU run. Pre-sizing and the churn-based ceiling are both untested on hardware; GPU verification is queued.
+
+@acrosley 2026-08-19

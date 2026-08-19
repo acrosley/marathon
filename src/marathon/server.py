@@ -149,6 +149,7 @@ class VllmEngine:
         max_model_len: int = 32768,
         gpu_util: float = 0.0,
         store_tokens: int = 16384,
+        session_tokens: int = 0,
     ) -> None:
         from vllm import LLM, SamplingParams
         from vllm.config import KVTransferConfig
@@ -163,7 +164,10 @@ class VllmEngine:
                 kv_connector="MarathonShiftConnector",
                 kv_connector_module_path="marathon.vllm_shift_connector",
                 kv_role="kv_both",
-                kv_connector_extra_config={"store_tokens": store_tokens},
+                kv_connector_extra_config={
+                    "store_tokens": store_tokens,
+                    "session_tokens": session_tokens,
+                },
             ),
         )
         self.block_size = self.llm.llm_engine.vllm_config.cache_config.block_size
@@ -207,7 +211,10 @@ class MarathonServer:
         if engine is None:
             if model is None:
                 raise ValueError("MarathonServer needs a model name or an engine")
-            engine = VllmEngine(model, max_model_len, gpu_util, store_tokens)
+            # A paged server knows exactly how big a session's KV can get, so the store
+            # can allocate it once instead of growing into a GPU with no headroom left.
+            cap = active_window + max_tokens + 256 if active_window else 0
+            engine = VllmEngine(model, max_model_len, gpu_util, store_tokens, cap)
         self.engine = engine
         self.tok = tokenizer if tokenizer is not None else ChatTokenizer(model)
         self.max_tokens = max_tokens
@@ -368,6 +375,10 @@ class MarathonServer:
                 "reused_tokens": sum(d["dst_end"] - d["dst_start"] for d in loads),
                 "segments": len(plan.segments) if plan else 0,
                 "deltas": [seg.delta for seg in plan.segments] if plan else [],
+                # where each reused run lands, so a churn metric (how much of what a
+                # reused span attended to has since been rewritten) can be computed
+                # after the fact rather than needing another run
+                "segment_spans": [[s.dst_start, s.dst_end] for s in plan.segments] if plan else [],
                 "policy": plan.policy if plan else "first",
                 "reason": plan.reason if plan else "first turn of the session",
                 "phases": max(len(phases), 1),
