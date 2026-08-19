@@ -28,6 +28,12 @@ CODES = ("7391-KAPPA", "5820-OMEGA", "1146-SIGMA")
 QUESTION = "List the access codes you were given, in order, separated by commas."
 EDIT = "[EDITED {n}] Amended note: this opening message was revised later in the session. "
 
+
+def code_for(t: int) -> str:
+    """A distinct, tokenizer-friendly code per turn."""
+    return f"{7000 + 13 * t}-{['KAPPA', 'OMEGA', 'SIGMA', 'DELTA', 'THETA'][t % 5]}"
+
+
 COLS = ("turn", "wire_bytes", "state_bytes", "prompt_tokens", "prefill_s", "reused", "ph", "pol")
 
 
@@ -41,9 +47,31 @@ def main(argv: list[str] | None = None) -> int:
         help="comma-separated turns that rewrite the opening message (e.g. 8,14,20)",
     )
     p.add_argument("--session", default="demo")
+    p.add_argument(
+        "--demote",
+        type=int,
+        default=0,
+        help="cold-tier shape: from this turn on, stub the oldest live message every "
+        "turn (a front-of-view shrink edit on every single turn)",
+    )
+    p.add_argument("--json", default=None, help="write per-turn rows here for comparison")
+    p.add_argument(
+        "--fact-probe",
+        action="store_true",
+        help="demote mode: plant a code every turn and ask for the one from two turns "
+        "back, so each turn scores exact-match on a fact that lives in the reused span",
+    )
+    p.add_argument(
+        "--fixed-replies",
+        action="store_true",
+        help="append a canned assistant message instead of the generated one, so two "
+        "runs keep byte-identical histories and each turn is an independent comparison",
+    )
     args = p.parse_args(argv)
 
     edit_at = [int(x) for x in str(args.edit_at).split(",") if x != ""]
+    if args.demote:
+        edit_at = []  # demotion drives the edits instead
     # a code goes in a few turns before each edit, so each one has to survive every
     # edit that follows it
     plant_at = {max(e - 3, 0): CODES[i % len(CODES)] for i, e in enumerate(edit_at)}
@@ -53,6 +81,11 @@ def main(argv: list[str] | None = None) -> int:
     rows = []
     answer = ""
     for t in range(args.turns):
+        if args.demote and t >= args.demote:
+            # the cold tier's demotion: the oldest live message becomes a stub carrying
+            # its own content address. A shrink edit at the front of the view, every turn.
+            d = t - args.demote
+            c.edit(args.session, 2 * d, f"[cold #{d} {d:08x}]")
         if t in edit_at:
             c.edit(
                 args.session,
@@ -61,10 +94,39 @@ def main(argv: list[str] | None = None) -> int:
             )
         fact = f"The access code is {plant_at[t]}. " if t in plant_at else ""
         ask = t == args.turns - 1
-        r = c.turn(
-            args.session,
-            f"Turn {t}. {fact}{FILLER} {QUESTION if ask else 'Reply ok.'}",
-        )
+        # In demote mode every turn asks something that can only be answered by
+        # attending over the *reused* span. "Reply ok." would compare 'Ok.' against
+        # 'Ok.' and call a corrupted cache a match.
+        want = None
+        if args.demote and args.fact_probe:
+            # Exactly one code is alive at a time: it is planted every 4th turn and the
+            # previous one has already been demoted to a stub by the time the next is
+            # planted, so "the access code" is unambiguous and a 0.6B can answer it.
+            # The question lands one turn later, while the code sits inside the *reused*
+            # span. Exact match on it is the decision-grade signal; an open-ended prompt
+            # only ever shows paraphrase drift.
+            if t % 4 == 0:
+                fact = f"The access code is {code_for(t)}. "
+                request = "Reply ok."
+            elif t % 4 == 1 and t >= 1:
+                want = code_for(t - 1)
+                request = "What is the access code? Answer with only the code."
+            else:
+                request = "Reply ok."
+        elif ask:
+            request = QUESTION
+        elif args.demote:
+            request = "In one sentence, summarize everything you have been told so far."
+        else:
+            request = "Reply ok."
+        r = c.turn(args.session, f"Turn {t}. {fact}{FILLER} {request}")
+        r["want"] = want
+        r["hit"] = None if want is None else (want in r["reply"])
+        if args.fixed_replies:
+            # Teacher forcing. Without it the first differing reply makes the two runs
+            # diverge as *conversations*, and every later mismatch is an echo of that
+            # one rather than a fresh signal about the KV.
+            c.session(args.session).messages[-1]["content"] = "Understood."
         rows.append(r)
         print(
             " ".join(
@@ -86,13 +148,36 @@ def main(argv: list[str] | None = None) -> int:
         if ask:
             answer = r["reply"]
 
+    if args.json:
+        import json
+
+        with open(args.json, "w", encoding="utf-8") as f:
+            json.dump({"turns": args.turns, "demote": args.demote, "rows": rows}, f, indent=1)
+
     print()
+    if args.fact_probe:
+        scored = [r for r in rows if r["hit"] is not None]
+        hits = sum(1 for r in scored if r["hit"])
+        print(f"fact exact-match: {hits}/{len(scored)} = {hits / max(len(scored), 1):.3f}")
+    if args.demote:
+        edited = [r for r in rows if r["reused_tokens"] > 0]
+        pre = [r["prefill_s"] for r in rows]
+        pre_sorted = sorted(pre)
+        print(
+            f"demote mode: {len(edited)}/{len(rows)} turns reused, "
+            f"prefill p50={pre_sorted[len(pre) // 2]:.3f}s max={max(pre):.3f}s"
+        )
+        if edited:
+            deltas = [d for r in edited for d in r["deltas"]]
+            print(f"  segment deltas: min={min(deltas)} max={max(deltas)}")
     for t in edit_at:
         e = rows[t]
         print(
             f"edit turn {t:>2}: {e['prefill_s']:>7}s  {e['reused_tokens']:>6} tokens reused  "
             f"({e['policy']}: {e['reason']})"
         )
+    if args.demote and not plant_at:
+        return 0
     planted = [plant_at[t] for t in sorted(plant_at)]
     missing = [code for code in planted if code not in answer]
     print(f"answer: {answer.strip()!r}")

@@ -391,7 +391,12 @@ def test_demotion_flows_through_the_reuse_plan_as_an_ordinary_edit():
     ]
     assert demote_only
     assert all(r["policy"] == "reuse" for r in demote_only), [r["reason"] for r in demote_only]
-    assert all(r["reused_tokens"] > 0 for r in demote_only)
+    # Paging makes *every* turn an edit turn, so the staleness ceiling (max_stale, see
+    # findings 2026-08-19) makes consecutive demotions alternate between reusing and
+    # spending one honest recompute. A demotion is still a shrink edit the plan reuses
+    # around -- which is what this test is about -- on every turn the ceiling allows.
+    assert all((r["reused_tokens"] > 0) != r["refreshed"] for r in demote_only)
+    assert any(r["reused_tokens"] > 0 for r in demote_only)
 
 
 def test_the_governing_system_prompt_is_never_paged_out():
