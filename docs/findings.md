@@ -858,3 +858,39 @@ The next run is specified and was not made: **Qwen3-8B, 4–8k sessions, the ful
 Caveats: one model, one seed pair, one epoch, one query type, 120 held-out items. `gov_frac 0.5` gives ~282 governing and ~317 other training items, near the intended split but not tuned. No hyperparameter search was run — 1e-4 was a first guess and the `clean_kl` spike by step 81 suggests it is too high for r=16 across all four projections. The eval's `*_answer_ok` grades the arg-max of the teacher-forced sequence rather than a free-running greedy decode; that is comparable across base and tuned but is not `kvshift_eval`'s `exact` column. And the method distills toward full recompute, which the dependent-edit study showed is *itself* sometimes the less obedient party — so a KL improvement would not have been an accuracy improvement even had one appeared.
 
 @acrosley 2026-08-19
+
+## 2026-08-19 — Why the connector broke on a paged session: a latched full-save and a staleness ratchet. Paged 14B now runs at exact-match 1.000 with byte-identical text
+
+Track N measured the Phase 2 / Phase 1 composition failing: with a paged session (the oldest message demoted every turn, so a front-of-view edit on *every* turn) the shift connector scored exact-match 0.33 against 1.0 with it off, and p50 prefill 6.18 s with a 382 s outlier. My `save="full"` fix had been validated on two and three edits; this is what breaks at depth. Two independent bugs, one latency and one correctness.
+
+**First, the CPU harness — which cleared the suspect I was most worried about.** `tests/test_paged_depth.py` models "the KV of the token at position p" as "the token id at position p", so re-rotation is exact by construction and any wrong fingerprint means wrong *coordinates*. It drives the connector's own decisions (`plan_load` / `plan_save`, factored out of the connector into `shift_store` for exactly this reason) through a block-granular prefix cache and a per-scheduler-step save loop, over 30 consecutive demote-style front edits. It passes: no corrupted position, no declined load, no refused save, no `covers()` miss. **Store coordinate bookkeeping is not the bug** — that rules out base/high-water drift, holes, and scheduler/worker mirror divergence, and it is worth having as a standing regression.
+
+**Bug 1 — the full save latches, and every generated token re-gathers the whole prompt.** `_plan_save` runs on every scheduler step, decode steps included. `save="full"` forces `lo = 0`, so it was re-gathering the entire prompt across all 40 layers *once per generated token*. Phase 1 never saw it because the demo replies `ok` in two tokens; a paged eval answers real questions on 70 consecutive edit turns. The fix is to downgrade the flag to an ordinary incremental save the first time it is planned. That alone took p50 prefill on the paged shape from **6.18 s to 0.312 s**.
+
+**Bug 2 — a staleness ratchet, and this one changes answers.** Reused KV attended to the text that preceded it when it was computed, and an edit turn *re-saves the span it just loaded*, so the reused vectors are never recomputed. In a paged session turn N's reuse carries N demotions of drift against a prefix that has been replaced by stubs. Measured on Qwen3-0.6B, 40 turns, a demotion every turn, teacher-forced so each turn is an independent comparison:
+
+| `max_stale` | fact exact-match | control |
+|---|---:|---:|
+| unbounded | 0.200 | 1.000 |
+| 4 | 0.500 | 1.000 |
+| **1** | **1.000** | 1.000 |
+| `repair_first=256`, unbounded | 0.200 | 1.000 |
+
+`repair_first` does nothing here, consistent with the 2026-08-18 entry: repairing 256 tokens of an 1800-token span does not help when what changed is 97% of everything the span attended to. The fix is a ceiling on *consecutive* reused edit turns, after which one turn recomputes honestly. An append-only turn needs no reuse and resets the counter, so `max_stale=1` costs Phase 1's pattern nothing — isolated edits are still served entirely from reused KV.
+
+**The failure mode is worth recording because it is not garbage.** The wrong answers were the *stub identifiers* (`00000004`, `0000000a`) rather than the planted code, with the control answering correctly from byte-identical text. Stale reused KV loses the attention competition to freshly computed tokens. Two measurement traps on the way: with the model's own replies fed back, the first divergence makes the two runs different *conversations* and every later mismatch is an echo — teacher forcing is required. And an open-ended prompt ("summarize what you have been told") diverges on paraphrase alone and reports damage where there is none; only exact-match on a planted fact, with the control at 1.000, is decision-grade.
+
+**Qwen3-14B-FP8, ~8.3k paged window, 50 turns, demotion every turn from turn 12, against the same run with the connector off:**
+
+| | mean | p50 | p90 | fact EM | text vs control |
+|---|---:|---:|---:|---:|---|
+| control (no reuse) | 0.954 s | 0.941 | 1.007 | 13/13 | — |
+| **shift, fixed** | **0.574 s** | 0.871 | 1.027 | **13/13** | **0/50 turns differ** |
+| shift, bug 2 unfixed | — | 0.312 | — | 5/13 | 31/50 differ |
+| Track N, both bugs | — | 6.18 s | 12.1 | 0.33 | — |
+
+Per-turn: the 19 reused turns average **0.171 s** against the control's 0.954 s (5.6×), and the 19 refresh turns average 0.977 s — the same as the control, which is what a refresh *is*. **Honest headline: 1.66× on the mean, not 5.6×.** The ceiling spends half the edit turns on an honest recompute, and that is the price of exact-match parity. All 50 turns' generated text is byte-identical to the no-reuse control, and Phase 1's own shape is unaffected — isolated edits at turns 12 and 20 on 14B still run at 0.187 s and 0.224 s against a control of 0.651 s and 1.287 s.
+
+**Limits.** `max_stale=1` is the strongest setting short of disabling reuse, chosen because 4 still scored 0.500; between 1 and 4 is unmeasured and there may be a cheaper safe point on a less aggressive paging policy. The staleness counter counts *turns*, not drift — a better ceiling would measure how much of the reused span's attended context actually changed (the churn fraction), which would let benign repeated edits keep reusing and would probably beat 1.66×. This is a synthetic paged shape (a per-turn front demotion driven by `scripts/server_demo.py --demote`), not Track N's `cold.py` policy with its retriever and eviction, so the composition should be re-measured through `cold_eval` before the cold tier is called fixed. One model per shape, one run per cell, one window size.
+
+@acrosley 2026-08-19

@@ -195,6 +195,7 @@ class MarathonServer:
         store_tokens: int = 16384,
         repair_first: int | None = None,
         reuse: bool = True,
+        max_stale: int = 1,
     ) -> None:
         if engine is None:
             if model is None:
@@ -206,11 +207,23 @@ class MarathonServer:
         self.repair_first = repair_first
         # off = plain vLLM prefix caching, the control an edit turn is measured against
         self.reuse = reuse
+        # How many *consecutive* edit turns may be served from re-rotated KV before one
+        # is made to recompute honestly. Reused KV is stale by construction -- it
+        # attended to the text that preceded it when it was computed -- and an edit turn
+        # re-saves the span it just loaded, so without a ceiling the staleness ratchets.
+        # Measured 2026-08-19 on a paged session (a front-of-view demotion every turn,
+        # 40 turns, Qwen3-0.6B): fact exact-match 0.20 unbounded, 0.50 at 4, and 1.000
+        # at 1 against a control of 1.000. An append-only turn needs no reuse and so
+        # resets the counter, which is why the default costs Phase 1's pattern nothing:
+        # isolated edits separated by ordinary turns are still served entirely from
+        # reused KV.
+        self.max_stale = max_stale
         self.store = BaselineStore()
         self._lock = threading.Lock()
         # per session: previous verified state and line -> ids cache
         self._prev: dict[str, bytes] = {}
         self._cache: dict[str, dict[bytes, list[int]]] = {}
+        self._stale: dict[str, int] = {}
 
     def plan_for(self, session_id: str, state: bytes, pieces: list[list[int]]):
         """The reuse plan for this session's transition into ``state`` (None if first).
@@ -241,6 +254,10 @@ class MarathonServer:
 
             plan = self.plan_for(session_id, state, pieces)
             loads = plan.to_kv_transfer_params() if plan else []
+            stale = self._stale.get(session_id, 0)
+            refreshed = bool(loads) and stale >= self.max_stale
+            if refreshed:
+                loads = []  # spend one honest recompute to reset the staleness clock
             phases = reuse_plan.phases(loads, self.engine.block_size, len(ids))
 
             start = time.perf_counter()
@@ -259,6 +276,7 @@ class MarathonServer:
                 reply = self.engine.generate(ids, session_id, self.max_tokens, save=self.reuse)
             prefill_s = time.perf_counter() - start
 
+            self._stale[session_id] = stale + 1 if loads else 0
             self._prev[session_id] = state
             return {
                 "reply": reply,
@@ -267,9 +285,12 @@ class MarathonServer:
                 "prompt_tokens": len(ids),
                 "reused_tokens": sum(d["dst_end"] - d["dst_start"] for d in loads),
                 "segments": len(plan.segments) if plan else 0,
+                "deltas": [seg.delta for seg in plan.segments] if plan else [],
                 "policy": plan.policy if plan else "first",
                 "reason": plan.reason if plan else "first turn of the session",
                 "phases": max(len(phases), 1),
+                "stale": self._stale[session_id],
+                "refreshed": refreshed,
                 "wire_bytes": wire_bytes,
                 "state_bytes": len(state),
             }
@@ -322,6 +343,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--gpu-util", type=float, default=0.0)
     p.add_argument("--store-tokens", type=int, default=16384)
     p.add_argument(
+        "--repair-first",
+        type=int,
+        default=None,
+        help="natively recompute the first M tokens of each reused segment so it "
+        "attends to the new text before it",
+    )
+    p.add_argument(
+        "--max-stale",
+        type=int,
+        default=1,
+        help="consecutive reused *edit* turns before one honest recompute refreshes "
+        "the KV (an append-only turn resets the count)",
+    )
+    p.add_argument(
         "--no-reuse",
         action="store_true",
         help="control run: plan nothing, leaving plain vLLM prefix caching",
@@ -334,6 +369,8 @@ def main(argv: list[str] | None = None) -> int:
         gpu_util=args.gpu_util,
         store_tokens=args.store_tokens,
         reuse=not args.no_reuse,
+        max_stale=args.max_stale,
+        repair_first=args.repair_first,
     )
     http = serve(srv, args.host, args.port)
     print(f"marathon.server ready on http://{args.host}:{args.port}/v1/turn", flush=True)

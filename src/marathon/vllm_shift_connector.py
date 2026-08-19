@@ -71,7 +71,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.logger import init_logger
 
 from .shift_kernels import RopeShift, rope_shift, scatter_shifted, warmup
-from .shift_store import DEFAULT_STORE_TOKENS, SessionTable, ShiftStore, slots
+from .shift_store import (
+    DEFAULT_STORE_TOKENS,
+    SessionTable,
+    ShiftStore,
+    plan_load,
+    plan_save,
+    slots,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -192,38 +199,21 @@ class MarathonShiftConnector(KVConnectorBase_V1):
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:
         session = self._table.session_of(request.request_id)
-        plan = (self._params.get(request.request_id) or {}).get("load")
-        if not session or not plan:
-            return 0, False
-        dst_start, dst_end, delta = (
-            int(plan["dst_start"]),
-            int(plan["dst_end"]),
-            int(plan["delta"]),
+        req = (self._params.get(request.request_id) or {}).get("load")
+        decision, why = plan_load(
+            self._store,
+            session,
+            req,
+            num_computed_tokens,
+            request.num_prompt_tokens,
+            self._bs,
         )
-        if num_computed_tokens < dst_start:
-            # vLLM's own prefix hit stops before the reuse region starts; we cannot
-            # ask it to compute a hole in the middle, so decline and let it recompute.
-            logger.warning(
-                "shift: local hit %d < dst_start %d, declining reuse",
-                num_computed_tokens,
-                dst_start,
-            )
+        if decision is None:
+            if session and req:
+                logger.warning("shift: session %s declining reuse: %s", session, why)
             return 0, False
-        # whole blocks only, and always leave at least one token for vLLM to compute
-        hi = min(dst_end, (request.num_prompt_tokens - 1) // self._bs * self._bs)
-        hi -= hi % self._bs
-        if hi <= num_computed_tokens:
-            return 0, False
-        if not self._store.covers(session, num_computed_tokens - delta, hi - num_computed_tokens):
-            logger.warning(
-                "shift: session %s no longer holds [%d,%d); declining reuse",
-                session,
-                num_computed_tokens - delta,
-                hi - delta,
-            )
-            return 0, False
-        self._plans[request.request_id] = (num_computed_tokens, hi, delta)
-        return hi - num_computed_tokens, False
+        self._plans[request.request_id] = (decision.lo, decision.hi, decision.delta)
+        return decision.hi - decision.lo, False
 
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
@@ -234,30 +224,38 @@ class MarathonShiftConnector(KVConnectorBase_V1):
     def _plan_save(self, meta: ShiftConnectorMetadata, rid: str, lo: int, hi: int) -> None:
         """Record a save of the positions this step computed, if the store takes them.
 
-        ``save="full"`` widens the save to ``[0, hi)`` instead of the positions this
-        step actually computed. That is what an *edit* turn needs: the store is a flat
-        position-indexed buffer, so a reused span cannot keep its old index once the
-        edited span before it changed length — the new sequence and the old one no
-        longer agree on where anything lives. Re-gathering the whole prompt out of the
-        paged cache (where the loaded span, the prefix-cache hits and the freshly
-        computed tokens are all resident by now) puts the store back into the *new*
-        coordinates, which makes the session append-only again and the next edit an
-        ordinary one. Loads for a step are all issued in ``start_load_kv`` before any
-        ``save_kv_layer`` runs, so this re-read can never race the load that fed it.
+        ``save="full"`` widens the save to ``[0, hi)``. That is what an *edit* turn
+        needs: the store is a flat position-indexed buffer, so a reused span cannot keep
+        its old index once the edited span before it changed length — the new sequence
+        and the old one no longer agree on where anything lives. Re-gathering the whole
+        prompt out of the paged cache (where the loaded span, the prefix-cache hits and
+        the freshly computed tokens are all resident by now) puts the store back into
+        the *new* coordinates, which makes the session append-only again and the next
+        edit an ordinary one. Loads for a step are all issued in ``start_load_kv``
+        before any ``save_kv_layer`` runs, so this re-read cannot race the load that fed
+        it.
+
+        It is a *one-shot* widening, downgraded to an ordinary incremental save as soon
+        as it has been planned once. ``_plan_save`` runs on every scheduler step,
+        decode steps included, so leaving it latched would re-gather the entire prompt
+        across every layer once per generated token — measured 2026-08-19 as the
+        dominant cost of a paged session, where every turn is an edit turn and every
+        turn generates a real answer.
         """
         session = self._table.session_of(rid)
         blocks = self._blocks.get(rid)
-        if hi <= lo or not session or not blocks:
+        if not blocks:
             return
-        mode = (self._params.get(rid) or {}).get("save")
-        if not mode:
+        params = self._params.get(rid) or {}
+        window = plan_save(self._store, session, params.get("save"), lo, hi)
+        if window is None:
+            if session and params.get("save") and hi > lo:
+                logger.warning("shift: session %s refused save of [%d,%d)", session, lo, hi)
             return
-        if mode == "full":
-            lo = 0
-        if not self._store.reserve(session, lo, hi - lo):
-            logger.warning("shift: session %s refused save of [%d,%d)", session, lo, hi)
-            return
-        meta.saves.append(_Save(session, slots(blocks, lo, hi, self._bs), lo))
+        if params.get("save") == "full":
+            params["save"] = True
+        lo, hi = window
+        meta.saves.append(_Save(session or "", slots(blocks, lo, hi, self._bs), lo))
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput):
         meta = ShiftConnectorMetadata()
