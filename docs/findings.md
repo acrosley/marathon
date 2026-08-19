@@ -536,3 +536,42 @@ Takeaway: **cost scales with the number of edited messages, not with context len
 Caveats: the k-sweep is one session shape (24 turns of ~600-token messages, all edits in the first half) on one model, and the k ≈ 17 break-even is an extrapolation from four points, not a measured crossing. Parity is still one planted fact plus greedy-token equality against prefix mode — the vLLM offline API still cannot give teacher-forced KL at 14B, so Part 1 carries the quality argument and Part 2 carries the cost argument. `combined` at 0.6B *did* break under plain `reuse-all` (answered `5111-SIGMA` for `5111-DELTA`, fixed by first-32); it did not break at 8B, so that failure is not reproduced at scale and may be a small-model artefact. The relocation rule is binary and conservative — it refuses all relocations on the evidence of one |δ| ≈ 10k case, and nothing measures where between δ = 186 (safe) and δ = 10,153 (broken) the boundary sits. And the connector is still one request in flight, one writer, no eviction.
 
 @acrosley 2026-08-19
+
+## 2026-08-19 — North-star: edit-turn TTFT is flat as the session grows (Qwen3-14B-FP8, vLLM 0.27.1)
+
+Command: `scripts/phase1_lengthsweep.sh` → `marathon.local_probe --mode {prefix,shift} --turns T --edit-at T-4 --parity-tokens 16` · Model: `Qwen/Qwen3-14B-FP8` · RTX 5090 / WSL2 · logs `~/marathon-logs/ls_*.{log,json}`
+
+PLAN.md's north-star line is "TTFT flat as session length grows". Every earlier vLLM number was a single 12.5k-token session, which shows a speedup but cannot show a *shape*. This entry sweeps the session length and measures the shape directly. Session turns are the probe's ~597-token filler messages; `--turns` is chosen so the **edit turn** (always last-but-3) lands near each target size, the edit rewrites turn 0, and the final turn asks the planted-fact parity question. `steady` is the mean prefill of the three turns immediately before the edit.
+
+```
+edit-turn   turns    prefix          shift            speedup   steady_s      reused   copy
+prompt tok           edit_s          edit_s                     prefix/shift  tokens   ms (MB, GB/s)
+  4,206      10      0.4193          0.1542            2.7x     0.072/0.074    2,976    24.4 ( 465, 18.6)
+  8,382      17      0.6936          0.1544            4.5x     0.082/0.080    7,152    16.0 (1118, 68.4)
+ 12,561      24      1.2723          0.1951            6.5x     0.100/0.101   11,328    30.2 (1770, 57.2)
+ 16,143      30      1.7840          0.2006            8.9x     0.113/0.107   14,912    35.5 (2330, 64.1)
+ 24,501      44      2.9281          0.3612            8.1x     0.139/0.141   23,264   158.4 (3635, 22.4)
+ 30,471      54      3.8688          0.3663           10.6x     0.156/0.162   29,232   151.6 (4568, 29.4)
+
+mid-history edit (the edited message sits in the middle of the session, not at turn 0)
+ 16,143      30      0.9550          0.2224            4.3x     0.110/0.117   14,912    15.9 (1118, 68.6)
+ 30,471      54      2.5715          0.3579            7.2x     0.161/0.163   29,232    61.8 (2235, 35.3)
+```
+
+Every row's parity answer is `7391-KAPPA`, and every shift row's generated text is identical to its prefix row on every turn. Each shift edit turn is 2 segments / 2 requests (the `_phases` trick), reusing 2,976–29,232 of the prompt's tokens.
+
+**The claim holds.** Prefix caching's edit turn is a straight line in context length: 0.42 → 3.87 s over 4.2k → 30.5k tokens, a slope of **131 µs per token of history** (r² > 0.99 by eye — the six points are 0.42/0.69/1.27/1.78/2.93/3.87 against 4.2/8.4/12.6/16.1/24.5/30.5k). Shift mode over the same range goes 0.154 → 0.366 s, a slope of **8.1 µs/token — 16× shallower**. At 30k the edit turn costs less than a tenth of what the prefix cache costs, and the gap is still widening; the 24k point (8.1×) dips below the 16k point (8.9×) only because the copy cost stepped up there, not because the prefill did.
+
+**But shift-mode TTFT is not literally flat, and the reason is the copy.** The connector's re-rotate-and-scatter is logged per load now (`copy_ms`, added this run — it was previously untimed). It grows linearly with the reused span: 24 ms at 3.0k tokens rising to 152 ms at 29.2k, i.e. roughly **5 µs per reused token**, which accounts for **essentially the whole 8.1 µs/token shift slope** — 128 ms of the 212 ms that the edit turn gains from 4k to 30k is copy. At 30k the copy is **41% of the entire 366 ms edit turn**. Effective bandwidth is not a clean memcpy either: 57–68 GB/s on the 7k–15k spans but only 22–29 GB/s on the 23k–29k ones, because this is a gathered scatter into paged slots plus a float32 RoPE re-rotation of the K half, not a contiguous copy. So the honest statement is *sub-linear-by-16×, dominated by a memory-bandwidth term that is itself linear in |S|* — not O(1). Making it genuinely flat needs the copy to go away (write re-rotated K in place, or have the attention kernel apply δ at read time), which is a real optimisation and not done.
+
+**Mid-history edits behave the same, from a lower baseline.** When the edit lands in the middle rather than at turn 0, prefix caching keeps the first half as a hit and only collapses from there — 0.955 s at 16k and 2.57 s at 30k, versus 1.78 / 3.87 s for the turn-0 edit. Shift is essentially unchanged (0.222 / 0.358 s), so the speedup is smaller (4.3× / 7.2×) but the *shape* is identical: prefix grows with context, shift does not. This is the expected result — prefix caching's cost is "everything after the earliest edit", so an edit at the midpoint costs about half as much, while shift's cost is "the edited span plus the copy" either way.
+
+**Steady-state prefill is untouched and identical between modes** (0.072 → 0.162 s from 4k to 30k, matching to within noise on every row). That growth is vLLM's own cost of prefilling ~600 fresh tokens against a longer KV cache, and it is the same in both modes — shift mode adds nothing to unchanged turns, which was the point of leaving prefix caching enabled underneath.
+
+Memory: the connector's store is 164 KB/token, so 32k tokens is **5.45 GB** on top of vLLM. The 16k default buffer is now sized per run via a new `--store-tokens` flag (with `--gpu-util`); the 24k and 30k points needed `gpu_memory_utilization 0.78` instead of 0.80 to leave room, peaking at **27.1 GB of 32.6 GB**. Full 32k context does fit — the final turn of the largest run is a 32,274-token prompt — but the *edit* turn tops out at 30.5k because it sits three turns before the end, so the largest edit measured is 30.5k, not 32k.
+
+Caveats: one session shape (uniform ~597-token filler messages), one model, one edit (`--edit-count 1`); the k-dependence from the 2026-08-19 multi-span entry stacks on top of this and is not re-measured here. Six points per line is enough to see a slope, not to bound curvature, and each cell is a single run — the 24k/30k copy-bandwidth drop could partly be run-to-run variance rather than a real size effect. Parity is still one planted fact plus greedy-text equality against prefix mode, not teacher-forced KL. The connector is still single-request, single-writer, no eviction, and the store is a flat position-indexed buffer that must be as long as the session.
+
+Note on process: the first attempt at this sweep died mid-run with a `NameError` because another agent was editing `local_probe.py` in the shared worktree. The runs above were made against a pinned copy of the package (`scripts/phase1_probe_pinned.sh` + `MARATHON_SNAP`, which stages `src/marathon` at git HEAD into `~/marathon-snap` and puts it first on `PYTHONPATH`), so a concurrent edit cannot invalidate a sweep in flight. Only two changes sit on top of HEAD in that snapshot: `--store-tokens`/`--gpu-util` on the probe, and the `copy_ms` timing line in the connector.
+
+@acrosley 2026-08-19
