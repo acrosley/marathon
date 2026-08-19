@@ -19,12 +19,14 @@ Sessions are isolated end to end: the previous state, the piece cache and the
 connector's KV store are all keyed by session id, so a plan or a KV read can never
 cross sessions.
 
-Saving policy (v1, deliberately conservative). The connector's store is written while a
-session is append-only; an edit turn *reads* the store and does not write it, and the
-session's store key then rolls to a new epoch so later turns re-save under a fresh key
-rather than layering new positions over the old layout. Coverage the new epoch does not
-have is simply declined by the store (:mod:`marathon.shift_store`), so a second edit in
-a session costs a recompute — never a wrong answer.
+Saving policy. The connector's store is a flat position-indexed buffer, so it is only
+meaningful in *one* set of coordinates at a time. An append-only turn extends it. An
+edit turn moves everything after the edit, which would leave the store describing a
+layout that no longer exists — so the edit turn's final request saves with ``"full"``,
+re-gathering the whole prompt out of the paged KV cache (loaded span, prefix-cache hits
+and freshly computed tokens are all resident there by then) at its *new* positions. The
+session is append-only again afterwards, which is what makes a session's second, third
+and Nth edit cost the same as its first.
 
 Two front doors, both thin: :class:`MarathonServer` is the Python API
 (``turn(session_id, payload) -> dict``), and :func:`serve` wraps it in a stdlib
@@ -168,7 +170,7 @@ class VllmEngine:
         session: str,
         max_tokens: int,
         load: dict | None = None,
-        save: bool = False,
+        save: bool | str = False,
     ) -> str:
         params = self._sampling(temperature=0, max_tokens=max_tokens)
         kv: dict[str, Any] = {"session": session, "save": save}
@@ -206,10 +208,9 @@ class MarathonServer:
         self.reuse = reuse
         self.store = BaselineStore()
         self._lock = threading.Lock()
-        # per session: previous verified state, line -> ids cache, connector store epoch
+        # per session: previous verified state and line -> ids cache
         self._prev: dict[str, bytes] = {}
         self._cache: dict[str, dict[bytes, list[int]]] = {}
-        self._epoch: dict[str, int] = {}
 
     def plan_for(self, session_id: str, state: bytes, pieces: list[list[int]]):
         """The reuse plan for this session's transition into ``state`` (None if first).
@@ -242,23 +243,22 @@ class MarathonServer:
             loads = plan.to_kv_transfer_params() if plan else []
             phases = reuse_plan.phases(loads, self.engine.block_size, len(ids))
 
-            epoch = self._epoch.setdefault(session_id, 0)
-            key = f"{session_id}#{epoch}"
             start = time.perf_counter()
             if phases:
                 # every phase but the last is a max_tokens=1 warm-up whose only job is
                 # to leave its blocks in vLLM's prefix cache for the phase after it
                 for length, load in phases[:-1]:
-                    self.engine.generate(ids[:length], key, 1, load=load)
-                reply = self.engine.generate(ids, key, self.max_tokens, load=phases[-1][1])
-            else:
+                    self.engine.generate(ids[:length], session_id, 1, load=load)
+                # "full": the reused span has moved, so the store is rebuilt in the new
+                # position coordinates -- otherwise the *next* edit would plan against a
+                # layout that no longer exists. See the connector's _plan_save.
                 reply = self.engine.generate(
-                    ids, key, self.max_tokens, save=self.reuse and not loads
+                    ids, session_id, self.max_tokens, load=phases[-1][1], save="full"
                 )
+            else:
+                reply = self.engine.generate(ids, session_id, self.max_tokens, save=self.reuse)
             prefill_s = time.perf_counter() - start
 
-            if loads:  # this turn read the store; later turns must not layer onto it
-                self._epoch[session_id] = epoch + 1
             self._prev[session_id] = state
             return {
                 "reply": reply,

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end Marathon server demo: boot the HTTP endpoint, run a 12-turn conversation
-# with a mid-history edit through it, print the per-turn table, assert the planted fact.
+# with mid-history edits through it, print the per-turn table, assert the planted fact.
 #
 # Usage:
 #   wsl -d Ubuntu -- bash /mnt/c/Users/acros/Projects/marathon-server/scripts/server_demo.sh

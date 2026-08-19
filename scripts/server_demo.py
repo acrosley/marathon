@@ -21,10 +21,12 @@ FILLER = (
     "byte-stable, append-only fashion so that KV reuse can be measured across turns. "
 ) * 20
 
-CODE = "7391-KAPPA"
-PLANT_AT = 3
-QUESTION = "What is the access code? Answer with only the code."
-EDIT = "[EDITED] Amended note: this opening message was revised later in the session. "
+# One code planted before each edit turn, so the last turn's answer proves that every
+# edit's re-rotated reuse kept the facts it stitched over -- including the codes that
+# have now survived two and three separate edit turns.
+CODES = ("7391-KAPPA", "5820-OMEGA", "1146-SIGMA")
+QUESTION = "List the access codes you were given, in order, separated by commas."
+EDIT = "[EDITED {n}] Amended note: this opening message was revised later in the session. "
 
 COLS = ("turn", "wire_bytes", "state_bytes", "prompt_tokens", "prefill_s", "reused", "ph", "pol")
 
@@ -33,19 +35,31 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--url", default="http://127.0.0.1:8000")
     p.add_argument("--turns", type=int, default=12)
-    p.add_argument("--edit-at", type=int, default=9)
+    p.add_argument(
+        "--edit-at",
+        default="9",
+        help="comma-separated turns that rewrite the opening message (e.g. 8,14,20)",
+    )
     p.add_argument("--session", default="demo")
     args = p.parse_args(argv)
+
+    edit_at = [int(x) for x in str(args.edit_at).split(",") if x != ""]
+    # a code goes in a few turns before each edit, so each one has to survive every
+    # edit that follows it
+    plant_at = {max(e - 3, 0): CODES[i % len(CODES)] for i, e in enumerate(edit_at)}
 
     c = Client(http(args.url))
     print(" ".join(f"{h:>14}" for h in COLS), "  reply")
     rows = []
     answer = ""
     for t in range(args.turns):
-        if t == args.edit_at:
-            # rewrite turn 0's message: every later turn's KV must be shifted, not redone
-            c.edit(args.session, 0, EDIT + c.session(args.session).messages[0]["content"])
-        fact = f"The access code is {CODE}. " if t == PLANT_AT else ""
+        if t in edit_at:
+            c.edit(
+                args.session,
+                0,
+                EDIT.format(n=edit_at.index(t)) + c.session(args.session).messages[0]["content"],
+            )
+        fact = f"The access code is {plant_at[t]}. " if t in plant_at else ""
         ask = t == args.turns - 1
         r = c.turn(
             args.session,
@@ -72,16 +86,21 @@ def main(argv: list[str] | None = None) -> int:
         if ask:
             answer = r["reply"]
 
-    edit = rows[args.edit_at]
-    print(
-        f"\nedit turn {args.edit_at}: {edit['prefill_s']}s, {edit['reused_tokens']} tokens reused"
-    )
-    print(f"  plan: {edit['policy']} / {edit['reason']}")
-    print(f"answer: {answer.strip()!r} (expecting {CODE})")
-    if CODE not in answer:
-        print("FAIL: the planted fact did not survive the edit turn's KV reuse")
+    print()
+    for t in edit_at:
+        e = rows[t]
+        print(
+            f"edit turn {t:>2}: {e['prefill_s']:>7}s  {e['reused_tokens']:>6} tokens reused  "
+            f"({e['policy']}: {e['reason']})"
+        )
+    planted = [plant_at[t] for t in sorted(plant_at)]
+    missing = [code for code in planted if code not in answer]
+    print(f"answer: {answer.strip()!r}")
+    print(f"expecting: {', '.join(planted)}")
+    if missing:
+        print(f"FAIL: {len(missing)} planted fact(s) lost across the edit turns: {missing}")
         return 1
-    print("PASS: planted fact answered correctly after a mid-history edit")
+    print(f"PASS: all {len(planted)} planted facts answered after {len(edit_at)} edit turn(s)")
     return 0
 
 
