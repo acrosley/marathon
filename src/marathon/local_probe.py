@@ -34,6 +34,7 @@ import json
 import os
 import time
 
+from .reuse_plan import phases as _phases
 from .session import Session
 
 _FILLER = (
@@ -79,38 +80,6 @@ def _line_tokens(tok, sep: list[int]):
         return sep + tok.encode(f"{h['role']}: {h['content']}", add_special_tokens=False)
 
     return f
-
-
-def _phases(loads: list[dict], block_size: int, n_prompt: int) -> list[tuple[int, dict | None]]:
-    """Turn a segment list into ``[(request_length, load_or_None)]`` — k+1 requests.
-
-    vLLM's connector API can only express externally-matched tokens as a *prefix* of
-    one request, so k reused segments cannot be handed over in one shot. They are
-    instead handed over one per request, in destination order: request i prefills the
-    fresh span before segment i (everything earlier is a vLLM prefix hit, including the
-    segments the connector wrote in earlier requests) and stops exactly on the block
-    boundary where segment i begins, so that the *next* request's local prefix hit lands
-    on the connector's ``dst_start``. The final request is the real one: full prompt,
-    last segment loaded, only the new turn left to prefill.
-
-    Segments are clipped to whole blocks (vLLM counts matched tokens per block); a
-    segment with less than one whole block left is dropped and simply recomputed.
-    """
-    segs = []
-    for ld in loads:
-        lo = -(-int(ld["dst_start"]) // block_size) * block_size
-        hi = int(ld["dst_end"]) // block_size * block_size
-        if hi - lo >= block_size and lo > 0 and hi < n_prompt:
-            segs.append((lo, hi, int(ld["delta"])))
-    if not segs:
-        return []
-    out: list[tuple[int, dict | None]] = [(segs[0][0], None)]
-    for i, (lo, _hi, _d) in enumerate(segs[1:], start=1):
-        prev = segs[i - 1]
-        out.append((lo, {"dst_start": prev[0], "dst_end": prev[1], "delta": prev[2]}))
-    last = segs[-1]
-    out.append((n_prompt, {"dst_start": last[0], "dst_end": last[1], "delta": last[2]}))
-    return out
 
 
 def _mutate(session, edit_turn: int, count: int, grow: str, move: bool, upto: int) -> None:
