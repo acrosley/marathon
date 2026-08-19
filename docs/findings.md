@@ -184,3 +184,31 @@ Takeaway: re-rotated shifted-KV reuse holds up. Recomputing only `E'` plus the n
 Caveats: single model size (Qwen3-0.6B); a Qwen3-8B scale-up was started and aborted — the download filled the C: drive (0 bytes free), which wedged the WSL VM; `wsl --terminate Ubuntu` did not bring it back and `--shutdown` is off limits, so WSL needs a manual restart by the lead. ~114 GB was freed from `%TEMP%` (stale diagnostic dumps); the partial Qwen3-8B download is still in the WSL HF cache. Also: in these sessions `S` is semantically independent of the edited span (separate log entries), which is the friendly case for reuse — an edit that later text actually depends on should be the next test.
 
 @acrosley 2026-08-18
+
+## 2026-08-18 — CacheBlend knobs: a lower recompute ratio only speeds *unchanged* turns, never the edit turn; blend + prefix caching crashes
+
+Commands: `scripts/phase1_probe.sh --mode {none,prefix,blend} --turns 24 --edit-at 20 --parity-tokens 16 [--recompute-ratio R] [--blend-prefix]` · Model: `Qwen/Qwen3-14B-FP8`, same WSL2/vLLM 0.27.1/LMCache-from-source stack · Cost: $0.
+
+New probe flags: `--recompute-ratio` (sets `LMCACHE_BLEND_RECOMPUTE_RATIOS`), `--blend-prefix` (blend mode with vLLM `enable_prefix_caching=True` as well), and `--parity-tokens N` — a unique fact (`The access code is 7391-KAPPA.`) is planted in turn 3's user message and the last turn asks `What is the access code? Answer with only the code.` instead of "Reply 'ok'", generating N tokens greedily. Qwen3 is a thinking model and spent the whole budget on `<think>`, so the parity turn's assistant tail prefills a closed empty think block; 16 tokens then suffice. The parity turn is the only one that decodes more than one token, which is why turn 23 is inflated everywhere.
+
+`prefill_s`, turns 17–23 (edit of turn 0 lands on turn 20):
+
+```
+turn  prompt_tokens   none   prefix   blend r=0.15   blend r=0.05   blend r=0.02
+ 17      10766        1.269   0.110      0.686          0.522          0.472
+ 18      11363        1.399   0.103      0.766          0.557          0.410
+ 19      11960        1.691   0.098      0.789          0.580          0.521
+ 20      12561        1.718   1.377      1.399          1.395          1.369   <- edit turn
+ 21      13158        1.685   0.116      0.878          0.614          0.507
+ 22      13755        1.884   0.117      0.973          0.651          0.530
+ 23      14364        1.747   0.210      1.286          1.067          0.830   <- parity turn (16 tokens decoded)
+```
+
+Parity: every mode and every ratio answered `7391-KAPPA` exactly — including `none` (ground truth). Dropping the recompute ratio to 0.02 costs no measurable accuracy on this probe.
+
+`--blend-prefix` does not run at all: with vLLM prefix caching on, the scheduler hands LMCache only the *new* tokens after a prefix hit while the blender still assumes the full chunked prompt, so it dies on the first turn with a hit — `RuntimeError: The size of tensor a (1208) must match the size of tensor b (3)` in `blender.process_qkv` (`k` vs `old_k`). Reproduced at r=0.15 and r=0.02; after the crash the engine hangs until LMCache's pin monitor times out at 300 s, so the run has to be killed.
+
+Takeaway: the recompute ratio is the wrong knob — 0.15 → 0.02 buys ~1.7× on unchanged turns (0.79 → 0.52 s at 12k tokens) and *nothing* on the edit turn (1.399 → 1.369 s, still a tie with prefix caching's 1.377 s collapse and with full recompute), because the edit turn's cost is the two full-length passes plus vLLM's prefill of the new tokens, not the selected fraction. Blend still loses 4–5× to prefix caching on unchanged turns, and the "keep both on" escape hatch is closed by an LMCache bug. Of the options listed last entry, the two cheap ones are now spent; the remaining route is Marathon's own position-shifted KV reuse.
+Caveats: the box is shared with another agent's GPU work — runs contended by it show 5–40 s spikes and were discarded and re-run (`none` turn 13 at 22.0 s is one survivor; ignore it). A partial `Qwen3-8B` download is still in the WSL HF cache — deleting it was blocked by the permission classifier, so the lead should `rm -rf ~/.cache/huggingface/hub/models--Qwen--Qwen3-8B`.
+
+@acrosley 2026-08-18
