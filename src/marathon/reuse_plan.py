@@ -59,6 +59,7 @@ class ReusePlan:
     """
 
     segments: tuple[Segment, ...]
+    moved: tuple[bool, ...]
     total: int
     policy: str
     repair_first: int
@@ -100,7 +101,7 @@ class ReusePlan:
     def s_end(self) -> int:
         return self._last.dst_end if self._last else self.total
 
-    def to_kv_transfer_params(self) -> list[dict[str, int]]:
+    def to_kv_transfer_params(self, reuse_moved: bool = False) -> list[dict[str, int]]:
         """One ``{"dst_start", "dst_end", "delta"}`` per reused segment, in dst order.
 
         The leading prefix is omitted: vLLM's own prefix cache already has it. Every
@@ -112,8 +113,13 @@ class ReusePlan:
         if self.policy == "full":
             return []
         out = []
-        for seg in self.segments:
+        for seg, moved in zip(self.segments, self.moved, strict=True):
             if seg.dst_start == 0:
+                continue
+            if moved and not reuse_moved:
+                # Measured 2026-08-19: transplanting a *relocated* block into vLLM at
+                # |delta| ~10k destroys generation, and repairing its head does not help.
+                # A shift is safe; a relocation is not. Recompute it instead.
                 continue
             start = seg.dst_start + self.repair_first
             if start < seg.dst_end:
@@ -134,9 +140,17 @@ def _governing(line: bytes) -> bool:
 def _match(old_lines: list[bytes], new_lines: list[bytes]) -> list[int | None]:
     """For each new line, the old line it reuses -- or None if it is genuinely new.
 
-    Greedy and order-agnostic on purpose: a line that moved is still the same line, so
-    the match may run backwards. Continuing the current run is preferred, which keeps a
-    block of moved messages as one segment instead of many.
+    Order-agnostic on purpose: a line that moved is still the same line, so the match
+    may run backwards. But byte identity is not *context* identity -- a reused line's KV
+    encodes whatever preceded it in the old sequence -- and histories are full of
+    byte-identical entries (every bare ``"ok"`` acknowledgement is the same line). Given
+    several candidates, the nearest one is therefore taken, not the first: an entry that
+    did not move should match itself, and only a genuinely relocated entry should get a
+    large delta. Continuing the current run breaks ties, which keeps a block of moved
+    entries together as one segment.
+
+    Measured 2026-08-18: picking the first unused candidate instead mapped a duplicate
+    acknowledgement line to one 10k tokens away and destroyed generation.
     """
     index: dict[bytes, list[int]] = {}
     for i, line in enumerate(old_lines):
@@ -144,11 +158,9 @@ def _match(old_lines: list[bytes], new_lines: list[bytes]) -> list[int | None]:
     used: set[int] = set()
     out: list[int | None] = []
     nxt: int | None = None
-    for line in new_lines:
-        if nxt is not None and nxt < len(old_lines) and nxt not in used and old_lines[nxt] == line:
-            pick: int | None = nxt
-        else:
-            pick = next((i for i in index.get(line, ()) if i not in used), None)
+    for j, line in enumerate(new_lines):
+        free = [i for i in index.get(line, ()) if i not in used]
+        pick = min(free, key=lambda i: (abs(i - j), i != nxt)) if free else None
         if pick is not None:
             used.add(pick)
         out.append(pick)
@@ -161,8 +173,12 @@ def _segments(
     old_len: list[int],
     new_len: list[int],
     head_tokens: int,
-) -> list[Segment]:
-    """Maximal runs of consecutively-matched lines, as token-coordinate segments."""
+) -> tuple[list[Segment], list[bool]]:
+    """Maximal runs of consecutively-matched lines, as token-coordinate segments.
+
+    The second list flags the runs whose entries *relocated* (their index in the history
+    changed), as opposed to merely shifting because something before them got longer.
+    """
     old_off, new_off = [head_tokens], [head_tokens]
     for n in old_len:
         old_off.append(old_off[-1] + n)
@@ -170,8 +186,10 @@ def _segments(
         new_off.append(new_off[-1] + n)
 
     segs: list[Segment] = []
+    moved: list[bool] = []
     if head_tokens:
         segs.append(Segment(0, head_tokens, 0))
+        moved.append(False)
     run: list[int] = []  # new-line indices in the current run
 
     def flush() -> None:
@@ -179,6 +197,7 @@ def _segments(
             return
         i0, i1 = matches[run[0]], matches[run[-1]]
         segs.append(Segment(old_off[i0], old_off[i1 + 1], new_off[run[0]]))
+        moved.append(any(matches[j] != j for j in run))
         run.clear()
 
     for j, m in enumerate(matches):
@@ -192,15 +211,18 @@ def _segments(
     flush()
 
     merged: list[Segment] = []
-    for seg in segs:
+    merged_moved: list[bool] = []
+    for seg, mv in zip(segs, moved, strict=True):
         if seg.length <= 0:
             continue
         prev = merged[-1] if merged else None
         if prev is not None and prev.dst_end == seg.dst_start and prev.src_end == seg.src_start:
             merged[-1] = Segment(prev.src_start, seg.src_end, prev.dst_start)
+            merged_moved[-1] = merged_moved[-1] or mv
         else:
             merged.append(seg)
-    return merged
+            merged_moved.append(mv)
+    return merged, merged_moved
 
 
 def plan(
@@ -223,31 +245,37 @@ def plan(
     total = head_tokens + sum(new_len)
 
     matches = _match(old_lines, new_lines)
-    segments = _segments(matches, old_len, new_len, head_tokens)
+    segments, moved = _segments(matches, old_len, new_len, head_tokens)
     matched = {m for m in matches if m is not None}
     dropped = [i for i in range(len(old_lines)) if i not in matched]
     n_fresh = sum(1 for m in matches if m is None)
-    moved = sum(1 for a, b in zip(segments, segments[1:], strict=False) if a.delta != b.delta)
 
     if not segments:
         # nothing at all survived: the history was replaced, not edited.
-        return ReusePlan((), total, "full", 0, f"no reusable entries ({len(old_lines)} dropped)")
-
-    what = (
-        "append-only"
-        if not dropped
-        else (
-            f"{len(dropped)} edited entries, {n_fresh} fresh, {len(segments)} segments"
-            + (f", {moved} delta changes (moved blocks)" if moved else "")
+        return ReusePlan(
+            (), (), total, "full", 0, f"no reusable entries ({len(old_lines)} dropped)"
         )
-    )
-    if any(_governing(old_lines[i]) for i in dropped):
+
+    relocated = [m for j, m in enumerate(matches) if m is not None and m != j]
+    if not dropped and not relocated:
+        what = "append-only"
+    elif not dropped:
+        what = f"{len(relocated)} relocated entries, {len(segments)} segments (moved blocks)"
+    else:
+        what = f"{len(dropped)} edited entries, {n_fresh} fresh, {len(segments)} segments" + (
+            f", {len(relocated)} relocated" if relocated else ""
+        )
+    # A governing entry that *moved* changes what governs later text just as much as one
+    # that was rewritten, so both count. An index change is the signal; a token delta can
+    # cancel to zero while the entry still sits somewhere else in the history.
+    if any(_governing(old_lines[i]) for i in dropped + relocated):
         return ReusePlan(
             tuple(segments),
+            tuple(moved),
             total,
             "repair",
             repair_first,
             f"edit inside a governing span ({what}); reused KV must attend to the new "
             "text (findings 2026-08-18)",
         )
-    return ReusePlan(tuple(segments), total, "reuse", 0, what)
+    return ReusePlan(tuple(segments), tuple(moved), total, "reuse", 0, what)

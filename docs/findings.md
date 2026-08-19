@@ -459,3 +459,80 @@ Takeaway: with the confound broken, the governing flag is the predictor (9x on m
 Caveats: one model (`Qwen3-8B` bf16, sdpa), two seeds. `mid-governing` is one synthetic construction of "a governing span that is not the system prompt" — a user turn carrying a standing instruction — and real sessions may carry governing content in forms this does not resemble. The 2x2 holds δ near 0 by design, so it says nothing about a *large* governing edit; `rewrite` is the only large-δ kind and it is non-governing. Cell sizes are 38-40 items (12 sessions each), so the two >0.2 items are 2 events and the KL means are not tightly bounded. `continue-code` is n=14. And as before, exact-match has a reference-instability floor (`prefix-equiv` 0.86 overall, 0.67 on `obey`), so the KL columns carry the argument.
 
 @acrosley 2026-08-18
+
+## 2026-08-19 — Multi-span and moved-block KV reuse: cost tracks the number of edits, not the context — and a *relocated* block is not a shifted one
+
+Commands: `scripts/kvshift_probe.sh --model Qwen/Qwen3-8B --turns 20 --scenario multi-k1,multi-k2,multi-k4,multi-k8,move,combined` and `scripts/phase1_multispan.sh` (prefix/shift matrix, `Qwen/Qwen3-14B-FP8`, `--turns 24 --edit-at 20 --parity-tokens 16`) · Cost: $0 · GPU quiet throughout (Track G idle); every steady-state turn quoted below sits in 0.089–0.110 s, so no row is contended.
+
+Every reuse result in this log so far was a *single* edited span, and `reuse_plan` returned `policy="full"` the moment it saw two — a `# ponytail:` ceiling. That is the wrong shape for the workload the design targets: an agent turn rewrites several messages, and blocks get moved. This entry removes the ceiling, and finds that one of the two generalisations works and the other does not.
+
+**The generalisation.** A plan is now a list of `Segment(src_start, src_end, dst_start)`, each carrying its own `delta = dst_start - src_start`; a moved block is a segment whose delta differs from its neighbours' and may be negative. `stitch_segments` places them all (V verbatim, K re-rotated per segment) and everything they do not cover is recomputed in one masked forward, so each fresh span attends to every stitched and freshly written slot below it. The RoPE identity is unchanged; `tests/test_kvshift.py` covers δ ∈ {−7, −1, 0, 1, 13, 64} and `rerotate max abs error` on the real 8B `inv_freq` is 1.39e-05. In the HF prototype `token_segments` runs `marathon.diff`'s rsync matcher over the token-id stream encoded as fixed 4-byte words — the rsync engine is right here precisely because it is *not* an LCS: it indexes every aligned baseline block and matches wherever the bytes occur, so a moved block appears as a copy whose source offset runs backwards, and the 4-byte encoding snaps every match to a token boundary for free. In the serving path `reuse_plan.plan` matches canonical JSONL lines, so a segment is always a whole run of entries.
+
+### Part 1 — quality, Qwen3-8B, 20 turns, ~5.3k tokens, worst case over each scenario's fact questions
+
+`multi-kN` rewrites N different messages in one turn; `move` swaps two messages' contents; `combined` does two rewrites *and* a swap.
+
+```
+scenario   segments  reused/total   policy          frac    klmean    klmax  tf_top1   QA   ==ref
+multi-k1      3      5288/5326      full-recompute  1.000   0.0000   0.0000    1.00    2/2   2/2
+                                    reuse-all       0.012   0.0014   0.0128    1.00    2/2   2/2
+                                    no-rerotate     0.012   0.0024   0.0214    1.00    2/2   2/2
+multi-k2      6      5276/5345      reuse-all       0.018   0.0012   0.0111    1.00    3/3   3/3
+                                    no-rerotate     0.018   0.0024   0.0269    1.00    3/3   3/3
+multi-k4      8      5255/5383      reuse-all       0.028   0.0008   0.0095    1.00    4/4   4/4
+                                    no-rerotate     0.028   0.0192   0.2256    1.00    4/4   4/4
+multi-k8     22      5216/5459      reuse-all       0.049   0.0022   0.0259    1.00    4/4   4/4
+                                    no-rerotate     0.049   0.0405   0.3845    1.00    4/4   4/4
+move          5      5305/5333      reuse-all       0.009   0.0005   0.0033    1.00    2/2   2/2
+                                    no-rerotate     0.009   0.0013   0.0071    1.00    2/2   2/2
+combined      -      -              reuse-all       0.028   0.0007   0.0049    1.00    3/3   3/3
+                                    no-rerotate     0.028   2.3173  13.5002    0.58    1/3   1/3
+```
+
+Deltas are per segment and mixed-sign wherever a block moved: `move` is `[-3689, 0, 14, 3703]`, `multi-k8` runs `[-3001 … 0, 4, 8, 12, 16, 20, 24, 28, 32 … 3193]` across 22 segments. HF prefill, mean over the fact questions: full recompute 0.41–0.45 s against reuse-all 0.039–0.049 s — **9.1× at k=8, 10.1–10.8× elsewhere**, and at 8B this is compute-bound enough that wall clock and recompute fraction agree. Selective recompute again buys nothing: `first-32/128/512` and `blend-r0.05/0.15/0.30` leave klmean in the same 0.001–0.010 band for 2–16× the compute (`first-512` reaches 80% recompute at k=8).
+
+**The control is now decisive.** `no-rerotate` — same segments, keys left at their stale angles — was a 5–20× KL penalty in the single-span entries. With multi-span it becomes a correctness failure: at `combined` it is klmean **2.32**, max 13.5, teacher-forced top-1 agreement 0.58, and 1/3 fact questions right instead of 3/3. At 0.6B the same control literally swaps the two answers in `move` (asked for `alpha` it returns the `omega` code and vice versa). This matches Track G's independent same-day result that the control's damage concentrates where δ is large. Re-rotation is not a refinement; it is what makes non-prefix reuse work at all.
+
+### Part 2 — cost, Qwen3-14B-FP8 in vLLM, 24 turns, edit on turn 20 (12.5k-token prompt)
+
+k segments cannot be handed to vLLM in one shot — its connector API expresses externally-matched tokens only as a *prefix* — so `local_probe._phases` hands them over one per request, each stopping on the block boundary where the next segment begins; the final request is the real one. k edits ⇒ k+1 requests.
+
+```
+config                        turn19  turn20  turn21  turn23   req  seg   t20 text / parity        vs prefix
+prefix (k=1 mutation)          0.097   1.243   0.107   0.191    1    -    '<think>' / '7391-KAPPA'     -
+prefix (pure move)             0.089   1.181   0.109   0.194    1    -    '<think>' / '7391-KAPPA'     -
+shift --edit-count 1           0.097   0.198   0.105   0.187    2    2    '<think>' / '7391-KAPPA'   6.3x
+shift --edit-count 2           0.099   0.276   0.107   0.193    3    3    '<think>' / '7391-KAPPA'   4.5x
+shift --edit-count 4           0.097   0.411   0.105   0.190    5    5    '<think>' / '7391-KAPPA'   3.0x
+shift --edit-count 8           0.090   0.664   0.100   0.179    9    9    '<think>' / '7391-KAPPA'   1.9x
+shift --move                   0.098   0.293   0.110   0.192    3    5    '<think>' / '7391-KAPPA'   4.0x
+shift --edit-count 4 --move    0.095   0.546   0.106   0.188    6    9    '<think>' / '7391-KAPPA'   2.3x
+```
+
+Every working row's generated text is byte-identical to prefix mode on every turn, and turn 23 answers the planted fact through re-rotated KV. Steady-state turns are unchanged (0.09–0.11 s in both modes). The edit turn is almost exactly linear in k — 0.198 / 0.276 / 0.411 / 0.664 s is **+66 ms per additional edited message**, which is the k+1-request phase trick plus that message's own prefill, and nothing that scales with context. Extrapolating that fit, shift stops beating prefix caching's flat 1.24 s collapse at about **k ≈ 17 edited messages** in a 12.5k context; below that the win is real, above it a full recompute is simply cheaper.
+
+### A relocated block is not a shifted block
+
+The two `--move` rows above are the *second* version. The first was wrong, and the failure is the most useful thing in this entry.
+
+Transplanting relocated blocks the same way as shifted ones ran fine mechanically — `shift: loaded 576 tokens x 40 layers from store[10777:11353], delta=-10153` and its mirror at `delta=+10154`, no declines, 0.235 s — and produced **garbage**: turn 20 emitted `'1'` instead of `'<think>'`, turn 21 `'2'`, and turn 23 answered `' content used to grow the context in a 2 2 2 2'` instead of `7391-KAPPA`. `--repair-first 256` did not move it (0.340 s, same wrong text), which rules out a seam effect. The cause is the one thing re-rotation cannot touch: a block that moved 10k positions has KV summarising a *completely different* prefix, and re-rotating its keys fixes only where it now sits, not what it attended to. A shift of +4 or +186 leaves the preceding context intact; a relocation does not.
+
+So `reuse_plan` now distinguishes them. A segment whose entries merely shifted is reused; a segment whose entries *relocated* (their index in the history changed) is flagged in `plan.moved` and recomputed instead — `to_kv_transfer_params(reuse_moved=True)` restores the old, measured-unsafe behaviour for anyone who wants to re-measure it. That costs 2 × ~600 tokens of prefill and turns the broken row into the working one: **pure move 1.181 s → 0.293 s (4.0×) with byte-identical output**, `k=4 + move` 1.243 s → 0.546 s (2.3×). Reuse of the *unmoved* 76–95% of the history is untouched. A governing entry that relocated now also trips the `repair` policy, for the same reason a rewritten one does.
+
+This does **not** contradict Part 1, where `move` at 8B scored klmean 0.0005 with both fact questions exact at |δ| ≈ 3.7k. Those questions only ask the model to look up a value living *inside* the moved block, which the query attends to directly — the same structural reason fact edits have always survived. The vLLM probe asks the model to keep generating in context, and that is where a transplanted block's stale summary shows. The honest reading is that the HF move measurement was not sensitive to the failure, not that the two disagree.
+
+### Byte identity is not context identity
+
+The matcher will happily match a block against an *identical passage elsewhere*. It is visible in the segment lists: `multi-k1` contains no move at all, yet its deltas are `[-2385, 0, 4]` — a chunk of the probe's repeated filler prose matched a copy of itself 2,385 tokens earlier. That segment's KV was computed after different preceding text, so it is not merely shifted; it is wrong in the way the move case just demonstrated.
+
+On the HF workload it cost nothing measurable — every scenario above reuses such a segment and still scores klmean ≤ 0.0022 with every fact question exact, for the same "the query attends to the fresh text directly" reason. In the serving path it *did* bite, and the fix is in: `reuse_plan._match` used to take the first unused byte-identical old entry, which mapped a bare `"ok"` acknowledgement to one 10k tokens away (every assistant turn in `local_probe` serialises to the identical line). It now takes the **nearest** candidate, with run-continuation only as a tie-break, so an entry that did not move matches itself and only a genuinely relocated one gets a large delta — `tests/test_reuse_plan.py::test_duplicate_entries_match_the_nearest_not_the_first` pins it. That was not what broke the move case (the relocation itself was — the fix changed which segment one 9-token line belonged to and the output stayed wrong until relocations were recomputed), but it is a real defect found on the way, and it is the same hazard one level down. `token_segments` in the HF prototype remains exposed: the cheap mitigations — require a segment's *predecessor* to match too, or prefer the smallest |δ| among candidates — are not implemented there.
+
+### What changed in the code
+
+`kvshift.Segment` / `token_segments` / `stitch_segments` / `fresh_positions`; `select` and `run_segments` apply first-M and blend per non-leading segment. `reuse_plan.plan` is line-granular, takes `head_tokens` so its coordinates are the serving layer's, and returns `segments` + `moved` + `total`; `to_kv_transfer_params()` returns a **list**, one dict per reused segment past the leading prefix, skipping relocated ones. `policy="full"` now means only "nothing survived" — a truncated history keeps its prefix. `local_probe` derives its plan from `reuse_plan.plan` (its private `_reuse_plan` is gone) and gained `--edit-count k`, `--move` and `--reuse-moved`. `docs/protocol.md`'s reuse-plan section is rewritten. `tests/test_reuse_plan.py` lost `test_two_edits_are_full` — that behaviour is exactly what this entry removes — and gained multi-edit, moved-block (negative δ), duplicate-entry, relocation-policy, `head_tokens` and `_phases` coverage.
+
+Takeaway: **cost scales with the number of edited messages, not with context length** — +66 ms per edit at 12.5k tokens, 6.3× at k=1 down to 1.9× at k=8, against a prefix cache that collapses to 1.24 s regardless — and **quality holds for in-place edits at every k tested**, byte-identical output through k=8 in vLLM and klmean ≤ 0.0022 with every fact answer exact at 8B. Moved blocks are the exception: re-rotation cannot repair a block whose entire preceding context changed, so relocations are recomputed and only shifts reused, which still leaves 4.0× on a pure move.
+
+Caveats: the k-sweep is one session shape (24 turns of ~600-token messages, all edits in the first half) on one model, and the k ≈ 17 break-even is an extrapolation from four points, not a measured crossing. Parity is still one planted fact plus greedy-token equality against prefix mode — the vLLM offline API still cannot give teacher-forced KL at 14B, so Part 1 carries the quality argument and Part 2 carries the cost argument. `combined` at 0.6B *did* break under plain `reuse-all` (answered `5111-SIGMA` for `5111-DELTA`, fixed by first-32); it did not break at 8B, so that failure is not reproduced at scale and may be a small-model artefact. The relocation rule is binary and conservative — it refuses all relocations on the evidence of one |δ| ≈ 10k case, and nothing measures where between δ = 186 (safe) and δ = 10,153 (broken) the boundary sits. And the connector is still one request in flight, one writer, no eviction.
+
+@acrosley 2026-08-19

@@ -219,3 +219,58 @@ def test_plan_drives_local_probe_end_to_end():
     phases = _phases(loads, block_size=16, n_prompt=p.total + 40)
     assert len(phases) == 3  # k=2 edits -> k+1 requests
     assert phases[-1][0] == p.total + 40  # the last one is the real, full request
+
+
+def test_duplicate_entries_match_the_nearest_not_the_first():
+    """Byte identity is not context identity — the hazard that broke the move case.
+
+    Real histories are full of byte-identical entries (every bare "ok"). Matching such a
+    line to the *first* unused twin gives it a huge delta, and its KV encodes a context
+    from 10k tokens away. Measured 2026-08-18: doing that destroyed generation in vLLM.
+    Only the entries that genuinely moved may get a non-identity match.
+    """
+    old = []
+    for i in range(12):
+        old.append({"role": "user", "content": f"turn {i} with distinct content here"})
+        old.append({"role": "assistant", "content": "ok"})  # every one is identical
+    new = [dict(m) for m in old]
+    new[2], new[18] = dict(old[18]), dict(old[2])  # swap two user messages
+
+    matches = reuse_plan._match(reuse_plan._lines(_state(old)), reuse_plan._lines(_state(new)))
+    assert [(j, m) for j, m in enumerate(matches) if m != j] == [(2, 18), (18, 2)]
+
+    p = plan(_state(old), _state(new), tokenize)
+    deltas = [seg.delta for seg in p.segments]
+    assert any(d < 0 for d in deltas) and any(d > 0 for d in deltas), deltas
+    for seg in p.segments:
+        assert _state(old)[seg.src_start : seg.src_end] == _state(new)[seg.dst_start : seg.dst_end]
+
+
+def test_a_moved_governing_entry_forces_repair():
+    """Relocating a governing entry changes what governs later text, like rewriting it."""
+    old = [{"role": "system", "content": "be terse and answer in French"}, *_msgs(4)]
+    new = [dict(old[1]), dict(old[0]), *[dict(m) for m in old[2:]]]  # system moves to slot 1
+    assert plan(_state(old), _state(new), tokenize).policy == "repair"
+
+
+def test_relocated_segments_are_not_handed_to_the_connector_by_default():
+    """A shift is safe to re-rotate; a relocation is not (measured 2026-08-19).
+
+    The moved entries still appear in ``segments`` — the plan describes the history
+    faithfully — but they are recomputed rather than transplanted, while every segment
+    that merely shifted is still reused.
+    """
+    old = _msgs(8)
+    new = [dict(m) for m in old]
+    new[1], new[6] = dict(old[6]), dict(old[1])
+    p = plan(_state(old), _state(new), tokenize)
+    assert any(p.moved), "the swap should be flagged as a relocation"
+
+    safe = p.to_kv_transfer_params()
+    bold = p.to_kv_transfer_params(reuse_moved=True)
+    assert len(safe) < len(bold)
+    moved_starts = {
+        seg.dst_start for seg, mv in zip(p.segments, p.moved, strict=True) if mv and seg.dst_start
+    }
+    assert not (moved_starts & {ld["dst_start"] for ld in safe})
+    assert moved_starts <= {ld["dst_start"] for ld in bold}

@@ -183,6 +183,7 @@ def probe(
     repair_first: int = 0,
     edit_count: int = 1,
     move: bool = False,
+    reuse_moved: bool = False,
 ) -> list[dict]:
     import dataclasses
 
@@ -255,10 +256,12 @@ def probe(
                 reuse = reuse_plan.plan(prev_state, state, line_tokens, head_tokens=len(sys_ids))
                 if repair_first > 0:
                     reuse = dataclasses.replace(reuse, repair_first=repair_first)
-                phases = _phases(reuse.to_kv_transfer_params(), block_size, len(ids))
+                loads = reuse.to_kv_transfer_params(reuse_moved=reuse_moved)
+                phases = _phases(loads, block_size, len(ids))
                 print(
                     f"[shift] turn {t}: policy={reuse.policy} segments={len(reuse.segments)} "
                     f"deltas={[sg.delta for sg in reuse.segments]} "
+                    f"moved={[i for i, m in enumerate(reuse.moved) if m]} "
                     f"reused={sum(sg.length for sg in reuse.segments)}/{len(ids)} "
                     f"requests={len(phases) or 1} ({reuse.reason})",
                     flush=True,
@@ -330,6 +333,11 @@ def main(argv: list[str] | None = None) -> int:
         help="also swap two earlier messages, so some segments get a negative delta",
     )
     parser.add_argument(
+        "--reuse-moved",
+        action="store_true",
+        help="also transplant relocated blocks (measured unsafe; off by default)",
+    )
+    parser.add_argument(
         "--repair-first",
         type=int,
         default=0,
@@ -367,12 +375,14 @@ def main(argv: list[str] | None = None) -> int:
         args.repair_first,
         args.edit_count,
         args.move,
+        args.reuse_moved,
     )
     print(
         f"mode={args.mode} model={args.model} edit_at={args.edit_at} "
         f"ratio={args.recompute_ratio} blend_prefix={args.blend_prefix} "
         f"edit_turn={args.edit_turn} edit_grow={args.edit_grow} "
-        f"repair_first={args.repair_first} edit_count={args.edit_count} move={args.move}"
+        f"repair_first={args.repair_first} edit_count={args.edit_count} move={args.move} "
+        f"reuse_moved={args.reuse_moved}"
     )
     cols = [
         "turn",
