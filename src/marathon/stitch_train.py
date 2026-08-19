@@ -63,7 +63,14 @@ from .kvshift import (
     span_segments,
     token_span,
 )
-from .kvshift_eval import EDIT_KINDS, FAMILIES, build_item, question_text, render
+from .kvshift_eval import (
+    EDIT_KINDS,
+    FAMILIES,
+    STANDING_KIND,
+    build_item,
+    question_text,
+    render,
+)
 
 # --------------------------------------------------------------------------- LoRA
 
@@ -320,6 +327,7 @@ def build_examples(
     max_tokens: int = 8000,
     queries_per_item: int = 1,
     corpus=None,
+    standing_frac: float = 0.0,
 ) -> list[Example]:
     """Stage ``n_items`` (session, edit) pairs from :mod:`marathon.kvshift_eval` builders.
 
@@ -330,6 +338,15 @@ def build_examples(
 
     ``queries_per_item`` questions are taken per session, rotating the entry point into
     the pool by session id so the population covers every query type even at ``k=1``.
+
+    ``standing_frac`` is the share of the *governing* half drawn as ``standing-governing``
+    (:func:`~marathon.kvshift_eval.build_standing_item`) instead of ``governing`` /
+    ``mid-governing``. It exists because iteration 2's adapter got *worse* on the
+    `dep-instruction` probe: the probe is a homogeneous log with an early standing
+    instruction and open-ended questions, which the training population never contained, so
+    the probe was measuring off-distribution generalisation rather than the thing trained.
+    At ``0.0`` the RNG stream is untouched (the second draw short-circuits), so populations
+    built before this argument existed reproduce exactly.
     """
     from .kvshift_eval import load_corpus
 
@@ -338,11 +355,14 @@ def build_examples(
     rng = random.Random(seed)
     out: list[Example] = []
     for sid in range(n_items):
-        kind = (
-            ("governing" if sid % 2 else "mid-governing")
-            if rng.random() < gov_frac
-            else other[sid % len(other)]
-        )
+        if rng.random() < gov_frac:
+            kind = (
+                STANDING_KIND
+                if standing_frac > 0 and rng.random() < standing_frac
+                else ("governing" if sid % 2 else "mid-governing")
+            )
+        else:
+            kind = other[sid % len(other)]
         item = build_item(
             sid,
             kind,
@@ -499,6 +519,68 @@ def clean_logits(model, ex: Example, forced: list[int]) -> torch.Tensor:
     return _clean_sequence(model, torch.cat([ex.new_ids, ex.query_ids]), forced)
 
 
+#: WSL2 does not surface GPU exhaustion as a clean ``torch.OutOfMemoryError``. Its GPU
+#: paravirtualisation layer fails the residency ioctl with ``-ENOMEM``
+#: (``dmesg``: ``dxgk: dxgkio_make_resident: Ioctl failed: -12``) and torch reports it as a
+#: plain ``RuntimeError: CUDA driver error: device not ready``. Iteration 1 lost a run to it
+#: 81 items in, and iteration 3 lost one to it again on a 8.5k-token item — the second time
+#: *through* an OOM fallback that only caught the clean exception. Matching the message is
+#: ugly, and it is still better than the alternative, which is that one long item ends a
+#: two-hour job. The fallback is attempted once; if the retry also fails the error escapes,
+#: so a genuinely poisoned context still ends the run rather than looping.
+_OOM_SIGNATURES = ("out of memory", "device not ready", "make_resident")
+
+
+def _is_oom(exc: BaseException) -> bool:
+    """Whether an exception is GPU exhaustion, including WSL's mislabelled form."""
+    if isinstance(exc, torch.OutOfMemoryError):
+        return True
+    return any(sig in str(exc).lower() for sig in _OOM_SIGNATURES)
+
+
+def kv_bytes_per_token(model) -> int:
+    """Bytes of K+V cache one token costs across every layer, at the model's dtype."""
+    cfg = model.config
+    heads = cfg.num_attention_heads
+    n_kv = getattr(cfg, "num_key_value_heads", None) or heads
+    head_dim = getattr(cfg, "head_dim", None) or cfg.hidden_size // heads
+    element = torch.finfo(model.dtype).bits // 8
+    return 2 * cfg.num_hidden_layers * n_kv * head_dim * element
+
+
+def stitch_memory_estimate(model, total_tokens: int, grad_prefill: bool) -> dict:
+    """Estimate the dominant (full-length K/V) term of one training item's peak.
+
+    Not a substitute for a measurement — ``train`` reports the real
+    ``torch.cuda.max_memory_allocated`` — but it is what decides whether
+    ``--grad-prefill`` can be given a cap that covers an 8k session before a run is
+    launched, rather than after a two-hour job dies. Only full-length copies are counted;
+    the fresh span's activations are over ``E'`` plus the query and are small beside them.
+
+    Live at once, per item:
+
+    * ``old_kv``  — the ``no_grad`` prefill of the old context (detached, one copy)
+    * the stitched cache :func:`grad_stitch` places (constant: the reused KV is a constant)
+    * with ``grad_prefill``, the ``index_copy`` result that SDPA saves for backward (+1)
+
+    The teacher's own prefill is freed before the student runs, so it does not add a copy.
+    """
+    per = kv_bytes_per_token(model)
+    copies = 3 if grad_prefill else 2
+    return {
+        "kv_bytes_per_token": per,
+        "copies": copies,
+        "tokens": total_tokens,
+        "cache_bytes": per * total_tokens * copies,
+        "cache_gib": per * total_tokens * copies / 2**30,
+    }
+
+
+def _peak_gib() -> float:
+    """Peak allocated GiB since the last reset, or 0 off CUDA."""
+    return torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
+
+
 def is_governing(ex: Example) -> bool:
     """Whether this example edits a span that governs later generation."""
     return "governing" in ex.edit_kind
@@ -578,9 +660,23 @@ def example_losses(
         used_grad_prefill = grad_prefill and (
             grad_prefill_max_tokens <= 0 or total_tokens <= grad_prefill_max_tokens
         )
-        stitch_kl = kl_to(
-            teacher_seq, stitched_logits(model, ex, old_kv, forced, used_grad_prefill)
-        )
+        oom = False
+        try:
+            stitch_kl = kl_to(
+                teacher_seq, stitched_logits(model, ex, old_kv, forced, used_grad_prefill)
+            )
+        except (torch.OutOfMemoryError, RuntimeError) as exc:
+            if not _is_oom(exc):
+                raise
+            # A token cap is a *prediction* about memory; this is the measurement. An item
+            # whose expressive path does not fit is worth training on the cheap path rather
+            # than losing the whole run.
+            if not used_grad_prefill:
+                raise
+            oom, used_grad_prefill = True, False
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            stitch_kl = kl_to(teacher_seq, stitched_logits(model, ex, old_kv, forced, False))
         # governing: get better. non-governing: just do not get worse than the base already is.
         term = (
             torch.clamp(stitch_kl - (base_kl + preserve_slack), min=0.0) * preserve_weight
@@ -608,6 +704,7 @@ def example_losses(
         "penalty": term,
         "governing": governing,
         "grad_prefill": used_grad_prefill,
+        "grad_prefill_oom": oom,
         "tokens": total_tokens,
         "forced": forced,
     }
@@ -642,6 +739,8 @@ def train(
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.0)
     log: list[dict] = []
     step = 0
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()
     for epoch in range(epochs):
         order = list(range(len(examples)))
@@ -677,7 +776,9 @@ def train(
                 "penalty": parts["penalty"],
                 "governing": parts["governing"],
                 "grad_prefill": parts["grad_prefill"],
+                "grad_prefill_oom": parts["grad_prefill_oom"],
                 "tokens": parts["tokens"],
+                "peak_gib": _peak_gib(),
                 "elapsed_s": time.perf_counter() - t0,
             }
             log.append(row)
@@ -787,11 +888,57 @@ def _agg(rows: list[dict], key: str) -> dict:
     }
 
 
+#: Pre-registered checkpoint-selection rule (docs/phase3-design.md, iteration 3). Written
+#: down *before* the run so "pick the best checkpoint" cannot become "pick the checkpoint
+#: that passes": governing tail first, but only among checkpoints that have not spent the
+#: collateral, and the two constraints are the exit criteria's own numbers (criterion 3's
+#: 20% non-governing allowance, criterion 2's 0.002 clean-drift budget).
+CKPT_NON_GOV_FACTOR = 1.2
+CKPT_CLEAN_MAX = 0.002
+
+
+def select_checkpoint(
+    history: list[dict],
+    non_gov_factor: float = CKPT_NON_GOV_FACTOR,
+    clean_max: float = CKPT_CLEAN_MAX,
+) -> dict | None:
+    """Best governing p95 among checkpoints that keep the collateral inside budget.
+
+    Feasible means, on the mid-training held-out slice: non-governing **median** at most
+    ``non_gov_factor`` x the base's median on the same items, and clean drift at most
+    ``clean_max``. Among those, minimise governing p95 — the tail is what forces
+    ``reuse_plan`` to refuse, so it is the quantity the phase is buying.
+
+    Returns ``None`` when no checkpoint is feasible, which is a reportable outcome (the run
+    bought the tail only by spending the collateral at every point measured) and not an
+    error to paper over by relaxing the rule after the fact.
+    """
+    feasible = [
+        h
+        for h in history
+        if h.get("gov_p95") is not None
+        and h.get("non_tuned_median") is not None
+        and h["non_tuned_median"] <= h.get("non_base_median", 0.0) * non_gov_factor
+        and h.get("clean", float("inf")) <= clean_max
+    ]
+    return min(feasible, key=lambda h: h["gov_p95"]) if feasible else None
+
+
 def report(rows: list[dict]) -> str:
     """The before/after table. Governing vs non-governing is the whole question."""
+    # ``standing-governing`` is a governing kind, but it is bucketed separately as well as
+    # inside ``governing``: it was added after the gate ratios were pre-registered, so the
+    # headline ratio stays on the same core population (``governing`` + ``mid-governing``)
+    # that iteration 1 and 2 measured, and the new bucket is reported next to it rather than
+    # silently folded into it.
+    standing = [r for r in rows if r["edit_kind"] == STANDING_KIND]
+    core = [r for r in rows if r["governing"] and r["edit_kind"] != STANDING_KIND]
+    non = [r for r in rows if not r["governing"]]
     buckets = [
-        ("governing", [r for r in rows if r["governing"]]),
-        ("non-governing", [r for r in rows if not r["governing"]]),
+        ("governing", core),
+        ("standing-gov", standing),
+        ("governing+std", core + standing if standing else []),
+        ("non-governing", non),
         ("ALL", rows),
     ]
     out = [
@@ -826,18 +973,18 @@ def report(rows: list[dict]) -> str:
                 f"{qt:<16}{'base->tuned mean':<18}{a['n']:>4}{a['mean']:>10.4f}"
                 f"{b['mean']:>10.4f}   (median {a['median']:.4f} -> {b['median']:.4f})"
             )
-    gov = [r for r in rows if r["governing"]]
-    non = [r for r in rows if not r["governing"]]
-    if gov and non:
-        # both, because they say different things: the 144-session eval's headline 9x is a
-        # ratio of means (driven by the heavy tail governing owns), while the median ratio
-        # is ~3-4.5x and describes the typical item. A fix must move both.
+    # both statistics, because they say different things: the 144-session eval's headline
+    # 9x is a ratio of means (driven by the heavy tail governing owns), while the median
+    # ratio is ~3-4.5x and describes the typical item. A fix must move both.
+    for label, gov in (("", core), ("+std ", core + standing)):
+        if not (gov and non) or (label and not standing):
+            continue
         for tag in ("base", "tuned"):
             for stat, fn in (("mean", statistics.fmean), ("median", statistics.median)):
                 g = fn([r[f"{tag}_stitch_kl"] for r in gov])
                 n = fn([r[f"{tag}_stitch_kl"] for r in non])
                 out.append(
-                    f"{tag:<16}governing/non-governing {stat} KL ratio "
+                    f"{tag:<16}{label}governing/non-governing {stat} KL ratio "
                     f"= {g / max(n, 1e-9):.2f}x  ({g:.4f} / {n:.4f})"
                 )
     return "\n".join(out)
@@ -976,6 +1123,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--preserve-slack", type=float, default=0.0)
     ap.add_argument(
+        "--standing-frac",
+        type=float,
+        default=0.0,
+        help="share of the governing half drawn as probe-shaped standing-instruction "
+        "sessions (closes the dep-instruction distribution gap; own bucket in the report)",
+    )
+    ap.add_argument(
         "--checkpoint-every",
         type=int,
         default=0,
@@ -1012,6 +1166,7 @@ def main(argv: list[str] | None = None) -> int:
         args.min_tokens,
         args.max_tokens,
         args.queries_per_item,
+        standing_frac=args.standing_frac,
     )
     print(
         f"{args.cmd}: {len(examples)} examples from {args.items} sessions "
@@ -1020,6 +1175,23 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.cmd == "train":
+        if args.grad_prefill:
+            longest = max(int(ex.new_ids.shape[0] + ex.query_ids.shape[0]) for ex in examples)
+            est = stitch_memory_estimate(model, longest, True)
+            over = sum(
+                1
+                for ex in examples
+                if args.grad_prefill_max_tokens > 0
+                and int(ex.new_ids.shape[0] + ex.query_ids.shape[0]) > args.grad_prefill_max_tokens
+            )
+            print(
+                f"grad-prefill: longest item {longest} tokens, estimated full-length K/V "
+                f"{est['cache_gib']:.2f} GiB ({est['copies']} copies at "
+                f"{est['kv_bytes_per_token'] / 1024:.0f} KiB/token); "
+                f"{over}/{len(examples)} items over the {args.grad_prefill_max_tokens}-token "
+                f"cap will use the cheap path",
+                flush=True,
+            )
         mid: list[Example] = []
         if args.checkpoint_every and args.mid_eval_items:
             # a *held-out* slice: same seed as the final eval, so the mid-training curve and
@@ -1033,6 +1205,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.min_tokens,
                 args.max_tokens,
                 args.queries_per_item,
+                standing_frac=args.standing_frac,
             )
             print(f"mid-training eval slice: {len(mid)} held-out examples", flush=True)
 
@@ -1042,21 +1215,33 @@ def main(argv: list[str] | None = None) -> int:
             path = f"{args.out}.step{step}" if args.out else None
             if path:
                 torch.save(lora_state(loras), path)
-            row = {"step": step}
+            row = {"step": step, "path": path, "peak_gib": _peak_gib()}
             if mid:
                 rows = evaluate(model, loras, mid, tok, args.gen_tokens)
                 g = [r for r in rows if r["governing"]]
                 n = [r for r in rows if not r["governing"]]
+                # p95 and the medians, not just the means: `select_checkpoint` needs the
+                # governing tail and the non-governing typical item, which are exactly the
+                # two statistics the exit criteria are written on.
                 for tag, rs in (("gov", g), ("non", n)):
-                    if rs:
-                        row[f"{tag}_base"] = statistics.fmean([r["base_stitch_kl"] for r in rs])
-                        row[f"{tag}_tuned"] = statistics.fmean([r["tuned_stitch_kl"] for r in rs])
+                    if not rs:
+                        continue
+                    base, tuned = _agg(rs, "base_stitch_kl"), _agg(rs, "tuned_stitch_kl")
+                    row[f"{tag}_base"] = base["mean"]
+                    row[f"{tag}_tuned"] = tuned["mean"]
+                    row[f"{tag}_base_median"] = base["median"]
+                    row[f"{tag}_tuned_median"] = tuned["median"]
+                    row[f"{tag}_p95"] = tuned["p95"]
                 row["clean"] = statistics.fmean([r["tuned_clean_kl"] for r in rows])
                 print(
                     f"[checkpoint {step}] gov {row.get('gov_base', float('nan')):.4f}->"
-                    f"{row.get('gov_tuned', float('nan')):.4f}  non "
+                    f"{row.get('gov_tuned', float('nan')):.4f} (p95 "
+                    f"{row.get('gov_p95', float('nan')):.4f})  non "
                     f"{row.get('non_base', float('nan')):.4f}->"
-                    f"{row.get('non_tuned', float('nan')):.4f}  clean {row['clean']:.4f}",
+                    f"{row.get('non_tuned', float('nan')):.4f} (median "
+                    f"{row.get('non_base_median', float('nan')):.4f}->"
+                    f"{row.get('non_tuned_median', float('nan')):.4f})  "
+                    f"clean {row['clean']:.4f}  peak {row['peak_gib']:.1f} GiB",
                     flush=True,
                 )
             history.append(row)
@@ -1091,9 +1276,28 @@ def main(argv: list[str] | None = None) -> int:
                     f.write(json.dumps(row) + "\n")
         downgraded = sum(1 for r in log if args.grad_prefill and not r["grad_prefill"])
         if args.grad_prefill:
+            ooms = sum(1 for r in log if r.get("grad_prefill_oom"))
             print(
                 f"grad-prefill: {len(log) - downgraded}/{len(log)} items kept the fresh span "
-                f"in the graph (cap {args.grad_prefill_max_tokens} tokens)"
+                f"in the graph (cap {args.grad_prefill_max_tokens} tokens, "
+                f"{ooms} fell back on OOM)"
+            )
+        print(f"peak allocated: {_peak_gib():.2f} GiB")
+        if history:
+            # the pre-registered rule, applied to the measured curve rather than by eye
+            pick = select_checkpoint(history)
+            print(
+                f"selected checkpoint (gov p95 subject to non-gov median <= base x"
+                f"{CKPT_NON_GOV_FACTOR} and clean <= {CKPT_CLEAN_MAX}): "
+                + (
+                    f"step {pick['step']} -> {pick['path']} "
+                    f"(gov p95 {pick['gov_p95']:.4f}, non median "
+                    f"{pick['non_tuned_median']:.4f} vs base "
+                    f"{pick['non_base_median']:.4f}, clean {pick['clean']:.4f})"
+                    if pick
+                    else "NONE feasible — every checkpoint spent the collateral"
+                ),
+                flush=True,
             )
         gov = [r["stitch_kl"] for r in log if "governing" in r["edit_kind"]]
         if gov:

@@ -1234,4 +1234,74 @@ Promotions do not predict it (2 on every turn, hit and miss alike). Segment coun
 
 **Limits.** The predictor table is seven reuse turns from one run — cold count and turn index are confounded (both rise monotonically), so "stub fraction" is a hypothesis consistent with the data, not an isolated cause. The fingerprint model treats re-rotation as exact by construction, so it can only ever find *coordinate* errors; it cannot see attention damage, which is precisely the thing now suspected. Segment spans are now recorded per turn so a real churn metric can be computed from the next run's JSON without another GPU run. Pre-sizing and the churn-based ceiling are both untested on hardware; GPU verification is queued.
 
+## 2026-08-19 — Iteration 3 at 4–8k: the gates fail on both hinge weights, and iteration 2's promising ratios turn out to be mostly a regime artefact
+
+Command: `scripts/stitch_train_8b.sh` (base-only n=120, then w=2) and the same with `--skip-basecheck --preserve-weight 4` (w=4) — train 200 items seed 7001 lr 3e-5, `--grad-prefill` capped at 6000 tokens, `--standing-frac 0.34`, checkpoints every 50 with a 24-item held-out eval, checkpoint chosen by the pre-registered rule, then held-out eval n=120 seed 9001 and the dependent-edit probe (WSL2, `~/marathon-venv`, torch 2.13.0+cu130, transformers 5.15.0, sdpa, bf16, RTX 5090; peak 26.86 GiB both arms) · Model: `Qwen/Qwen3-8B`, LoRA r=16 α=32 on q/k/v/o · Cost: $0.
+
+Everything here was pre-registered in [phase3-design.md](phase3-design.md) before the GPU was touched: the 4–8k regime, the hinge-weight ordering (`w=2` first, `w=4` if time), the checkpoint-selection rule, and the new `standing-governing` bucket. That matters, because the result is negative and the temptation to re-read it favourably is exactly what pre-registration removes.
+
+**The base at 4–8k, n=120 held out — the number the gate is actually against:**
+
+```
+bucket          metric            n      mean    median       p95       max  >.05  >.2
+governing       base            46    0.0284    0.0050    0.0328    0.4910     2     2
+standing-gov    base            14    0.0061    0.0030    0.0155    0.0172     0     0
+non-governing   base            60    0.0054    0.0024    0.0157    0.1031     1     0
+
+base gov/non-gov ratio   5.26x mean / 2.11x median     (+std 4.29x / 1.86x)
+```
+
+**Both arms, same 120 items, same in-run base, checkpoint chosen by the rule:**
+
+```
+                          n     mean   median      p95      max   >.05   >.2
+base    governing        46   0.0284   0.0050   0.0328   0.4910     2     2
+  w=2 (step150)          46   0.0234   0.0050   0.0339   0.4532     2     2
+  w=4 (step200)          46   0.0233   0.0059   0.0504   0.4496     3     2
+base    standing-gov     14   0.0061   0.0030   0.0155   0.0172     0     0
+  w=2                    14   0.0053   0.0042   0.0110   0.0111     0     0
+  w=4                    14   0.0048   0.0027   0.0113   0.0135     0     0
+base    non-governing    60   0.0054   0.0024   0.0157   0.1031     1     0
+  w=2                    60   0.0059   0.0022   0.0183   0.0956     1     0
+  w=4                    60   0.0051   0.0029   0.0142   0.0412     0     0
+  w=2 clean drift       120   0.0020   0.0014   0.0055   0.0130     -     -
+  w=4 clean drift       120   0.0022   0.0015   0.0068   0.0122     -     -
+
+gov/non-gov ratio    base 5.26x mean / 2.11x median
+                      w=2 3.98x / 2.26x        w=4 4.59x / 2.02x
+governing improved    w=2 24/46                w=4 22/46
+planted-fact ok       64/65 for reference, base, w=2 and w=4 alike
+grad-prefill          78/200 items expressive (cap 6000), 0 OOM fallbacks, peak 26.86 GiB
+```
+
+**Against the pre-registered gates:**
+
+| criterion | target | w=2 | w=4 |
+|---|---|---|---|
+| 1. failure class closes | ratio ≤ 2× mean **and** median; no item > 0.2 | 3.98× / 2.26×, 2 items > 0.2 — **fail** | 4.59× / 2.02×, 2 items > 0.2 — **fail** |
+| 2. clean context | ≤ 0.002 mean | **0.001999 — pass by 1e-6** | 0.0022 — **fail** |
+| 3. no regression | non-gov within 20%, mean and median | **+8.9% / −6.6% — pass** | −5.8% / **+21.6%** — **fail (median)** |
+| 4. dep-instruction | ≥ 30% fall vs same-run base | 0.0133→0.0198, 0.0178→0.0170 — **fail** | 0.0133→0.0310, 0.0178→0.0161 — **fail** |
+| 5. win kept | tokens forwarded unchanged | pass | pass |
+
+**Neither arm passes, and the headline is that iteration 2 was measuring an easier problem than it looked.** At 4–6k the base ratio was 3.74× and arm B reached 1.56× mean with *every* item over KL 0.05 eliminated. At 4–8k the same method reaches 3.98× against a 5.26× base, the two items over KL 0.2 are still there afterwards, and w=4 actually *adds* a third item over 0.05 and raises p95 (0.0328 → 0.0504). The tail did not close. The pre-registration called this risk in advance — "any claim that the gate is nearly met has to be re-made at 4–8k" — and the answer is that it is not nearly met.
+
+**The hinge weight is not the missing knob.** Doubling it from 2 to 4 moved the non-governing *mean* the right way (+8.9% → −5.8%, i.e. w=4 actually improves the cases it is only asked to protect) and the *median* the wrong way (−6.6% → +21.6%), while clean drift went 0.0020 → 0.0022 and the governing tail got worse. "Arm B's signal with arm A's restraint" was the hypothesis; more restraint bought neither.
+
+**The checkpoint rule worked, and it cost us the better tail on purpose.** For w=2 the rule selected step 150 and *rejected* step 200, whose governing p95 was better (0.2077 vs 0.2627) but whose clean drift on the mid-slice was 0.0022, over the 0.002 budget. That is the rule doing its job — criterion 2 is a gate, not a preference — but the reported w=2 tail is not the best tail the run produced. For w=4 the rule selected step 200. Both curves are non-monotone and genuinely downward on the governing mean (w=2: 0.0556 → 0.0600 → 0.0388 → 0.0307), consistent with iteration 2.
+
+**Two findings that are more useful than the gate verdict.**
+
+**(1) The base measurement is not reproducible across runs, and the mean ratio rests on the irreproducible part.** The base-only eval at step 1 and the base column of the w=2 eval are the same model on the same 120 items from the same seed. 87 of 120 rows are bit-identical; 33 differ, and the largest disagreements are enormous — item 57 `fact-at` reads 0.1351 in one run and **0.4910** in the other; item 6 reads 0.0018 and 0.1031. Mean |diff| is 0.0062, against a governing mean of ~0.026. The mechanism is bf16 non-determinism flipping the teacher's greedy token, after which the whole 32-token teacher-forced sequence differs. Since the governing mean is carried by two or three tail items, **cross-run mean-ratio comparisons at this sample size are inside the noise** — which retroactively weakens every cross-iteration ratio claim in this phase, including iteration 2's 3.74× → 1.56×. The *in-run* base/tuned comparison is unaffected and remains sound: `evaluate` computes the teacher once per item with adapters off and pairs both columns against it. Any future gate should quote the paired per-item delta, not two independently measured means.
+
+**(2) The `dep-instruction` distribution gap was not the explanation.** `standing-governing` put probe-shaped sessions — the probe's own filler generator, the instruction in the system prompt or an early governing user turn, open-ended questions with no forced prefix — into training and the held-out eval at 4–8k, at 34% of the governing half. The bucket behaves well (base mean 0.0061, nothing over 0.05, and both arms improve it slightly) and criterion 4 **still fails in both arms**, with `lang-pipeline` getting worse in each. So the iteration-2 hypothesis that the probe regressed because it was off-distribution is not supported: the bucket that closes the distribution gap barely exhibits the failure in the first place (0.0061 against core governing's 0.0284), so it carries little gradient and cannot teach the probe's behaviour. The probe's `dep-instruction` scenario is measuring something the synthetic governing population does not contain, and that is now a question about the population rather than about the training regime.
+
+**Infrastructure, since it cost an hour of the window.** The first launch produced a 0-byte log: `nohup … &` inside `wsl.exe -- bash -c` does not survive the parent exiting, and PowerShell had separately eaten the redirect. The second attempt died in training with `RuntimeError: CUDA driver error: device not ready` — WSL's ENOMEM again — at a `--grad-prefill` cap of 8600 where every item was expressive, having printed `longest item 8560 tokens, estimated full-length K/V 3.53 GiB (3 copies at 144 KiB/token)` and peaked at 28.8 GiB by checkpoint 50. The pre-registered memory estimate was accurate; the margin it predicted (~28–29 GiB on a 32 GiB card) was simply too thin. Two fixes: the cap dropped to 6000 (iteration 2's proven 27.4 GiB envelope), and the OOM fallback now recognises WSL's mislabelled form. That second one is a correction to this project's own pre-registration, which explicitly declined to catch plain `RuntimeError` on the grounds that a poisoned context must not be retried — right in principle, wrong on this box, and it cost the run. It now matches the known ENOMEM signatures, retries once, and re-raises if the retry also fails; a non-exhaustion `RuntimeError` still propagates untouched.
+
+**The cost of that fix is a confound worth stating plainly.** At a 6000-token cap only **78 of 200** training items kept the fresh span in the graph, against 200/200 in iteration 2's arm B. So iteration 3 is not "arm B at 4–8k" — it is a 39%-strength version of arm B at 4–8k. The comparison to iteration 2 is confounded by regime *and* by expressive coverage, and neither confound can be separated from this data.
+
+**Where this leaves the phase.** Three iterations in, the method reliably cuts the governing mean (43%, then 51%, now 18%) and has never met criterion 1. The most valuable next step is not another hyperparameter: it is fixing the measurement, because finding (1) says the current gate cannot resolve the differences being argued over. Concretely — quote paired per-item deltas with a bootstrap CI rather than a ratio of means; raise n or seed-average the base; and decide whether `klmean` on a teacher-forced sequence whose *first token* can flip is the right target at all. After that, the open modelling question is whether 8k-token expressive training (which needs either more VRAM or the chunked `E'` forward that was deferred here) closes the tail that 39% coverage did not.
+
+Caveats: one seed pair, one epoch, 200 training items, one model, n=120 held out, cells 46 governing / 14 standing / 60 non-governing. The base tail is 2 events and the governing mean is dominated by them — see finding (1) for why that is worse than it usually is. The mid-training curve uses a 24-item slice, so the selection rule is applied to noisy p95 estimates. `w=4`'s base column is the same run's base, but its *selected checkpoint* differs from `w=2`'s (step 200 vs 150), so the two arms differ in training length as well as in hinge weight and are not a clean one-variable comparison. `planted-fact ok` grades the arg-max of the teacher-forced sequence, not a free-running greedy decode. The dep-probe rows remain single runs on hand-built scenarios, not a distribution.
+
 @acrosley 2026-08-19
