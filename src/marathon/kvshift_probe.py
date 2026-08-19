@@ -24,7 +24,8 @@ from .kvshift import (
     prefill,
     rerotate_keys,
     run_full,
-    run_policy,
+    run_segments,
+    token_segments,
     token_span,
 )
 from .session import Session
@@ -165,13 +166,16 @@ def build_dep_anaphora(turns: int):
             ),
         },
     )
-    new = session.messages[src * 2]["content"].replace(_OLD_CODE, _NEW_CODE)
+
+    def mutate(sess):
+        sess.edit(src * 2, sess.messages[src * 2]["content"].replace(_OLD_CODE, _NEW_CODE))
+
     qs = [
         ("primary-key", [_NEW_CODE], "What is the primary key?", " The primary key is", 12),
         ("mission", [_NEW_CODE], "What is the mission code?", " The mission code is", 12),
         ("open", None, "Summarise the log so far.", "", 48),
     ]
-    return session, src * 2, new, qs
+    return session, mutate, qs
 
 
 def build_dep_instruction(turns: int):
@@ -187,12 +191,15 @@ def build_dep_instruction(turns: int):
             ),
         },
     )
-    new = session.messages[0]["content"].replace("in French", "in German")
+
+    def mutate(sess):
+        sess.edit(0, sess.messages[0]["content"].replace("in French", "in German"))
+
     qs = [
         ("lang-pipeline", ["de"], "Describe the build pipeline in one sentence.", "", 40),
         ("lang-scheduler", ["de"], "What changed about the scheduler?", "", 40),
     ]
-    return session, 0, new, qs
+    return session, mutate, qs
 
 
 def build_dep_contradict(turns: int):
@@ -209,11 +216,18 @@ def build_dep_contradict(turns: int):
             ),
         },
     )
-    new = session.messages[src * 2]["content"] + (
-        " Correction, authoritative and overriding every later mention in this log: "
-        "the harbor code 8814-OMEGA has been revoked and is invalid; it must never be "
-        "quoted again. The only valid harbor code is 4417-TANGO."
-    )
+
+    def mutate(sess):
+        sess.edit(
+            src * 2,
+            sess.messages[src * 2]["content"]
+            + (
+                " Correction, authoritative and overriding every later mention in this log: "
+                "the harbor code 8814-OMEGA has been revoked and is invalid; it must never be "
+                "quoted again. The only valid harbor code is 4417-TANGO."
+            ),
+        )
+
     qs = [
         (
             "harbor",
@@ -224,16 +238,20 @@ def build_dep_contradict(turns: int):
         ),
         ("open", None, "Summarise the log so far.", "", 48),
     ]
-    return session, src * 2, new, qs
+    return session, mutate, qs
 
 
 def build_edit(turns: int, edit_turn: int, gap: int, grow):
     """The original independent-S scenarios, in the shared builder shape."""
     session, facts = build_session(turns, edit_turn, gap)
     idx = edit_turn * 2
-    new = "[EDITED] " + session.messages[idx]["content"].replace(facts["edit"][1], _NEW_CODE)
-    if grow:
-        new += " " + _paragraph(99, grow // 12 + 1)
+
+    def mutate(sess):
+        new = "[EDITED] " + sess.messages[idx]["content"].replace(facts["edit"][1], _NEW_CODE)
+        if grow:
+            new += " " + _paragraph(99, grow // 12 + 1)
+        sess.edit(idx, new)
+
     qs = [
         (
             which,
@@ -245,7 +263,102 @@ def build_edit(turns: int, edit_turn: int, gap: int, grow):
         for which, (fact, code) in facts.items()
     ]
     qs.append(("open", None, "Summarise the log so far.", "", 48))
-    return session, idx, new, qs
+    return session, mutate, qs
+
+
+# --- multi-span and moved-block scenarios --------------------------------
+# The real workload: an agent rewrites several messages in one turn, or moves a
+# block. Every unchanged run gets its own delta; a moved block's delta differs
+# from its neighbours' and can be negative.
+
+
+def _code(i: int, new: bool = False) -> str:
+    return f"{(9000 if new else 5000) + i * 111}-{'SIGMA' if new else 'DELTA'}"
+
+
+def _edit_turns(turns: int, k: int) -> list[int]:
+    """``k`` distinct, well-separated turns to edit, spread over the history."""
+    step = max((turns - 2) // k, 1)
+    return [1 + i * step for i in range(k)]
+
+
+def build_multi(turns: int, k: int):
+    """``k`` disjoint fact edits in one turn — the case reuse_plan used to refuse."""
+    session = Session()
+    at = _edit_turns(turns, k)
+    _log(session, turns, {t: f" The site-{i} code is {_code(i)}." for i, t in enumerate(at)})
+
+    def mutate(sess):
+        for i, t in enumerate(at):
+            sess.edit(
+                t * 2,
+                "[EDITED] " + sess.messages[t * 2]["content"].replace(_code(i), _code(i, True)),
+            )
+
+    asked = sorted({0, k // 2, k - 1})
+    qs = [
+        (
+            f"site-{i}",
+            [_code(i, True)],
+            f"What is the site-{i} code?",
+            f" The site-{i} code is",
+            12,
+        )
+        for i in asked
+    ]
+    qs.append(("archive", ["7391-KAPPA"], "What is the archive code?", " The archive code is", 12))
+    return session, mutate, qs
+
+
+def build_move(turns: int):
+    """Two messages swap places: same bytes, different positions, one delta negative."""
+    a, b = 2, max(turns - 4, 4)
+    session = Session()
+    _log(
+        session,
+        turns,
+        {a: f" The alpha code is {_code(1)}.", b: f" The omega code is {_code(7)}."},
+    )
+
+    def mutate(sess):
+        ca, cb = sess.messages[a * 2]["content"], sess.messages[b * 2]["content"]
+        sess.edit(a * 2, cb)
+        sess.edit(b * 2, ca)
+
+    qs = [
+        ("alpha", [_code(1)], "What is the alpha code?", " The alpha code is", 12),
+        ("omega", [_code(7)], "What is the omega code?", " The omega code is", 12),
+    ]
+    return session, mutate, qs
+
+
+def build_combined(turns: int):
+    """Two fact edits *and* a swap in the same turn."""
+    a, b = 2, max(turns - 4, 4)
+    at = [1, max(turns - 6, 5)]
+    session = Session()
+    extras = {t: f" The site-{i} code is {_code(i)}." for i, t in enumerate(at)}
+    extras[a] = f" The alpha code is {_code(1)}."
+    extras[b] = f" The omega code is {_code(7)}."
+    session_extras = extras
+    _log(session, turns, session_extras)
+
+    def mutate(sess):
+        for i, t in enumerate(at):
+            sess.edit(
+                t * 2,
+                "[EDITED] " + sess.messages[t * 2]["content"].replace(_code(i), _code(i, True)),
+            )
+        ca, cb = sess.messages[a * 2]["content"], sess.messages[b * 2]["content"]
+        sess.edit(a * 2, cb)
+        sess.edit(b * 2, ca)
+
+    qs = [
+        ("site-0", [_code(0, True)], "What is the site-0 code?", " The site-0 code is", 12),
+        ("alpha", [_code(1)], "What is the alpha code?", " The alpha code is", 12),
+        ("omega", [_code(7)], "What is the omega code?", " The omega code is", 12),
+    ]
+    return session, mutate, qs
 
 
 def render(session: Session, tok=None) -> str:
@@ -294,7 +407,13 @@ def main(argv: list[str] | None = None) -> int:
         help="greedy tokens for the open-ended (unforced) question",
     )
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--scenario", default=None, help="run just this scenario")
+    ap.add_argument("--scenario", default=None, help="comma-separated scenarios to run")
+    ap.add_argument(
+        "--min-segment",
+        type=int,
+        default=16,
+        help="drop reusable segments shorter than this many tokens",
+    )
     ap.add_argument(
         "--raw", action="store_true", help="plain transcript instead of the model's chat template"
     )
@@ -343,6 +462,13 @@ def main(argv: list[str] | None = None) -> int:
         ("dep-anaphora", build_dep_anaphora),
         ("dep-instruction", build_dep_instruction),
         ("dep-contradict", build_dep_contradict),
+        # multi-span: k disjoint edits in one turn, a move, and both at once
+        ("multi-k1", lambda t: build_multi(t, 1)),
+        ("multi-k2", lambda t: build_multi(t, 2)),
+        ("multi-k4", lambda t: build_multi(t, 4)),
+        ("multi-k8", lambda t: build_multi(t, 8)),
+        ("move", build_move),
+        ("combined", build_combined),
     ]
     policies = [
         Policy("none", rerotate=False),  # control: reuse S's keys unrotated
@@ -361,21 +487,32 @@ def main(argv: list[str] | None = None) -> int:
         return _lang(text) if which.startswith("lang") else text.strip()
 
     if args.scenario:
-        scenarios = [sc for sc in scenarios if sc[0] == args.scenario]
+        want = args.scenario.split(",")
+        scenarios = [sc for sc in scenarios if sc[0] in want]
     for name, builder in scenarios:
-        session, msg_index, new_content, questions = builder(args.turns)
+        session, mutate, questions = builder(args.turns)
         chat_tok = None if args.raw else tok
         old_text = render(session, chat_tok)
-        session.edit(msg_index, new_content)
+        mutate(session)
         new_text = render(session, chat_tok)
 
         head, tail_b = byte_span(old_text.encode(), new_text.encode())
         old_ids, new_ids = ids(old_text), ids(new_text)
-        span = token_span(old_ids.tolist(), new_ids.tolist())
+        old_list, new_list = old_ids.tolist(), new_ids.tolist()
+        span = token_span(old_list, new_list)
+        segments = token_segments(old_list, new_list, min_tokens=args.min_segment)
+        reused = sum(sg.length for sg in segments)
+        deltas = sorted({sg.delta for sg in segments})
         print(
-            f"\n== {name}: byte delta head={head} tail={tail_b} | tokens "
+            f"\n== {name}: byte delta head={head} tail={tail_b} | single-span view "
             f"P={span.p} E={span.e_old}->{span.e_new} (d={span.delta}) S={span.s}"
         )
+        print(
+            f"   segments={len(segments)} reused={reused}/{len(new_list)} "
+            f"({reused / max(len(new_list), 1):.3f}) deltas={deltas}"
+        )
+        for sg in segments:
+            assert old_list[sg.src_start : sg.src_end] == new_list[sg.dst_start : sg.dst_end]
 
         t0 = time.perf_counter()
         old_kv, _ = prefill(model, old_ids)
@@ -384,6 +521,7 @@ def main(argv: list[str] | None = None) -> int:
 
         for which, expected, question, forced_prefix, n_tok in questions:
             q = ids(question_text(chat_tok, question, forced_prefix))
+            all_ids = torch.cat([new_ids, q])
             ref = run_full(model, new_ids, q, n_tok)
             ref_text = tok.decode(ref["tokens"])
             ref_label = label(which, ref_text)
@@ -420,7 +558,9 @@ def main(argv: list[str] | None = None) -> int:
                 }
             ]
             for pol in policies:
-                got = run_policy(model, old_kv, span, new_ids, q, pol, n_tok, forced=ref["tokens"])
+                got = run_segments(
+                    model, old_kv, segments, all_ids, pol, n_tok, forced=ref["tokens"]
+                )
                 text = tok.decode(got["tokens"])
                 ok, same = graded(text)
                 rows.append(

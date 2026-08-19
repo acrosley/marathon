@@ -96,3 +96,61 @@ def test_stitch_shapes():
     assert cache.layers[0].keys.shape[-2] == span.new_len + 3
     assert torch.allclose(cache.layers[0].values[:, :, :5], kv[0][1][:, :, :5])
     assert torch.allclose(cache.layers[0].values[:, :, 11:22], kv[0][1][:, :, 9:20])
+
+
+# --- multi-span and moved blocks -----------------------------------------
+
+
+def test_token_segments_finds_two_disjoint_edits():
+    from marathon.kvshift import token_segments
+
+    old = list(range(1000, 1400))
+    new = old[:100] + [7] * 20 + old[120:250] + [8] * 20 + old[270:]
+    segs = token_segments(old, new)
+    for seg in segs:
+        assert old[seg.src_start : seg.src_end] == new[seg.dst_start : seg.dst_end]
+    assert len(segs) >= 3  # head, middle, tail
+    assert sum(s.length for s in segs) > 0.8 * len(new)
+
+
+def test_token_segments_finds_a_moved_block_with_a_negative_delta():
+    """A swap is the case an LCS diff cannot express: one segment must move backwards."""
+    from marathon.kvshift import token_segments
+
+    old = list(range(2000, 2400))
+    new = old[:100] + old[300:350] + old[150:300] + old[100:150] + old[350:]
+    segs = token_segments(old, new)
+    for seg in segs:
+        assert old[seg.src_start : seg.src_end] == new[seg.dst_start : seg.dst_end]
+    deltas = {s.delta for s in segs}
+    assert any(d < 0 for d in deltas) and any(d > 0 for d in deltas)
+
+
+def test_span_segments_matches_the_single_edit_view():
+    from marathon.kvshift import span_segments
+
+    span = Span(p=5, e_old=4, e_new=6, s=11)
+    p, s = span_segments(span)
+    assert (p.src_start, p.src_end, p.dst_start, p.delta) == (0, 5, 0, 0)
+    assert (s.src_start, s.src_end, s.dst_start, s.delta) == (9, 20, 11, 2)
+
+
+def test_fresh_positions_is_the_complement_of_the_segments():
+    from marathon.kvshift import Segment, fresh_positions
+
+    segs = [Segment(0, 4, 0), Segment(10, 14, 6)]
+    fresh = fresh_positions(segs, 12, torch.device("cpu")).tolist()
+    assert fresh == [4, 5, 10, 11]
+
+
+def test_stitch_segments_places_a_moved_block_verbatim_in_v():
+    from marathon.kvshift import Segment, stitch_segments
+
+    inv = 1.0 / (10000 ** (torch.arange(0, 8, 2).float() / 8))
+    k, v = torch.randn(1, 2, 20, 8), torch.randn(1, 2, 20, 8)
+    segs = [Segment(0, 5, 0), Segment(12, 18, 5), Segment(5, 12, 11)]  # a swap
+    cache = stitch_segments([(k, v)], segs, 20, inv)
+    got = cache.layers[0].values
+    assert torch.allclose(got[:, :, 5:11], v[:, :, 12:18])
+    assert torch.allclose(got[:, :, 11:18], v[:, :, 5:12])
+    assert torch.count_nonzero(got[:, :, 18:]) == 0  # the fresh tail stays zeroed
