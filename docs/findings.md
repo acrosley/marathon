@@ -801,6 +801,62 @@ The second edit is as fast as the first was, and matches the previous entry's si
 
 @acrosley 2026-08-19
 
+## 2026-08-19 — Phase 3 reframed, and a stitched-KV fine-tuning pilot that is honestly negative: at 0.6B the failure it repairs isn't there
+
+Command: `scripts/stitch_train.sh --items 600 --eval-items 120 --min-tokens 3000 --max-tokens 5000 --gen-tokens 32 --tag pilot` (WSL2, `~/marathon-venv`, torch 2.13.0+cu130, transformers 5.15.0, eager, bf16, RTX 5090; train 599 items in 937 s, eval 120 held-out items; LoRA r=16 alpha=32 on q/k/v/o, AdamW 1e-4, accum 4, anchor weight 1.0 every other step) · Model: `Qwen/Qwen3-0.6B` · Cost: $0.
+
+**First, the reframe** (written up in [phase3-design.md](phase3-design.md); PLAN.md's Phase 3 section rewritten). DESIGN.md's Phase 3 was "fine-tune the model to consume delta-formatted *text* and trust that absence-from-diff means unchanged". Phase 1 already got that outcome without training, and more completely: position-shifted KV reuse never retransmits, re-tokenizes or re-prefills the baseline, yet the model's attention still runs over the full history, so its input distribution never changes and there is nothing to persuade it of — 1.5–1.6% of tokens forwarded for median KL 0.003, planted-fact retrieval 105/111 against full recompute's 106/111. That bet is superseded. What remains is the harder form: the one residual failure class (an edit to a *governing* span leaves the reused suffix conditioned on an instruction that is gone — ~9x KL, all of the >0.2 tail, and selective recompute does not fix it), and more generally making the model robust to stitched caches so reuse can be pushed into cases the planner currently refuses (relocated blocks, large delta, the hybrid tier's washed-out state). The method under test: **stitched-KV consistency fine-tuning** — LoRA, forward passes run *with* the stitched cache (P verbatim, E' fresh, S re-rotated), loss = KL to the frozen base model's full-recompute continuation, plus an anchor term running the student on a *clean* cache against the same teacher.
+
+Two properties make it the honest version rather than a proxy. The training objective **is** the eval metric — mean KL over 32 teacher-forced continuation tokens against full recompute is literally the loss, so there is no gap between "the loss went down" and "the reported number went down". And the anchor's floor is a true zero: teacher and anchor share one function, so at identity they are bit-identical. That took a fix. The first launch reported `clean_kl = 0.0049` at step 0, where an identity adapter must give 0 — prefilling the anchor separately from the teacher had put a ~0.005 bf16 floor under the damage metric, *larger than the damage it has to resolve*. After the fix it reads 0.0000, and a test pins it.
+
+**The pilot, on 120 held-out sessions (seed 9001, never trained on; training was seed 7001):**
+
+```
+bucket          metric               n      mean    median       p95       max  >.05
+governing       base_stitch_kl      57    0.0034    0.0024    0.0063    0.0207     0
+governing       tuned_stitch_kl     57    0.0034    0.0028    0.0069    0.0118     0
+governing       tuned_clean_kl      57    0.0033    0.0027    0.0085    0.0123     0
+non-governing   base_stitch_kl      63    0.0023    0.0018    0.0055    0.0088     0
+non-governing   tuned_stitch_kl     63    0.0032    0.0026    0.0069    0.0126     0
+non-governing   tuned_clean_kl      63    0.0029    0.0024    0.0055    0.0101     0
+ALL             base_stitch_kl     120    0.0028    0.0022    0.0060    0.0207     0
+ALL             tuned_stitch_kl    120    0.0033    0.0027    0.0069    0.0126     0
+ALL             tuned_clean_kl     120    0.0031    0.0025    0.0062    0.0123     0
+
+planted-fact ok   governing 57/57 for ref = base = tuned;  non-governing 60/63 for ref = base = tuned
+base   governing/non-governing KL ratio:  mean 1.50x   median 1.35x
+tuned  governing/non-governing KL ratio:  mean 1.05x   median 1.10x
+```
+
+**The headline is the base column, not the tuned one: the failure class did not reproduce.** On this population a governing edit costs mean KL 0.0034 against non-governing's 0.0023 — a **1.50x** ratio, where the 144-session 8B eval measured ~9x. The worst single item in 120 is 0.0207 and **zero** items clear KL 0.05, against that run's 7/78 governing items over 0.05 and 2 over 0.2. The dependent-edit probe agrees:
+
+```
+scenario          question           base_kl  tuned_kl  clean_kl  ref_ok base_ok tuned_ok
+dep-instruction   lang-pipeline       0.0038    0.0029    0.0027    True    True     True
+dep-instruction   lang-scheduler      0.0078    0.0071    0.0099    True    True     True
+dep-anaphora      primary-key         0.0053    0.0062    0.0020    True    True     True
+dep-anaphora      mission             0.0032    0.0023    0.0024    True    True     True
+dep-anaphora      open                0.0040    0.0121    0.0070    None    None     None
+dep-contradict    harbor              0.0049    0.0105    0.0033    True    True     True
+dep-contradict    open                0.0038    0.0040    0.0027    None    None     None
+```
+
+`dep-instruction` — the scenario that broke at 8B with first-token KL 0.3492 and 0/2 agreement — here scores klmean 0.0038 and 0.0078 and matches the reference on both questions. There is nothing to repair.
+
+So the adapter was trained against a population with almost no signal to exploit, and it behaves accordingly: **it did not improve stitched KL** (mean 0.0028 → 0.0033, marginally *worse*; the governing/non-governing ratio "improves" from 1.50x to 1.05x only because the non-governing cases got worse, not because governing got better), and it spent **0.0031** of clean-context drift buying that. Against the exit criteria in phase3-design.md: criterion 1 is untestable on this data; criterion 2 (clean-context KL ≤ 0.002) **fails**; criterion 3 (no regression on what already works) **fails**. Planted-fact accuracy is the one thing untouched — 117/120 for reference, base and tuned alike — so nothing was broken outright, but the two probe scenarios that were already fine got worse under the adapter (`dep-anaphora/open` 0.0040 → 0.0121, `dep-contradict/harbor` 0.0049 → 0.0105).
+
+The training curve says the same thing from the other side: governing `stitch_kl` median 0.0053 → 0.0031 across the run, non-governing 0.0059 → 0.0032, and `clean_kl` 0.0048 → 0.0028 — all three fall *together*, which is what converging back toward the identity adapter looks like after an early over-large-LR transient (`clean_kl` peaked at 0.0223 near step 81). The optimiser found nothing better to do than undo itself.
+
+**Why the population is wrong, and it is three things at once.** (i) **Model**: 0.6B, where the 9x was measured at 8B — the 2026-08-18 probe entry already recorded the 0.6B model's weaker instruction-following, and a model that barely obeys a standing instruction cannot be much disturbed by carrying the stale version of it in the suffix. (ii) **Length**: 3–5k-token sessions against the eval's 4–8k, chosen for iteration speed. (iii) **Query**: `build_examples` takes `item.queries[:1]` and `kvshift_eval` always puts `fact-at` first, so all 120 eval items asked the same question type and the `obey` query — the one a governing edit is most directly aimed at — never ran. That third one is a plain defect in the harness, not a judgement call.
+
+**Verdict: negative, and the negative is about the testbed rather than the method.** What this run does establish is that the instrument works end to end and is trustworthy: the differentiable stitch places tensors identical to the serving path's, gradients reach the adapter through a stitched cache, the split backward is arithmetically identical to the summed one, and the anchor reads exactly 0 at identity so damage is measurable below the eval's own ~0.0015 numerical floor — all pinned by CPU tests on a random tiny Qwen3. What it does **not** establish is anything about whether stitched-KV consistency fine-tuning fixes governing edits, because the governing edits in this pilot were not broken. phase3-design.md called this the smallest honest experiment; it was too small on the one axis that carries the phenomenon.
+
+The next run is specified and was not made: **Qwen3-8B, 4–8k sessions, the full query pool including `obey`, and a base-only eval first** to confirm the ~9x reproduces *before* spending an epoch of training on it. That confirmation was launched and immediately stood down — Track N's Phase 2 cold-tier eval had taken the GPU back (32.1 of 32.6 GB: `marathon.cold_eval` plus a vLLM engine), and the etiquette here is to yield, not to queue behind it.
+
+**One infrastructure lesson, learned the expensive way.** The first attempt died at item ~210 with `torch.AcceleratorError: CUDA error: unknown error` after degrading from 1.9 s to 19 s per item. Nothing else was on the GPU; it was self-inflicted allocator thrash — `torch.cuda.empty_cache()` on *every* step (each call hands every cached block back to the driver, so the next step re-`cudaMalloc`s ~2 GB of KV) on top of holding the stitched and anchor autograd graphs at the same time. The two loss terms are independent, so they are now backpropagated separately and freed as they go (halving peak memory, with a test asserting the gradients match the summed form), `empty_cache` is every 25 steps, and the script exports `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for the varying 3–6k buffer sizes. The rerun held a flat 1.6 s/item for all 599 items. At 8B this matters more, not less.
+
+Caveats: one model, one seed pair, one epoch, one query type, 120 held-out items. `gov_frac 0.5` gives ~282 governing and ~317 other training items, near the intended split but not tuned. No hyperparameter search was run — 1e-4 was a first guess and the `clean_kl` spike by step 81 suggests it is too high for r=16 across all four projections. The eval's `*_answer_ok` grades the arg-max of the teacher-forced sequence rather than a free-running greedy decode; that is comparable across base and tuned but is not `kvshift_eval`'s `exact` column. And the method distills toward full recompute, which the dependent-edit study showed is *itself* sometimes the less obedient party — so a KL improvement would not have been an accuracy improvement even had one appeared.
+
 ## 2026-08-19 — Phase 2 cold tier: the window goes flat, and recall-on-miss is the whole difference between 0.008 and 0.817
 
 Command: `python -m marathon.cold_eval --sessions 20 --turns 70 --active-window 8192 --threshold 0.2` (`scripts/cold_eval.sh`) · Model: `Qwen/Qwen3-14B-FP8` in vLLM 0.27.1, retriever `sentence-transformers/all-MiniLM-L6-v2` mean-pooled on CPU · 20 sessions × 70 turns, history p50 25.0k / min 18.5k / max 35.7k tokens, 6 facts planted per session from turn 2 to turn 65, 8 questions each (old / recent / distractor) = 480 questions.
