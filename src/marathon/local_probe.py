@@ -10,9 +10,11 @@ edit of turn 0), but served locally so we own the KV cache. Three modes:
             separator; chunk KV is reused regardless of position, with a
             small fraction of tokens recomputed to re-stitch attention
     shift   Marathon position-shifted KV reuse (``vllm_shift_connector``): prefix
-            caching stays on, and on the edit turn the unchanged suffix ``S`` is
-            copied into its new block slots with its keys re-rotated by the token
-            shift, so vLLM prefills only the edited message and the new turn
+            caching stays on, and on the edit turn every unchanged run of history is
+            copied into its new block slots with its keys re-rotated by *its own*
+            token shift, so vLLM prefills only the edited messages and the new turn.
+            ``--edit-count k`` edits k different messages in one turn and ``--move``
+            swaps two earlier messages (which gives some segments a negative delta).
 
 Wall time of a ``max_tokens=1`` generate is the prefill cost (offline engine,
 no network). Runs inside WSL2 in ``~/marathon-venv`` (see
@@ -66,35 +68,60 @@ def _configure(mode: str, recompute_ratio: float) -> None:
     )
 
 
-def _reuse_plan(old_chunks: list[list[int]], new_chunks: list[list[int]], block_size: int):
-    """``(phase1_len, dst_end, delta)`` for a single edited chunk, else ``None``.
+def _line_tokens(tok, sep: list[int]):
+    """Tokens one canonical history line contributes to the prompt (probe's layout)."""
 
-    The prompt is a list of chunks (system, one per message, trailing tail). An
-    in-place edit changes exactly one chunk and shifts every following chunk by
-    ``delta``; the run of chunks that survives unchanged is the reusable ``S``.
-    ``phase1_len`` rounds the start of ``S`` up to a block boundary — vLLM only
-    reports prefix hits in whole blocks, so the first partial block of ``S`` is
-    prefilled along with ``E'`` instead of being copied.
+    def f(line: bytes) -> list[int]:
+        h = json.loads(line)
+        return sep + tok.encode(f"{h['role']}: {h['content']}", add_special_tokens=False)
+
+    return f
+
+
+def _phases(loads: list[dict], block_size: int, n_prompt: int) -> list[tuple[int, dict | None]]:
+    """Turn a segment list into ``[(request_length, load_or_None)]`` — k+1 requests.
+
+    vLLM's connector API can only express externally-matched tokens as a *prefix* of
+    one request, so k reused segments cannot be handed over in one shot. They are
+    instead handed over one per request, in destination order: request i prefills the
+    fresh span before segment i (everything earlier is a vLLM prefix hit, including the
+    segments the connector wrote in earlier requests) and stops exactly on the block
+    boundary where segment i begins, so that the *next* request's local prefix hit lands
+    on the connector's ``dst_start``. The final request is the real one: full prompt,
+    last segment loaded, only the new turn left to prefill.
+
+    Segments are clipped to whole blocks (vLLM counts matched tokens per block); a
+    segment with less than one whole block left is dropped and simply recomputed.
     """
-    a = 0
-    while a < len(old_chunks) and a < len(new_chunks) and old_chunks[a] == new_chunks[a]:
-        a += 1
-    if a == 0 or a + 1 >= min(len(old_chunks), len(new_chunks)):
-        return None
-    delta = len(new_chunks[a]) - len(old_chunks[a])
-    k = 0
-    while (
-        a + 1 + k < min(len(old_chunks), len(new_chunks))
-        and old_chunks[a + 1 + k] == new_chunks[a + 1 + k]
-    ):
-        k += 1
-    if k == 0:
-        return None
-    src_start = sum(len(c) for c in old_chunks[: a + 1])
-    src_end = src_start + sum(len(c) for c in old_chunks[a + 1 : a + 1 + k])
-    dst_start, dst_end = src_start + delta, src_end + delta
-    phase1_len = -(-dst_start // block_size) * block_size
-    return (phase1_len, dst_end, delta) if dst_end - phase1_len >= block_size else None
+    segs = []
+    for ld in loads:
+        lo = -(-int(ld["dst_start"]) // block_size) * block_size
+        hi = int(ld["dst_end"]) // block_size * block_size
+        if hi - lo >= block_size and lo > 0 and hi < n_prompt:
+            segs.append((lo, hi, int(ld["delta"])))
+    if not segs:
+        return []
+    out: list[tuple[int, dict | None]] = [(segs[0][0], None)]
+    for i, (lo, _hi, _d) in enumerate(segs[1:], start=1):
+        prev = segs[i - 1]
+        out.append((lo, {"dst_start": prev[0], "dst_end": prev[1], "delta": prev[2]}))
+    last = segs[-1]
+    out.append((n_prompt, {"dst_start": last[0], "dst_end": last[1], "delta": last[2]}))
+    return out
+
+
+def _mutate(session, edit_turn: int, count: int, grow: str, move: bool, upto: int) -> None:
+    """Apply the edit-turn mutation: ``count`` in-place edits and optionally one swap."""
+    available = list(range(edit_turn, upto))
+    step = max(len(available) // max(count, 1), 1)
+    for t in available[::step][:count]:
+        i = 2 * t
+        session.edit(i, "[EDITED] " + grow + session.messages[i]["content"])
+    if move and upto >= 4:
+        a, b = 2, 2 * (upto - 2)
+        ca, cb = session.messages[a]["content"], session.messages[b]["content"]
+        session.edit(a, cb)
+        session.edit(b, ca)
 
 
 @contextlib.contextmanager
@@ -154,9 +181,16 @@ def probe(
     edit_turn: int = 0,
     edit_grow: int = 0,
     repair_first: int = 0,
+    edit_count: int = 1,
+    move: bool = False,
+    reuse_moved: bool = False,
 ) -> list[dict]:
+    import dataclasses
+
     from transformers import AutoTokenizer
     from vllm import SamplingParams
+
+    from . import reuse_plan
 
     _configure(mode, recompute_ratio)
     tok = AutoTokenizer.from_pretrained(model)
@@ -189,13 +223,13 @@ def probe(
         # warm the engine (CUDA graphs / kernels) so turn 0 isn't inflated
         llm.generate({"prompt_token_ids": sys_ids}, _sp(sampling, save=False))
         prev = _prefix_hits(llm) or (0, 0)
-        prev_chunks: list[list[int]] | None = None
+        line_tokens = _line_tokens(tok, sep)
+        prev_state: bytes | None = None
 
         for t in range(turns):
             if t == edit_at:
-                i = 2 * edit_turn
                 grow = _GROW * max(edit_grow // len(tok.encode(_GROW, add_special_tokens=False)), 0)
-                session.edit(i, "[EDITED] " + grow + session.messages[i]["content"])
+                _mutate(session, edit_turn, edit_count, grow, move, t)
             last = t == turns - 1
             ask = parity_tokens > 0 and last
             fact = _PARITY_FACT + " " if parity_tokens > 0 and t == _PARITY_AT else ""
@@ -216,38 +250,35 @@ def probe(
             # save the KV of everything computed while history is still append-only;
             # the store is what the edit turn re-rotates out of.
             save = mode == "shift" and (edit_at is None or t < edit_at)
-            plan = (
-                _reuse_plan(prev_chunks, chunks, block_size)
-                if mode == "shift" and t == edit_at and prev_chunks
-                else None
-            )
-            prev_chunks = chunks
+            phases: list[tuple[int, dict | None]] = []
+            reuse = None
+            if mode == "shift" and t == edit_at and prev_state is not None:
+                reuse = reuse_plan.plan(prev_state, state, line_tokens, head_tokens=len(sys_ids))
+                if repair_first > 0:
+                    reuse = dataclasses.replace(reuse, repair_first=repair_first)
+                loads = reuse.to_kv_transfer_params(reuse_moved=reuse_moved)
+                phases = _phases(loads, block_size, len(ids))
+                print(
+                    f"[shift] turn {t}: policy={reuse.policy} segments={len(reuse.segments)} "
+                    f"deltas={[sg.delta for sg in reuse.segments]} "
+                    f"moved={[i for i, m in enumerate(reuse.moved) if m]} "
+                    f"reused={sum(sg.length for sg in reuse.segments)}/{len(ids)} "
+                    f"requests={len(phases) or 1} ({reuse.reason})",
+                    flush=True,
+                )
+            prev_state = state
 
             start = time.perf_counter()
-            if plan is not None:
-                phase1_len, dst_end, delta = plan
-                # phase 1: prefill P + E' at native speed so it lands in the prefix cache
-                llm.generate({"prompt_token_ids": ids[:phase1_len]}, _sp(sampling, save=False))
-                # phase 2 (repair): prefill the first M tokens of S natively, so they
-                # attend to E' instead of carrying attention to the replaced E. vLLM's
-                # connector API can only express matched tokens as a prefix, so the
-                # repaired head has to be a separate, block-aligned request.
-                load_from = phase1_len
-                if repair_first > 0:
-                    repair = -(-repair_first // block_size) * block_size
-                    load_from = min(phase1_len + repair, dst_end - block_size)
-                    load_from -= load_from % block_size
-                    llm.generate({"prompt_token_ids": ids[:load_from]}, _sp(sampling, save=False))
-                # final phase: prefix-hit everything computed so far, connector supplies
-                # the rest of S re-rotated, vLLM prefills the new turn and the query
-                out = llm.generate(
-                    {"prompt_token_ids": ids},
-                    _sp(
-                        base,
-                        save=False,
-                        load={"dst_start": load_from, "dst_end": dst_end, "delta": delta},
-                    ),
-                )
+            if phases:
+                # every phase but the last is a max_tokens=1 warm-up whose only job is to
+                # leave its blocks in vLLM's prefix cache for the phase after it
+                for length, load in phases[:-1]:
+                    llm.generate(
+                        {"prompt_token_ids": ids[:length]},
+                        _sp(sampling, save=False, **({"load": load} if load else {})),
+                    )
+                _, load = phases[-1]
+                out = llm.generate({"prompt_token_ids": ids}, _sp(base, save=False, load=load))
             else:
                 out = llm.generate({"prompt_token_ids": ids}, _sp(base, save=save))
             prefill_s = time.perf_counter() - start
@@ -263,6 +294,8 @@ def probe(
                     "prefix_hit_tokens": hit,
                     "wire_bytes": len(session.last_payload.wire_bytes()),
                     "state_bytes": len(state),
+                    "requests": max(len(phases), 1),
+                    "segments": len(reuse.segments) if reuse else 0,
                     "text": out[0].outputs[0].text,
                 }
             )
@@ -287,6 +320,22 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=0,
         help="make the edit add roughly this many tokens (default: a ~4-token shift)",
+    )
+    parser.add_argument(
+        "--edit-count",
+        type=int,
+        default=1,
+        help="how many different messages --edit-at rewrites in the same turn",
+    )
+    parser.add_argument(
+        "--move",
+        action="store_true",
+        help="also swap two earlier messages, so some segments get a negative delta",
+    )
+    parser.add_argument(
+        "--reuse-moved",
+        action="store_true",
+        help="also transplant relocated blocks (measured unsafe; off by default)",
     )
     parser.add_argument(
         "--repair-first",
@@ -324,13 +373,26 @@ def main(argv: list[str] | None = None) -> int:
         args.edit_turn,
         args.edit_grow,
         args.repair_first,
+        args.edit_count,
+        args.move,
+        args.reuse_moved,
     )
     print(
         f"mode={args.mode} model={args.model} edit_at={args.edit_at} "
         f"ratio={args.recompute_ratio} blend_prefix={args.blend_prefix} "
-        f"edit_turn={args.edit_turn} edit_grow={args.edit_grow} repair_first={args.repair_first}"
+        f"edit_turn={args.edit_turn} edit_grow={args.edit_grow} "
+        f"repair_first={args.repair_first} edit_count={args.edit_count} move={args.move} "
+        f"reuse_moved={args.reuse_moved}"
     )
-    cols = ["turn", "prefill_s", "prompt_tokens", "prefix_hit_tokens", "wire_bytes", "state_bytes"]
+    cols = [
+        "turn",
+        "prefill_s",
+        "prompt_tokens",
+        "prefix_hit_tokens",
+        "requests",
+        "segments",
+        "state_bytes",
+    ]
     print(" ".join(f"{c:>17}" for c in cols), " text")
     for r in rows:
         print(" ".join(f"{str(r[c]):>17}" for c in cols), f" {r['text']!r}")

@@ -17,6 +17,13 @@ The delta engine knows a turn changed one span. Turn that into KV work:
    Policies: recompute nothing, recompute the first M tokens after the edit, or
    pick the top-r fraction by K deviation at a cheap early layer (CacheBlend-style).
 
+Multi-span and moved blocks are the same mechanism with the loop pulled out one level:
+:func:`token_segments` asks ``marathon.diff``'s rsync matcher which runs of tokens
+survived, each survivor becomes a :class:`Segment` with its *own* ``delta = dst - src``
+(negative when a block moved earlier), and :func:`stitch_segments` places them all. Only
+the genuinely new tokens are left over, and they are computed in one masked forward, so
+each fresh span sees every stitched and freshly written slot below it.
+
 Everything below is plain HF transformers eager attention: a ``Cache`` whose layers
 scatter freshly computed K/V into fixed slots of a pre-stitched buffer and return the
 whole buffer, so a recomputed token attends to the already-stitched context around it.
@@ -104,6 +111,89 @@ def token_span(old_ids: list[int], new_ids: list[int]) -> Span:
     return Span(p=p, e_old=len(old_ids) - p - s, e_new=len(new_ids) - p - s, s=s)
 
 
+# --------------------------------------------------------------- multi-span edits
+
+
+@dataclass(frozen=True)
+class Segment:
+    """One reused run of tokens: ``old[src_start:src_end]`` lands at ``dst_start``.
+
+    ``delta`` is per segment, so a *moved* block is simply a segment whose delta
+    differs from its neighbours' (and may be negative). Segments are kept in
+    destination order; everything they do not cover is recomputed.
+    """
+
+    src_start: int
+    src_end: int
+    dst_start: int
+
+    @property
+    def length(self) -> int:
+        return self.src_end - self.src_start
+
+    @property
+    def dst_end(self) -> int:
+        return self.dst_start + self.length
+
+    @property
+    def delta(self) -> int:
+        return self.dst_start - self.src_start
+
+
+def span_segments(span: Span) -> list[Segment]:
+    """The single-edit :class:`Span` as segments: ``P`` at delta 0, then ``S`` at delta."""
+    segs = [Segment(0, span.p, 0)] if span.p else []
+    if span.s:
+        src = span.p + span.e_old
+        segs.append(Segment(src, src + span.s, span.p + span.e_new))
+    return segs
+
+
+_W = 4  # bytes per token id in the id-stream encoding below
+
+
+def _id_bytes(ids: list[int]) -> bytes:
+    return b"".join(int(i).to_bytes(_W, "big") for i in ids)
+
+
+def token_segments(
+    old_ids: list[int],
+    new_ids: list[int],
+    block_tokens: int = 16,
+    min_tokens: int = 16,
+) -> list[Segment]:
+    """Reusable segments between two token sequences, via ``marathon.diff``.
+
+    The rsync matcher is the right engine here precisely because it is *not* an LCS:
+    it indexes every aligned baseline block in a hash table and matches wherever the
+    bytes occur, so a moved block is found with a copy whose source offset runs
+    backwards. Token ids are encoded as fixed 4-byte words, which makes every match
+    snap to a token boundary for free (an unaligned match is a cross-token
+    coincidence and is dropped). Matches shorter than ``min_tokens`` are dropped too:
+    a handful of reused tokens is not worth a segment.
+
+    Byte identity is not context identity — a segment's KV was computed after whatever
+    preceded it in the *old* sequence. For a moved block that is exactly the
+    approximation under test; for a segment matched against an unrelated identical
+    passage elsewhere it is a hazard the matcher cannot see.
+    """
+    ops = compute_delta(_id_bytes(old_ids), _id_bytes(new_ids), block_size=block_tokens * _W).ops
+    segs: list[Segment] = []
+    dst = 0
+    for op in ops:
+        if isinstance(op, Copy):
+            src, at, n = op.offset, dst, op.length
+            pad = (-src) % _W
+            src, at, n = src + pad, at + pad, n - pad
+            if at % _W == 0 and n // _W >= min_tokens:
+                start = src // _W
+                segs.append(Segment(start, start + n // _W, at // _W))
+            dst += op.length
+        else:
+            dst += len(op.data)
+    return segs
+
+
 # ------------------------------------------------------------------- scatter cache
 
 
@@ -149,6 +239,43 @@ class ShiftCache(Cache):
         return ShiftCache([(lyr.keys.clone(), lyr.values.clone()) for lyr in self.layers])
 
 
+def stitch_segments(
+    old_kv: list[tuple[torch.Tensor, torch.Tensor]],
+    segments: list[Segment],
+    total: int,
+    inv_freq: torch.Tensor,
+    rotate: bool = True,
+) -> ShiftCache:
+    """Place every reused segment into a fresh ``total``-long cache, K re-rotated per δ.
+
+    Slots no segment covers are left zeroed; they are the fresh spans, and the caller
+    computes them (all of them in one forward — the causal mask makes a fresh token at
+    position ``p`` attend to every stitched *and* freshly written slot below ``p``, so
+    fresh spans are effectively evaluated in destination order).
+    """
+    out = []
+    for k, v in old_kv:
+        nk = k.new_zeros((k.shape[0], k.shape[1], total, k.shape[3]))
+        nv = v.new_zeros((v.shape[0], v.shape[1], total, v.shape[3]))
+        for seg in segments:
+            if seg.length <= 0:
+                continue
+            src = slice(seg.src_start, seg.src_end)
+            dst = slice(seg.dst_start, seg.dst_end)
+            nk[:, :, dst] = rerotate_keys(k[:, :, src], seg.delta if rotate else 0, inv_freq)
+            nv[:, :, dst] = v[:, :, src]
+        out.append((nk, nv))
+    return ShiftCache(out)
+
+
+def fresh_positions(segments: list[Segment], total: int, device) -> torch.Tensor:
+    """Destination positions no segment covers — exactly what must be recomputed."""
+    covered = torch.zeros(total, dtype=torch.bool, device=device)
+    for seg in segments:
+        covered[seg.dst_start : seg.dst_end] = True
+    return (~covered).nonzero(as_tuple=True)[0]
+
+
 def stitch(
     old_kv: list[tuple[torch.Tensor, torch.Tensor]],
     span: Span,
@@ -156,26 +283,8 @@ def stitch(
     inv_freq: torch.Tensor,
     rotate: bool = True,
 ) -> ShiftCache:
-    """Build the new cache: P verbatim, E' zeroed, S re-rotated by ``span.delta``, tail zeroed.
-
-    ``tail`` is the number of trailing slots (the new query turn) computed fresh.
-    """
-    total = span.new_len + tail
-    out = []
-    s_from = span.p + span.e_old
-    s_to = span.p + span.e_new
-    for k, v in old_kv:
-        nk = k.new_zeros((k.shape[0], k.shape[1], total, k.shape[3]))
-        nv = v.new_zeros((v.shape[0], v.shape[1], total, v.shape[3]))
-        nk[:, :, : span.p] = k[:, :, : span.p]
-        nv[:, :, : span.p] = v[:, :, : span.p]
-        if span.s:
-            nk[:, :, s_to : s_to + span.s] = rerotate_keys(
-                k[:, :, s_from : s_from + span.s], span.delta if rotate else 0, inv_freq
-            )
-            nv[:, :, s_to : s_to + span.s] = v[:, :, s_from : s_from + span.s]
-        out.append((nk, nv))
-    return ShiftCache(out)
+    """Single-edit convenience: P verbatim, E' fresh, S re-rotated, ``tail`` slots fresh."""
+    return stitch_segments(old_kv, span_segments(span), span.new_len + tail, inv_freq, rotate)
 
 
 # ------------------------------------------------------------------------ forwards
@@ -292,17 +401,15 @@ class Policy:
 
 
 @torch.no_grad()
-def _deviation(model, cache: ShiftCache, ids, positions, total, span, check_layer):
-    """Fresh-vs-cached K deviation at ``check_layer`` for every token of S.
+def _deviation(model, cache: ShiftCache, ids, positions, total, slots, check_layer):
+    """Fresh-vs-cached K deviation at ``check_layer`` for every position in ``slots``.
 
     Costs ``(check_layer+1)/n_layers`` of a full prefill over the selected tokens —
     charged honestly in the reported effective fraction.
     """
     probe = cache.clone()
     probe.index = positions
-    s_to = span.p + span.e_new
-    s_slots = torch.arange(s_to, s_to + span.s, device=positions.device)
-    cached = probe.layers[check_layer].keys[:, :, s_slots].clone()
+    cached = probe.layers[check_layer].keys[:, :, slots].clone()
     h = model.model.embed_tokens(ids[None])
     pos_emb = model.model.rotary_emb(h, positions[None])
     mask = _causal_mask(positions, total, model.dtype)
@@ -315,23 +422,40 @@ def _deviation(model, cache: ShiftCache, ids, positions, total, span, check_laye
             past_key_values=probe,
             use_cache=True,
         )
-    fresh = probe.layers[check_layer].keys[:, :, s_slots]
-    return (fresh.float() - cached.float()).norm(dim=-1).mean(dim=(0, 1))  # [s]
+    fresh = probe.layers[check_layer].keys[:, :, slots]
+    return (fresh.float() - cached.float()).norm(dim=-1).mean(dim=(0, 1))
 
 
 @torch.no_grad()
-def select(model, policy: Policy, cache: ShiftCache, span: Span, ids, positions, total):
-    """Indices *within S* (0-based) to recompute, and the extra-cost fraction paid."""
-    if policy.kind == "none" or span.s == 0:
-        return torch.zeros(0, dtype=torch.long, device=ids.device), 0.0
+def select(model, policy: Policy, cache: ShiftCache, segments, fresh, all_ids, total):
+    """Extra destination positions to recompute, and the extra-cost fraction paid.
+
+    Only segments with something before them are candidates: a leading segment at
+    destination 0 is a true prefix, and nothing about its attention changed.
+    """
+    device = all_ids.device
+    empty = torch.zeros(0, dtype=torch.long, device=device)
+    repairable = [seg for seg in segments if seg.dst_start > 0 and seg.length > 0]
+    if policy.kind == "none" or not repairable:
+        return empty, 0.0
     if policy.kind == "firstm":
-        n = min(policy.m, span.s)
-        return torch.arange(n, device=ids.device), 0.0
+        picked = [
+            torch.arange(seg.dst_start, min(seg.dst_start + policy.m, seg.dst_end), device=device)
+            for seg in repairable
+        ]
+        return torch.cat(picked).sort().values, 0.0
     if policy.kind == "blend":
-        dev = _deviation(model, cache, ids, positions, total, span, policy.check_layer)
-        n = max(1, int(round(policy.ratio * span.s)))
-        idx = dev.topk(n).indices.sort().values
-        return idx, (policy.check_layer + 1) / model.config.num_hidden_layers
+        cand = torch.cat(
+            [torch.arange(seg.dst_start, seg.dst_end, device=device) for seg in repairable]
+        )
+        probe_pos = torch.cat([fresh, cand]).sort().values
+        score = _deviation(
+            model, cache, all_ids[probe_pos], probe_pos, total, cand, policy.check_layer
+        )
+        n = max(1, int(round(policy.ratio * cand.numel())))
+        return cand[score.topk(n).indices].sort().values, (
+            policy.check_layer + 1
+        ) / model.config.num_hidden_layers
     raise ValueError(policy.kind)
 
 
@@ -339,40 +463,24 @@ def select(model, policy: Policy, cache: ShiftCache, span: Span, ids, positions,
 
 
 @torch.no_grad()
-def run_policy(
+def run_segments(
     model,
     old_kv,
-    span: Span,
-    new_ids: torch.Tensor,
-    query_ids: torch.Tensor,
+    segments: list[Segment],
+    all_ids: torch.Tensor,
     policy: Policy,
     max_new_tokens: int = 16,
     forced: list[int] | None = None,
 ) -> dict:
-    """Stitch, selectively recompute, answer. Returns tokens, first logits and cost."""
-    device = new_ids.device
-    inv_freq = inv_freq_of(model)
-    tail = int(query_ids.shape[0])
-    total = span.new_len + tail
-    all_ids = torch.cat([new_ids, query_ids])
-
-    fresh_always = torch.cat(
-        [
-            torch.arange(span.p, span.p + span.e_new, device=device),
-            torch.arange(span.new_len, total, device=device),
-        ]
-    )
-
-    cache = stitch(old_kv, span, tail, inv_freq, rotate=policy.rerotate)
-    s_to = span.p + span.e_new
-    # policy selection needs a candidate forward set: everything not reusable + all of S
-    probe_pos = (
-        torch.cat([fresh_always, torch.arange(s_to, s_to + span.s, device=device)]).sort().values
-    )
-    picked, extra = select(model, policy, cache, span, all_ids[probe_pos], probe_pos, total)
-    positions = torch.cat([fresh_always, picked + s_to]).sort().values
-
+    """Stitch an arbitrary set of reused segments, recompute the rest, answer."""
     import time
+
+    device = all_ids.device
+    total = int(all_ids.shape[0])
+    cache = stitch_segments(old_kv, segments, total, inv_freq_of(model), rotate=policy.rerotate)
+    fresh = fresh_positions(segments, total, device)
+    picked, extra = select(model, policy, cache, segments, fresh, all_ids, total)
+    positions = torch.cat([fresh, picked]).sort().values if picked.numel() else fresh
 
     def sync():
         if device.type == "cuda":
@@ -394,6 +502,7 @@ def run_policy(
     recomputed = int(positions.shape[0])
     return {
         "policy": policy.label(),
+        "segments": len(segments),
         "recomputed_tokens": recomputed,
         "recompute_frac": recomputed / total,
         "effective_frac": recomputed / total + extra,
@@ -403,6 +512,29 @@ def run_policy(
         "logits": logits,
         "logits_seq": seq,
     }
+
+
+@torch.no_grad()
+def run_policy(
+    model,
+    old_kv,
+    span: Span,
+    new_ids: torch.Tensor,
+    query_ids: torch.Tensor,
+    policy: Policy,
+    max_new_tokens: int = 16,
+    forced: list[int] | None = None,
+) -> dict:
+    """Single-edit convenience wrapper over :func:`run_segments`."""
+    return run_segments(
+        model,
+        old_kv,
+        span_segments(span),
+        torch.cat([new_ids, query_ids]),
+        policy,
+        max_new_tokens,
+        forced,
+    )
 
 
 @torch.no_grad()
@@ -431,6 +563,7 @@ def run_full(model, new_ids: torch.Tensor, query_ids: torch.Tensor, max_new_toke
     sync()
     return {
         "policy": "full-recompute",
+        "segments": 0,
         "recomputed_tokens": int(ids.shape[0]),
         "recompute_frac": 1.0,
         "effective_frac": 1.0,

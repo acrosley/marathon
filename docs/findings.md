@@ -347,3 +347,192 @@ Takeaway: `--repair-first` is implemented and measured, and it is not worth its 
 Caveats: the near-tie diagnosis rests on a single-token observation on one prompt — a proper statement needs teacher-forced KL against a single-pass reference, which this probe still cannot get through vLLM's offline API. `--repair-first` also cannot express the policy the prototype actually favoured (top-r tokens scattered through `S` by K deviation); the prefix-only connector API rules that out without a second, scatter-shaped load path.
 
 @acrosley 2026-08-18
+
+## 2026-08-18 — Distribution eval, 60 sessions: re-rotated reuse costs 1.6% of tokens for a median KL of 0.0035, and the governing-span rule is right about *where* but wrong about *why*
+
+Command: `scripts/kvshift_eval.sh --model Qwen/Qwen3-8B --sessions 60 --gen-tokens 32 --seed 1234` → new `marathon.kvshift_eval` (WSL2, `~/marathon-venv`, torch 2.13.0+cu130, transformers 5.15.0, sdpa, bf16, peak 19.6 GiB, 1297 s) · Model: `Qwen/Qwen3-8B` · Cost: $0.
+
+The previous two entries measured position-shifted reuse on six hand-built scenarios. This is the population version a reviewer would ask for: **60 seeded sessions** (4,378–8,207 tokens, median 6,311) across three families — coding-assistant sessions whose history is real source chunks from this repo, prose sessions built from `docs/*.md`/`DESIGN.md`/`README.md` paragraphs, and Q&A sessions over seeded fact tables — each rendered through Qwen3's chat template. Each session gets **one** edit at a random earlier turn, one of five kinds: `fact` (identifier swap, δ≈0), `rewrite` (body swap, δ −135…+137), `insert` (δ≈+29), `delete` (δ≈−14), and `governing` (the system prompt's standing instruction, δ≈0–1) as its own bucket. Three codes are planted strictly before / inside / after the edited message so the same fact questions are askable under every edit kind. Queries are drawn from a template pool (`fact-before/at/after`, `summarise`, `obey` = "give me a one-line status", `continue-code`) plus, on ~1/3 of items, a question the model wrote itself under full recompute. 200 (session, edit, query) items × 4 conditions.
+
+`klmean` is mean KL over 32 **teacher-forced** continuation tokens of the reference's own greedy output; `kl1` is first-token KL; `tf_top1` per-position top-1 agreement; `exact` is exact match of the 32-token free-running greedy answer against full recompute; `frac` is tokens forwarded. `prefix-equiv` is what vLLM prefix caching can do — reuse `P` only, recompute everything from the edit onward — and it is here for its *cost*, not its quality.
+
+```
+overall            n   klmean    klmed    klp95    klmax  kl1mean   kl1max  tf_top1  exact   frac  >.05  >.2
+full-recompute   200   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000    1.000   1.00  1.000     0    0
+reuse-all        200   0.0142   0.0035   0.0599   0.6382   0.0453   4.1928    0.985   0.64  0.016    11    1
+no-rerotate      200   0.0675   0.0128   0.3021   1.5246   0.1479   6.6726    0.969   0.45  0.016    53   18
+prefix-equiv     200   0.0017   0.0011   0.0038   0.0452   0.0017   0.0609    0.992   0.80  0.664     0    0
+```
+
+```
+by edit kind           n   klmean(reuse)  klmean(no-rr)   klp95    klmax  tf_top1  exact    frac
+fact                  41      0.0023         0.0025      0.0057   0.0093   0.990    0.76   0.005
+insert                41      0.0067         0.0182      0.0245   0.0303   0.988    0.66   0.009
+delete                39      0.0115         0.1161      0.0337   0.1352   0.985    0.59   0.004
+rewrite               41      0.0167         0.1637      0.0886   0.1419   0.985    0.71   0.058
+governing             38      0.0350         0.0372      0.0715   0.6382   0.975    0.45   0.004
+```
+
+```
+by query type (reuse-all)   n   klmean    klp95    klmax  kl1mean   kl1max  tf_top1  exact
+fact-after                 23   0.0048   0.0172   0.0331   0.0021   0.0303    0.995   0.74
+summarise                  22   0.0059   0.0154   0.0246   0.0019   0.0290    0.989   0.59
+model-written              20   0.0095   0.0479   0.0838   0.1548   2.5864    0.988   0.65
+fact-at                    60   0.0114   0.0653   0.0994   0.0004   0.0107    0.988   0.72
+continue-code              10   0.0136   0.0457   0.0457   0.0128   0.0687    0.981   0.70
+obey                       37   0.0220   0.1137   0.1419   0.1545   4.1928    0.970   0.32
+fact-before                28   0.0274   0.0235   0.6382   0.0001   0.0028    0.985   0.79
+```
+
+**The claim holds at population scale.** Re-rotated reuse forwards **1.6%** of tokens for a median KL of 0.0035 and a p95 of 0.060; prefix caching's equivalent forwards **66.4%**. 11/200 items clear KL 0.05 and exactly one clears 0.2. Planted-fact retrieval is untouched: 105/111 correct under reuse-all against 106/111 under full recompute — one item's difference, across facts before, inside and after the edit.
+
+**The re-rotation control is now decisive where it can be.** Over the whole population no-rerotate is 4.8× worse in mean KL and puts 53/200 items over 0.05 and 18/200 over 0.2, against reuse-all's 11 and 1, at identical cost. But the per-kind split shows *why*, and it is the useful part: re-rotation only helps where the edit actually shifts positions. On `rewrite` (δ −135…+137) it is a 10× improvement (0.0167 vs 0.1637) and on `delete` (δ≈−14) 10× (0.0115 vs 0.1161); on `fact` and `governing`, where δ ∈ {−1,0,1}, reuse-all and no-rerotate are the same number to three decimals. That is exactly the predicted behaviour of a fixed-angle rotation, measured across 200 items rather than asserted.
+
+**On the governing-span question the rule survives, but its stated mechanism does not.** Governing edits are the worst bucket (klmean 0.0350, exact 0.45, and both the largest KL in the run and the only item over 0.2), and at 19% of items they carry 5 of the 11 over-0.05 items — a 2.4× enrichment. So `reuse_plan`'s refusal is pointed at a real tail. But three things in this data say the reason is not "instructions govern later generation":
+
+1. Governing edits shift nothing (δ ∈ {0,1}), so re-rotation is a no-op there and reuse-all ≡ no-rerotate. Whatever hurts is pure stale attention, not position.
+2. The failures land on **fact questions**, not on the instruction-following question. Cross-tabbed: governing × `obey` is 0.0138 mean KL, while governing × every other query is **0.0448**, including the run's worst item (`sid=34`, a governing edit asked `fact-before`, KL 0.638 — with a first-token KL of 0.001, i.e. the divergence is late in the continuation, not at the first token). The 0.35 first-token KL of the hand-built `dep-instruction` scenario does not reproduce anywhere in 60 sessions.
+3. The confound is size. The system prompt sits at position 0, so a governing edit leaves `P`≈27 tokens and puts the **entire** history into `S` — `sid=34` has S=7,053. Every token of `S` carries stale attention to the changed span. The other kinds edit a middle turn and leave a real prefix intact. Governing edits are not a semantically special class in this data; they are the class where 100% of the context is downstream of the edit.
+
+The honest restatement is therefore: **the predictor is how much of the context sits after the edit, and "governing" is a proxy for "at the very front".** The two are perfectly confounded here because a standing instruction is always message 0. `reuse_plan` refusing on governing spans still refuses on the right items — it just should not be sold as instruction-awareness, and an edit to a large early *non*-governing turn should be expected to behave the same way. Untested, and the cheapest next experiment.
+
+**The `obey` cell is real but half of it is not reuse's fault.** `obey` is the worst query type for reuse-all — exact 0.32, kl1mean 0.155 with a 4.19 outlier — and the natural read is that a short "one-line status" answer is where a standing instruction bites. But `prefix-equiv` on the same cell only reaches exact 0.59 (0.56 on non-governing × obey), and `prefix-equiv` is mathematically a full recompute of everything that could have changed. So roughly half the disagreement on `obey` is the reference's own instability under a different chunking of the same tokens — the same near-tie effect the `--repair-first` entry diagnosed, now quantified on a population.
+
+**Calibration that a reviewer should hold onto:** `prefix-equiv` scores KL 0.0017 (not 0) and exact-match **0.80** (not 1.00) against a single-pass reference over byte-identical token ids. Free-running 32-token exact match is a metric with a ~20% noise floor on this workload, so reuse-all's 0.64 is to be read against 0.80, not against 1.00 — while the teacher-forced KL, which has no such floor, separates the conditions cleanly (0.0017 / 0.0142 / 0.0675). This is why the KL columns carry the argument and the exact-match column does not.
+
+Takeaway: over 60 realistic sessions and 200 graded items, position-shifted re-rotated reuse diverges from full recompute at a rate of 11/200 above KL 0.05 and 1/200 above 0.2, for 1.6% of the compute prefix caching would spend on the same edits. Re-rotation is what buys that on every edit kind that moves positions. The governing-span rule catches the tail, but the mechanism is span *position and size*, not instruction semantics, and the entry that proposed it (2026-08-18, "instruction spans, not fact spans") is narrowed by this one rather than confirmed.
+Caveats: one model (`Qwen3-8B` bf16, sdpa) and one seed — the governing-vs-rewrite ordering rests on 38 vs 41 items and a second seed was not run. Sessions are synthetic, and although their material is real repo text, the turn structure is templated. `continue-code` is n=10 and `governing × obey` is n=12; those cells are indicative only. The three planted codes are the only hard-graded answers; `summarise`, `obey`, `continue-code` and `model-written` are graded solely by agreement with full recompute, which the `prefix-equiv` floor shows is a noisy target. And the position/size-vs-semantics reinterpretation above is an inference from a confounded design, not a controlled result: it needs a run that edits a large early non-governing turn.
+
+@acrosley 2026-08-18
+
+## 2026-08-18 — The 2x2 settles it: the predictor is the governing flag, not the edit's position or |S| — and this overturns the previous entry's reinterpretation
+
+Command: `scripts/kvshift_eval.sh --model Qwen/Qwen3-8B --sessions 84 --gen-tokens 32 --seed 1235` (same WSL2 stack: torch 2.13.0+cu130, transformers 5.15.0, sdpa, bf16, peak 19.7 GiB, 1675 s) · Model: `Qwen/Qwen3-8B` · Cost: $0.
+
+The previous entry ended by arguing that "governing" was only a proxy for "at the very front, so `S` is the whole history", because a standing instruction is always message 0 and the two were perfectly confounded. That argument was wrong, and this run — the discriminating experiment it asked for — says so. Two new edit kinds break the confound, giving a clean 2x2 with δ held near 0 in all four cells:
+
+* **`early-fact`** — a plain identifier swap in the user turn at position 1 or 2. Front position, huge `S`, **not** governing.
+* **`mid-governing`** — the standing instruction is moved out of the system prompt into a mid-history user turn flagged `governing=True` (the system prompt is left neutral, so no unedited copy of the directive survives to contradict the edit), and *that* turn is edited. Mid position, moderate `S`, **is** governing.
+
+Together with the existing `governing` (front, governing) and `fact` (mid, non-governing) that is the full factorial. 84 sessions = 7 edit kinds × 3 families × 4, seed 1235, 269 graded items — which also serves as the **second seed** for the original five kinds.
+
+```
+governing flag x edit position (reuse-all)
+cell                         n   klmean    klmed    klp95    klmax  exact   meanS  >.05
+front, governing            40   0.0264   0.0081   0.0601   0.3676   0.57    6060     4
+front, non-governing        39   0.0029   0.0018   0.0100   0.0132   0.87    5652     0
+mid, governing              38   0.0255   0.0040   0.1134   0.5133   0.68    3533     3
+mid, non-governing          39   0.0020   0.0012   0.0058   0.0110   0.67    3452     0
+```
+
+Read down the columns: **the governing flag moves mean KL by ~9x and the position moves it by nothing.** `early-fact` puts 5,652 tokens of stale-attention `S` after the edit — as much as the governing case's 6,060 — and is the *cleanest* cell in the run (0.0029, zero items over 0.05, exact 0.87). `mid-governing` has 3,533 tokens of `S`, barely more than plain `fact`, and is as damaging as a front governing edit (0.0255 vs 0.0264). The previous entry's size hypothesis predicted the exact opposite of both.
+
+**|S| is not the predictor, and there is no threshold to find.** Binned over all 269 reuse-all items, neither |S| nor the downstream fraction is monotone, and the bins that cross p95 = 0.05 are scattered rather than ordered (|S|: `[1000,2000)` and `[4000,5000)`; fraction: `[0,0.2)` and `[0.95,1.01)`). Rank correlations over all items: **spearman(KL, |S|) = −0.028**, **spearman(KL, |S|/prompt) = +0.042** — no relationship in either direction. The one numeric quantity that does correlate is the shift itself, spearman(KL, |δ|) = +0.237.
+
+Conditioning on the flag is what makes the picture snap into focus:
+
+```
+NON-GOVERNING only (n=191)                    GOVERNING only (n=78)
+|S| bin        n  klmean   klp95  >.05        |S| bin        n  klmean   klp95  >.05
+[0,2000)      19  0.0072  0.0152     1        [0,2000)       9  0.0671  0.5133     1
+[2000,3000)   48  0.0063  0.0147     0        [2000,3000)    3  0.0038  0.0062     0
+[3000,4000)   54  0.0080  0.0385     1        [3000,4000)    7  0.0028  0.0069     0
+[4000,5000)   29  0.0066  0.0268     1        [4000,5000)   28  0.0369  0.1978     4
+[5000,6000)   12  0.0018  0.0031     0        [5000,6000)    7  0.0073  0.0243     0
+[6000,8000)   29  0.0028  0.0100     0        [6000,8000)   24  0.0128  0.0589     2
+p95 crosses 0.05 in: no bin                   p95 crosses 0.05 in: 3 of 6 bins
+klmean 0.0061  p95 0.0229  >.05 3/191         klmean 0.0260  p95 0.1134  >.05 7/78
+>.2 0/191                                     >.2 2/78
+spearman(KL,|S|) = -0.162                     spearman(KL,|S|) = +0.058
+spearman(KL,|delta|) = +0.407                 spearman(KL,|delta|) = +0.311
+```
+
+**Among non-governing edits, p95 KL never crosses 0.05 in any |S| bin or any downstream-fraction bin**, right out to 8k tokens of `S` and a downstream fraction of 0.95+; the correlation with |S| is if anything mildly *negative* (−0.162). Among governing edits it crosses in half the bins with no ordering. Both items in the run above KL 0.2 are governing, and so are the top five items overall — the worst, `sid=69`, is a `mid-governing` edit with **|S| = 1,678 and a downstream fraction of 0.23**, i.e. the single most damaging item in 269 has one of the *smallest* `S` values. A size threshold would not have caught it and would have needlessly refused hundreds of large-|S| fact edits that are fine.
+
+**Seed reproducibility.** The five original kinds rank identically at seed 1235 (n=12 sessions each, as at 1234): fact 0.0020 (was 0.0023), insert 0.0055 (0.0067), delete 0.0062 (0.0115), rewrite 0.0141 (0.0167), governing 0.0264 (0.0350). Overall reuse-all is klmean 0.0119 / median 0.0030 / p95 0.0394 at 1.5% of tokens forwarded, against 0.0142 / 0.0035 / 0.0599 at 1.6% for seed 1234; 10/269 items over KL 0.05 and 2/269 over 0.2. `prefix-equiv` again forwards 68.2% for KL 0.0014 — a 45x cost ratio for a 8.5x KL difference. The `no-rerotate` control is again 6.8x worse (0.0812, 56/269 over 0.05, 25/269 over 0.2), and again the gap is concentrated exactly where δ is large: `rewrite` 0.0141 reused vs **0.3471** unrotated (25x), `delete` 0.0062 vs 0.1550, while `fact`/`early-fact`/`governing`, where δ ∈ {0,1}, show reuse-all ≈ no-rerotate as they must.
+
+**The `obey` cell, revisited.** With `mid-governing` in the mix there are now 58 `obey` items. Governing × obey is klmean 0.0161 / exact 0.46; governing × other queries is **0.0304** / exact 0.70; non-governing × obey is 0.0079 / exact 0.50. So the instruction-following query is *not* where governing edits do their damage — for the second run in a row the damage lands on the fact questions instead. What `obey` does have is a low exact-match under every condition, including `prefix-equiv` at 0.67, which is the reference-instability floor rather than a reuse effect. The mechanism is therefore not "the edited instruction steers the answer"; it is that `S`'s KV attended to the old instruction text and every later token's hidden state is subtly wrong, which shows up wherever the continuation is long enough to accumulate it.
+
+**What `reuse_plan`'s rule should be: exactly what it already is.** Keep the governing flag; do not add a position or |S| threshold, and do not replace the flag with one. Concretely, on this data the current rule refuses 78/269 items and catches both items over KL 0.2 and 7 of the 10 over 0.05; an |S|-based rule with any threshold would refuse far more and catch less. The one honest refinement available is that the flag is *conservative*: 71/78 governing items are under KL 0.05 and would have been fine reused, so `repair` (recompute a leading chunk of `S`) rather than `full` remains the right response — which is what `reuse_plan` already emits. The previous entry's proposed reinterpretation should be treated as retracted.
+
+Takeaway: with the confound broken, the governing flag is the predictor (9x on mean KL, all of the >0.2 tail) and edit position and |S| are not predictors at all — among non-governing edits p95 KL stays under 0.05 in every |S| bin out to 8k. `reuse_plan` keeps its rule unchanged. The 2026-08-18 entry that called "governing" a proxy for "at the front" is overturned by this one; the 2026-08-18 entry before it, which located the failure in governing/instruction spans, is restored — though its *mechanism* (the instruction steering generation) still does not hold, since the damage lands on fact queries, not on the instruction-following query.
+Caveats: one model (`Qwen3-8B` bf16, sdpa), two seeds. `mid-governing` is one synthetic construction of "a governing span that is not the system prompt" — a user turn carrying a standing instruction — and real sessions may carry governing content in forms this does not resemble. The 2x2 holds δ near 0 by design, so it says nothing about a *large* governing edit; `rewrite` is the only large-δ kind and it is non-governing. Cell sizes are 38-40 items (12 sessions each), so the two >0.2 items are 2 events and the KL means are not tightly bounded. `continue-code` is n=14. And as before, exact-match has a reference-instability floor (`prefix-equiv` 0.86 overall, 0.67 on `obey`), so the KL columns carry the argument.
+
+@acrosley 2026-08-18
+
+## 2026-08-19 — Multi-span and moved-block KV reuse: cost tracks the number of edits, not the context — and a *relocated* block is not a shifted one
+
+Commands: `scripts/kvshift_probe.sh --model Qwen/Qwen3-8B --turns 20 --scenario multi-k1,multi-k2,multi-k4,multi-k8,move,combined` and `scripts/phase1_multispan.sh` (prefix/shift matrix, `Qwen/Qwen3-14B-FP8`, `--turns 24 --edit-at 20 --parity-tokens 16`) · Cost: $0 · GPU quiet throughout (Track G idle); every steady-state turn quoted below sits in 0.089–0.110 s, so no row is contended.
+
+Every reuse result in this log so far was a *single* edited span, and `reuse_plan` returned `policy="full"` the moment it saw two — a `# ponytail:` ceiling. That is the wrong shape for the workload the design targets: an agent turn rewrites several messages, and blocks get moved. This entry removes the ceiling, and finds that one of the two generalisations works and the other does not.
+
+**The generalisation.** A plan is now a list of `Segment(src_start, src_end, dst_start)`, each carrying its own `delta = dst_start - src_start`; a moved block is a segment whose delta differs from its neighbours' and may be negative. `stitch_segments` places them all (V verbatim, K re-rotated per segment) and everything they do not cover is recomputed in one masked forward, so each fresh span attends to every stitched and freshly written slot below it. The RoPE identity is unchanged; `tests/test_kvshift.py` covers δ ∈ {−7, −1, 0, 1, 13, 64} and `rerotate max abs error` on the real 8B `inv_freq` is 1.39e-05. In the HF prototype `token_segments` runs `marathon.diff`'s rsync matcher over the token-id stream encoded as fixed 4-byte words — the rsync engine is right here precisely because it is *not* an LCS: it indexes every aligned baseline block and matches wherever the bytes occur, so a moved block appears as a copy whose source offset runs backwards, and the 4-byte encoding snaps every match to a token boundary for free. In the serving path `reuse_plan.plan` matches canonical JSONL lines, so a segment is always a whole run of entries.
+
+### Part 1 — quality, Qwen3-8B, 20 turns, ~5.3k tokens, worst case over each scenario's fact questions
+
+`multi-kN` rewrites N different messages in one turn; `move` swaps two messages' contents; `combined` does two rewrites *and* a swap.
+
+```
+scenario   segments  reused/total   policy          frac    klmean    klmax  tf_top1   QA   ==ref
+multi-k1      3      5288/5326      full-recompute  1.000   0.0000   0.0000    1.00    2/2   2/2
+                                    reuse-all       0.012   0.0014   0.0128    1.00    2/2   2/2
+                                    no-rerotate     0.012   0.0024   0.0214    1.00    2/2   2/2
+multi-k2      6      5276/5345      reuse-all       0.018   0.0012   0.0111    1.00    3/3   3/3
+                                    no-rerotate     0.018   0.0024   0.0269    1.00    3/3   3/3
+multi-k4      8      5255/5383      reuse-all       0.028   0.0008   0.0095    1.00    4/4   4/4
+                                    no-rerotate     0.028   0.0192   0.2256    1.00    4/4   4/4
+multi-k8     22      5216/5459      reuse-all       0.049   0.0022   0.0259    1.00    4/4   4/4
+                                    no-rerotate     0.049   0.0405   0.3845    1.00    4/4   4/4
+move          5      5305/5333      reuse-all       0.009   0.0005   0.0033    1.00    2/2   2/2
+                                    no-rerotate     0.009   0.0013   0.0071    1.00    2/2   2/2
+combined      -      -              reuse-all       0.028   0.0007   0.0049    1.00    3/3   3/3
+                                    no-rerotate     0.028   2.3173  13.5002    0.58    1/3   1/3
+```
+
+Deltas are per segment and mixed-sign wherever a block moved: `move` is `[-3689, 0, 14, 3703]`, `multi-k8` runs `[-3001 … 0, 4, 8, 12, 16, 20, 24, 28, 32 … 3193]` across 22 segments. HF prefill, mean over the fact questions: full recompute 0.41–0.45 s against reuse-all 0.039–0.049 s — **9.1× at k=8, 10.1–10.8× elsewhere**, and at 8B this is compute-bound enough that wall clock and recompute fraction agree. Selective recompute again buys nothing: `first-32/128/512` and `blend-r0.05/0.15/0.30` leave klmean in the same 0.001–0.010 band for 2–16× the compute (`first-512` reaches 80% recompute at k=8).
+
+**The control is now decisive.** `no-rerotate` — same segments, keys left at their stale angles — was a 5–20× KL penalty in the single-span entries. With multi-span it becomes a correctness failure: at `combined` it is klmean **2.32**, max 13.5, teacher-forced top-1 agreement 0.58, and 1/3 fact questions right instead of 3/3. At 0.6B the same control literally swaps the two answers in `move` (asked for `alpha` it returns the `omega` code and vice versa). This matches Track G's independent same-day result that the control's damage concentrates where δ is large. Re-rotation is not a refinement; it is what makes non-prefix reuse work at all.
+
+### Part 2 — cost, Qwen3-14B-FP8 in vLLM, 24 turns, edit on turn 20 (12.5k-token prompt)
+
+k segments cannot be handed to vLLM in one shot — its connector API expresses externally-matched tokens only as a *prefix* — so `local_probe._phases` hands them over one per request, each stopping on the block boundary where the next segment begins; the final request is the real one. k edits ⇒ k+1 requests.
+
+```
+config                        turn19  turn20  turn21  turn23   req  seg   t20 text / parity        vs prefix
+prefix (k=1 mutation)          0.097   1.243   0.107   0.191    1    -    '<think>' / '7391-KAPPA'     -
+prefix (pure move)             0.089   1.181   0.109   0.194    1    -    '<think>' / '7391-KAPPA'     -
+shift --edit-count 1           0.097   0.198   0.105   0.187    2    2    '<think>' / '7391-KAPPA'   6.3x
+shift --edit-count 2           0.099   0.276   0.107   0.193    3    3    '<think>' / '7391-KAPPA'   4.5x
+shift --edit-count 4           0.097   0.411   0.105   0.190    5    5    '<think>' / '7391-KAPPA'   3.0x
+shift --edit-count 8           0.090   0.664   0.100   0.179    9    9    '<think>' / '7391-KAPPA'   1.9x
+shift --move                   0.098   0.293   0.110   0.192    3    5    '<think>' / '7391-KAPPA'   4.0x
+shift --edit-count 4 --move    0.095   0.546   0.106   0.188    6    9    '<think>' / '7391-KAPPA'   2.3x
+```
+
+Every working row's generated text is byte-identical to prefix mode on every turn, and turn 23 answers the planted fact through re-rotated KV. Steady-state turns are unchanged (0.09–0.11 s in both modes). The edit turn is almost exactly linear in k — 0.198 / 0.276 / 0.411 / 0.664 s is **+66 ms per additional edited message**, which is the k+1-request phase trick plus that message's own prefill, and nothing that scales with context. Extrapolating that fit, shift stops beating prefix caching's flat 1.24 s collapse at about **k ≈ 17 edited messages** in a 12.5k context; below that the win is real, above it a full recompute is simply cheaper.
+
+### A relocated block is not a shifted block
+
+The two `--move` rows above are the *second* version. The first was wrong, and the failure is the most useful thing in this entry.
+
+Transplanting relocated blocks the same way as shifted ones ran fine mechanically — `shift: loaded 576 tokens x 40 layers from store[10777:11353], delta=-10153` and its mirror at `delta=+10154`, no declines, 0.235 s — and produced **garbage**: turn 20 emitted `'1'` instead of `'<think>'`, turn 21 `'2'`, and turn 23 answered `' content used to grow the context in a 2 2 2 2'` instead of `7391-KAPPA`. `--repair-first 256` did not move it (0.340 s, same wrong text), which rules out a seam effect. The cause is the one thing re-rotation cannot touch: a block that moved 10k positions has KV summarising a *completely different* prefix, and re-rotating its keys fixes only where it now sits, not what it attended to. A shift of +4 or +186 leaves the preceding context intact; a relocation does not.
+
+So `reuse_plan` now distinguishes them. A segment whose entries merely shifted is reused; a segment whose entries *relocated* (their index in the history changed) is flagged in `plan.moved` and recomputed instead — `to_kv_transfer_params(reuse_moved=True)` restores the old, measured-unsafe behaviour for anyone who wants to re-measure it. That costs 2 × ~600 tokens of prefill and turns the broken row into the working one: **pure move 1.181 s → 0.293 s (4.0×) with byte-identical output**, `k=4 + move` 1.243 s → 0.546 s (2.3×). Reuse of the *unmoved* 76–95% of the history is untouched. A governing entry that relocated now also trips the `repair` policy, for the same reason a rewritten one does.
+
+This does **not** contradict Part 1, where `move` at 8B scored klmean 0.0005 with both fact questions exact at |δ| ≈ 3.7k. Those questions only ask the model to look up a value living *inside* the moved block, which the query attends to directly — the same structural reason fact edits have always survived. The vLLM probe asks the model to keep generating in context, and that is where a transplanted block's stale summary shows. The honest reading is that the HF move measurement was not sensitive to the failure, not that the two disagree.
+
+### Byte identity is not context identity
+
+The matcher will happily match a block against an *identical passage elsewhere*. It is visible in the segment lists: `multi-k1` contains no move at all, yet its deltas are `[-2385, 0, 4]` — a chunk of the probe's repeated filler prose matched a copy of itself 2,385 tokens earlier. That segment's KV was computed after different preceding text, so it is not merely shifted; it is wrong in the way the move case just demonstrated.
+
+On the HF workload it cost nothing measurable — every scenario above reuses such a segment and still scores klmean ≤ 0.0022 with every fact question exact, for the same "the query attends to the fresh text directly" reason. In the serving path it *did* bite, and the fix is in: `reuse_plan._match` used to take the first unused byte-identical old entry, which mapped a bare `"ok"` acknowledgement to one 10k tokens away (every assistant turn in `local_probe` serialises to the identical line). It now takes the **nearest** candidate, with run-continuation only as a tie-break, so an entry that did not move matches itself and only a genuinely relocated one gets a large delta — `tests/test_reuse_plan.py::test_duplicate_entries_match_the_nearest_not_the_first` pins it. That was not what broke the move case (the relocation itself was — the fix changed which segment one 9-token line belonged to and the output stayed wrong until relocations were recomputed), but it is a real defect found on the way, and it is the same hazard one level down. `token_segments` in the HF prototype remains exposed: the cheap mitigations — require a segment's *predecessor* to match too, or prefer the smallest |δ| among candidates — are not implemented there.
+
+### What changed in the code
+
+`kvshift.Segment` / `token_segments` / `stitch_segments` / `fresh_positions`; `select` and `run_segments` apply first-M and blend per non-leading segment. `reuse_plan.plan` is line-granular, takes `head_tokens` so its coordinates are the serving layer's, and returns `segments` + `moved` + `total`; `to_kv_transfer_params()` returns a **list**, one dict per reused segment past the leading prefix, skipping relocated ones. `policy="full"` now means only "nothing survived" — a truncated history keeps its prefix. `local_probe` derives its plan from `reuse_plan.plan` (its private `_reuse_plan` is gone) and gained `--edit-count k`, `--move` and `--reuse-moved`. `docs/protocol.md`'s reuse-plan section is rewritten. `tests/test_reuse_plan.py` lost `test_two_edits_are_full` — that behaviour is exactly what this entry removes — and gained multi-edit, moved-block (negative δ), duplicate-entry, relocation-policy, `head_tokens` and `_phases` coverage.
+
+Takeaway: **cost scales with the number of edited messages, not with context length** — +66 ms per edit at 12.5k tokens, 6.3× at k=1 down to 1.9× at k=8, against a prefix cache that collapses to 1.24 s regardless — and **quality holds for in-place edits at every k tested**, byte-identical output through k=8 in vLLM and klmean ≤ 0.0022 with every fact answer exact at 8B. Moved blocks are the exception: re-rotation cannot repair a block whose entire preceding context changed, so relocations are recomputed and only shifts reused, which still leaves 4.0× on a pure move.
+
+Caveats: the k-sweep is one session shape (24 turns of ~600-token messages, all edits in the first half) on one model, and the k ≈ 17 break-even is an extrapolation from four points, not a measured crossing. Parity is still one planted fact plus greedy-token equality against prefix mode — the vLLM offline API still cannot give teacher-forced KL at 14B, so Part 1 carries the quality argument and Part 2 carries the cost argument. `combined` at 0.6B *did* break under plain `reuse-all` (answered `5111-SIGMA` for `5111-DELTA`, fixed by first-32); it did not break at 8B, so that failure is not reproduced at scale and may be a small-model artefact. The relocation rule is binary and conservative — it refuses all relocations on the evidence of one |δ| ≈ 10k case, and nothing measures where between δ = 186 (safe) and δ = 10,153 (broken) the boundary sits. And the connector is still one request in flight, one writer, no eviction.
+
+@acrosley 2026-08-19
