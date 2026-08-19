@@ -147,3 +147,203 @@ LMCache retrieves ~99.7% of tokens every turn (`Retrieved 12505 out of 12547`, v
 Takeaway: on the edit turn CacheBlend-as-shipped is a tie with full recompute (1.260 vs 1.265 s) and it is 7× worse than prefix caching on every unchanged turn (prefix caching is off in blend mode). The idea isn't refuted — with 15% recomputed at vLLM's efficiency the edit turn would be ~0.25 s, a ~5× win — but LMCache 0.5.3's implementation of it can't deliver that on this stack. Phase 1 exit criterion (TTFT win on mid-edit sessions) is NOT met by this route yet. Options, cheapest first: lower `blend_recompute_ratios` (0.05, 0.02) and check output parity against full recompute; blend + vLLM prefix caching on together so unchanged turns keep the 0.12 s path and blend only pays on edits; a late/realistic edit position where prefix caching gets partial hits; or bypass LMCache's recompute path and do the position-shifted KV reuse Marathon's design actually calls for (DESIGN.md "positional entanglement") — the delta engine already knows exactly which byte ranges changed.
 
 @acrosley 2026-08-18
+
+## 2026-08-18 — Position-shifted KV reuse: re-rotated shifted KV holds quality at 0.7% recompute (Qwen3-0.6B, HF)
+
+Command: `scripts/kvshift_probe.sh --model Qwen/Qwen3-0.6B --turns 20` → `marathon.kvshift_probe` (WSL2, `~/marathon-venv`: torch 2.13.0+cu130, transformers 5.15.0, sdpa attention, bf16, no vLLM/LMCache) · Model: `Qwen/Qwen3-0.6B` · Cost: $0.
+
+The route DESIGN.md actually calls for, instead of LMCache: the delta engine says the turn changed one span, so reuse `P` verbatim, compute `E'` fresh, and reuse `S`'s cached V unchanged while **re-rotating** `S`'s cached K by δ = |E'|−|E| positions. RoPE is a rotation, so a key computed at position `p` moves to `p+δ` exactly by one more rotation of angle `δ·θ_i` — no recompute, no approximation. Measured against the real model's `inv_freq`: max abs error 1.3e-05 in fp32 (`tests/test_kvshift.py` proves the identity on a tiny random Qwen3 config, CPU, in CI). What re-rotation cannot fix is that `S`'s KV attended to `E`, not `E'`; that residual is what selective recompute buys back.
+
+Sessions are built with `marathon.session.Session` (20 turns of varied prose, ~5.2k tokens); `marathon.diff` locates the edit (`byte delta head=10783 tail=10599` for the mid edit) and the token span is snapped to it. Four questions per scenario: three planted unique facts (one in `P`, one in the edited span, one in `S`) and one open-ended turn. `klmean` is mean KL vs full recompute over a teacher-forced continuation of the reference's own tokens (stable; free-running greedy agreement is bimodal and is reported but not relied on). `tf_top1` is per-position top-1 agreement. `frac` = tokens forwarded / total; `eff` adds the blend policy's layer-0/1 scan over all of `S`. Worst case over the four questions is shown. `no-rerotate` is the control: same reuse, keys left at their stale angles.
+
+```
+scenario    edit          policy         frac    eff   klmean(worst)  tf_top1  QA   prefill_s
+edit-turn0  turn 0        full-recompute 1.000  1.000     0.0000       1.00    3/3    0.058
+ P=35       E 17->21      no-rerotate    0.007  0.007     0.0168       1.00    3/3    0.024
+ S=5152     d=+4          reuse-all      0.007  0.007     0.0033       1.00    3/3    0.023
+                          first-32       0.013  0.013     0.0023       0.92    3/3    0.023
+                          first-128      0.031  0.031     0.0036       1.00    3/3    0.024
+                          blend-r0.05    0.056  0.128     0.0025       1.00    3/3    0.025
+                          blend-r0.15    0.155  0.226     0.0022       1.00    3/3    0.035
+                          blend-r0.30    0.303  0.374     0.0024       1.00    3/3    0.049
+edit-mid    turn 10       full-recompute 1.000  1.000     0.0000       1.00    3/3    0.058
+ P=2576     E 18->22      no-rerotate    0.007  0.007     0.0183       0.98    3/3    0.023
+ S=2610     d=+4          reuse-all      0.007  0.007     0.0027       0.98    3/3    0.023
+                          first-128      0.032  0.032     0.0009       0.98    3/3    0.024
+                          blend-r0.15    0.082  0.154     0.0010       0.96    3/3    0.025
+                          blend-r0.30    0.157  0.228     0.0006       0.96    3/3    0.035
+edit-grow   turn 10       full-recompute 1.000  1.000     0.0000       1.00    3/3    0.134
+ P=2576     E 257->466    no-rerotate    0.089  0.089     0.0295       0.92    3/3    0.025
+ S=2371     d=+209        reuse-all      0.088  0.088     0.0024       1.00    3/3    0.026
+                          first-128      0.112  0.112     0.0019       1.00    3/3    0.027
+                          blend-r0.15    0.154  0.226     0.0013       1.00    3/3    0.038
+                          blend-r0.30    0.219  0.291     0.0017       1.00    3/3    0.039
+```
+
+Takeaway: re-rotated shifted-KV reuse holds up. Recomputing only `E'` plus the new query — 0.7% of tokens on a small edit, 8.8% when the edit grows the history by 209 tokens — keeps mean KL vs full recompute at ~0.002 nats, per-position top-1 agreement at 0.96–1.00, and all planted-fact answers exact. Selective recompute of `S` (CacheBlend-style top-r by layer-1 K deviation, or a flat first-M) lowers KL by a further 2–4× but from an already negligible base; on this workload it does not pay for itself, and the blend policy's layer-0/1 scan over all of `S` costs more (`eff` − `frac` ≈ 0.07) than the recompute it selects. The control settles that re-rotation is doing the work: leaving `S`'s keys at their stale angles is 5–20× worse in KL at identical cost, and is the only policy that ever breaks per-position agreement (0.92). Wall time is 0.023 s vs 0.058 s full recompute (2.5×), but that number is not the claim — a 0.6B model at 5k tokens in HF is launch-latency-bound, not compute-bound, so the honest predictor of a serving win is the recompute fraction: 0.007–0.09 here versus CacheBlend's fixed 0.15 recomputed through LMCache's Python path (previous entry), which tied full recompute.
+Caveats: single model size (Qwen3-0.6B); a Qwen3-8B scale-up was started and aborted — the download filled the C: drive (0 bytes free), which wedged the WSL VM; `wsl --terminate Ubuntu` did not bring it back and `--shutdown` is off limits, so WSL needs a manual restart by the lead. ~114 GB was freed from `%TEMP%` (stale diagnostic dumps); the partial Qwen3-8B download is still in the WSL HF cache. Also: in these sessions `S` is semantically independent of the edited span (separate log entries), which is the friendly case for reuse — an edit that later text actually depends on should be the next test.
+
+@acrosley 2026-08-18
+
+## 2026-08-18 — CacheBlend knobs: a lower recompute ratio only speeds *unchanged* turns, never the edit turn; blend + prefix caching crashes
+
+Commands: `scripts/phase1_probe.sh --mode {none,prefix,blend} --turns 24 --edit-at 20 --parity-tokens 16 [--recompute-ratio R] [--blend-prefix]` · Model: `Qwen/Qwen3-14B-FP8`, same WSL2/vLLM 0.27.1/LMCache-from-source stack · Cost: $0.
+
+New probe flags: `--recompute-ratio` (sets `LMCACHE_BLEND_RECOMPUTE_RATIOS`), `--blend-prefix` (blend mode with vLLM `enable_prefix_caching=True` as well), and `--parity-tokens N` — a unique fact (`The access code is 7391-KAPPA.`) is planted in turn 3's user message and the last turn asks `What is the access code? Answer with only the code.` instead of "Reply 'ok'", generating N tokens greedily. Qwen3 is a thinking model and spent the whole budget on `<think>`, so the parity turn's assistant tail prefills a closed empty think block; 16 tokens then suffice. The parity turn is the only one that decodes more than one token, which is why turn 23 is inflated everywhere.
+
+`prefill_s`, turns 17–23 (edit of turn 0 lands on turn 20):
+
+```
+turn  prompt_tokens   none   prefix   blend r=0.15   blend r=0.05   blend r=0.02
+ 17      10766        1.269   0.110      0.686          0.522          0.472
+ 18      11363        1.399   0.103      0.766          0.557          0.410
+ 19      11960        1.691   0.098      0.789          0.580          0.521
+ 20      12561        1.718   1.377      1.399          1.395          1.369   <- edit turn
+ 21      13158        1.685   0.116      0.878          0.614          0.507
+ 22      13755        1.884   0.117      0.973          0.651          0.530
+ 23      14364        1.747   0.210      1.286          1.067          0.830   <- parity turn (16 tokens decoded)
+```
+
+Parity: every mode and every ratio answered `7391-KAPPA` exactly — including `none` (ground truth). Dropping the recompute ratio to 0.02 costs no measurable accuracy on this probe.
+
+`--blend-prefix` does not run at all: with vLLM prefix caching on, the scheduler hands LMCache only the *new* tokens after a prefix hit while the blender still assumes the full chunked prompt, so it dies on the first turn with a hit — `RuntimeError: The size of tensor a (1208) must match the size of tensor b (3)` in `blender.process_qkv` (`k` vs `old_k`). Reproduced at r=0.15 and r=0.02; after the crash the engine hangs until LMCache's pin monitor times out at 300 s, so the run has to be killed.
+
+Takeaway: the recompute ratio is the wrong knob — 0.15 → 0.02 buys ~1.7× on unchanged turns (0.79 → 0.52 s at 12k tokens) and *nothing* on the edit turn (1.399 → 1.369 s, still a tie with prefix caching's 1.377 s collapse and with full recompute), because the edit turn's cost is the two full-length passes plus vLLM's prefill of the new tokens, not the selected fraction. Blend still loses 4–5× to prefix caching on unchanged turns, and the "keep both on" escape hatch is closed by an LMCache bug. Of the options listed last entry, the two cheap ones are now spent; the remaining route is Marathon's own position-shifted KV reuse.
+Caveats: the box is shared with another agent's GPU work — runs contended by it show 5–40 s spikes and were discarded and re-run (`none` turn 13 at 22.0 s is one survivor; ignore it). A partial `Qwen3-8B` download is still in the WSL HF cache — deleting it was blocked by the permission classifier, so the lead should `rm -rf ~/.cache/huggingface/hub/models--Qwen--Qwen3-8B`.
+
+@acrosley 2026-08-18
+
+## 2026-08-18 — Position-shifted KV reuse inside vLLM: the edit turn drops from 1.46 s to 0.24 s (Qwen3-14B-FP8)
+
+Commands: `scripts/phase1_probe.sh --mode shift --turns 24 --edit-at 20 --parity-tokens 8` and the same with `--mode prefix` · Model: `Qwen/Qwen3-14B-FP8`, same WSL2 stack as the previous entries (vLLM 0.27.1, torch 2.13.0+cu130, `VLLM_USE_V2_MODEL_RUNNER=0`) · Cost: $0.
+
+The HF prototype's re-rotation identity, moved into the serving path. New `src/marathon/vllm_shift_connector.py` is a `KVConnectorBase_V1` (`MarathonShiftConnector`, loaded via `kv_connector_module_path`, `kv_role=kv_both`) that does two things for one session and one writer. SAVE: on every turn it gathers the KV of the tokens vLLM actually computed out of the paged cache into a flat per-layer `[16384, 8, 256]` GPU buffer indexed by absolute position (2.7 GB for 40 layers; `gpu_memory_utilization=0.80` leaves room) — history is append-only, so by the edit turn the buffer holds the previous turn's full KV. LOAD: the request carries `{"load": {"dst_start", "dst_end", "delta"}}` in `SamplingParams.extra_args["kv_transfer_params"]`; `get_num_new_matched_tokens` reports `dst_end - num_computed_tokens` as externally available so vLLM skips prefilling them, and `start_load_kv` copies them in from the buffer — V verbatim, K re-rotated by `delta` (`kvshift.rerotate_keys` as a torch op on vLLM's fused `[num_blocks, num_kv_heads, block_size, 2*head_size]` layout, GPU→GPU, K is `content[:head_size]`).
+
+The probe's edit turn is two phases and `prefill_s` is the sum of both: first a `max_tokens=1` generate of `P + E'` rounded up to a block boundary (native prefill, lands in vLLM's prefix cache), then the real request, on which vLLM prefix-hits `P + E'`, the connector supplies `S` re-rotated, and vLLM prefills only the new turn and the query. On non-edit turns `--mode shift` is plain prefix caching plus the save.
+
+```
+turn  prompt_tokens   prefix_s  prefix_hit   shift_s  prefix_hit   text
+ 17      10766          0.129      10160      0.125      10160     '<think>'
+ 18      11363          0.124      10752      0.137      10752     '<think>'
+ 19      11960          0.132      11344      0.128      11344     '<think>'
+ 20      12561          1.465          0      0.242        640     '<think>'   <- edit of turn 0
+ 21      13158          0.135      12544      0.138      12544     '<think>'
+ 22      13755          0.134      13152      0.126      13152     '<think>'
+ 23      14364          0.236      13744      0.236      13744     '7391-KAPPA'  <- parity question
+```
+
+On turn 20 the connector logs `loaded 11328 tokens x 40 layers from store[620:11948], delta=4`: of the 12,561-token prompt, 11,328 tokens (90.2%) are copied-and-re-rotated, 624 are phase-1 prefill of the edited message, and ~610 are the new turn — 9.8% of the prompt forwarded, matching the HF prototype's predictor. **1.465 s → 0.242 s, a 6.1× win on the edit turn**, and the first thing in this project to beat the prefix-cache collapse rather than tie it. Steady-state turns are unchanged (0.12–0.14 s both modes; the per-turn save costs nothing measurable because prefix caching means only ~600 new tokens are ever gathered). Parity: turn 23 answers `7391-KAPPA` in both modes — and it reads that fact through turn 20's re-rotated KV, since turns 21–23 prefix-hit the blocks the connector wrote. Every turn's generated text is byte-identical between the two modes, and identical again on a Qwen3-0.6B bf16 sanity run (10 turns, edit at 8). A sharper version of the parity check — the question asked *on* the edit turn, so the answer can only come from the re-rotated KV that was written moments earlier and never through a later full prefill — also returns `7391-KAPPA` in both modes (Qwen3-0.6B, 9 turns, edit at 8; `loaded 4160 tokens x 28 layers`).
+
+Takeaway: the Phase 1 exit criterion is met on the append-only-plus-one-edit workload — 6.1× TTFT on the edit turn at unchanged output, versus CacheBlend's tie. The mechanism is exactly DESIGN.md's claim: the delta engine knows which byte range moved, RoPE makes the move exact for K, V doesn't care, and only the changed span plus the new tokens need a forward pass.
+Caveats, all real: (1) single request, single writer, no eviction, one GPU — this is a probe, not a scheduler-safe connector. (2) The reuse region is copied in whole blocks only, so a sub-block head of `S` is folded into phase 1 and a sub-block tail is recomputed; that is why phase 1 pads up to a block boundary. (3) `S` here is semantically independent of the edited span, the friendly case, same caveat as the HF entry — quality is asserted only by output parity and one planted fact, not by a KL measurement at this scale. (4) The two-phase split is the probe's job, not the connector's; a real server would need the edit's token span from the delta engine directly. (5) A mid-history variant (`--edit-turn 10`, so `P` is 6.5k tokens and `S` is 5.4k) ran correctly — `loaded 5360 tokens x 40 layers from store[6588:11948], delta=4` — but every wall time in that run was contended by another agent's GPU job (steady-state turns at 0.7–5.4 s in two separate attempts), so no timing is quoted from it and the mid-history position remains unmeasured.
+
+@acrosley 2026-08-18
+
+## 2026-08-18 — Shifted KV reuse holds on a mid-history edit (4.7×) and a +186-token grow edit (5.9×); the grow edit flips one token
+
+Commands: `scripts/phase1_probe.sh --mode {shift,prefix} --turns 24 --edit-at 20 --parity-tokens 16` with `--edit-turn 10` (mid-history) and with `--edit-grow 200` (grow) · Model: `Qwen/Qwen3-14B-FP8`, same stack · Cost: $0. New `--edit-grow N` flag prepends filler to the edited message so the edit *adds* ~N tokens instead of shifting by ~4, which is the harder case for re-rotation.
+
+**Mid-history edit** (`--edit-turn 10`: `P` = 6.6k tokens, the connector reuses `S` = 5,360 tokens, `loaded 5360 tokens x 40 layers from store[6588:11948], delta=4`). Prefix caching is *not* fully collapsed here — it hits `P` (5,984 tokens) and recomputes the 6,577 after the edit, so its edit turn is 0.95 s rather than 1.46 s. Shift still wins:
+
+```
+turn  prompt_tokens   prefix_s  prefix_hit   shift_s  prefix_hit   text
+ 17      10766          0.111      10160      0.161      10160     '<think>'
+ 18      11363          0.114      10752      0.103      10752     '<think>'
+ 19      11960          0.109      11344      0.098      11344     '<think>'
+ 20      12561          0.950       5984      0.200      12576     '<think>'   <- edit of turn 10
+ 21      13158          0.138      12544      0.108      12544     '<think>'
+ 22      13755          0.134      13152      2.246*     13152     '<think>'
+ 23      14364          0.231      13744      0.265      13744     '7391-KAPPA'
+```
+
+**0.950 s → 0.200 s, 4.7×.** A second shift run reproduced turn 20 at 0.223 s. `*` turn 22 is contended (Track B); so were turns 5/6/15 of that run, and a whole repeat run spiked to 27 s — every quoted row above except the starred one sat in a stretch of clean neighbours, and the prefix run was fully clean (0.076–0.138 s across turns 0–19).
+
+**Grow edit** (`--edit-grow 200` on turn 0: the edited message gains 186 tokens, `loaded 11328 tokens x 40 layers from store[614:11942], delta=186` — a 46× larger shift than the default). Both runs fully clean, no contention:
+
+```
+turn  prompt_tokens   prefix_s  prefix_hit   shift_s  prefix_hit   prefix_text  shift_text
+ 17      10766          0.096      10160      0.098      10160     '<think>'    '<think>'
+ 18      11363          0.101      10752      0.103      10752     '<think>'    '<think>'
+ 19      11960          0.097      11344      0.097      11344     '<think>'    '<think>'
+ 20      12743          1.273          0      0.214        816     '<think>'    '1'        <- edit, delta=+186
+ 21      13340          0.101      12736      0.102      12736     '<think>'    '1'
+ 22      13937          0.111      13328      0.110      13328     '<think>'    '<think>'
+ 23      14546          0.198      13920      0.196      13920     '7391-KAPPA' '7391-KAPPA'
+```
+
+**1.273 s → 0.214 s, 5.9×** — the speedup is indifferent to how big the shift is, as expected, since re-rotation is a fixed-cost angle regardless of `delta`. But this is the first output divergence measured: on turns 20 and 21 the single greedy token differs (`'1'` vs `'<think>'`), converging again at turn 22, and the planted-fact answer at turn 23 is still exact in both modes. Turn 21 inherits the difference because it prefix-hits the blocks the connector wrote on turn 20.
+
+Takeaway: the win is robust to edit position (4.7× when prefix caching still gets a partial hit) and to edit size (5.9× at δ=+186). The honest crack is the divergence: the HF prototype predicted this — it measured per-position top-1 agreement at 0.92–1.00, i.e. occasional flips — and at δ=+186 a flip lands on the very first sampled token. The residual is not re-rotation (that is exact) but the fact that `S`'s KV attended to `E`, not `E'`; the prototype showed a first-M or CacheBlend-style selective recompute of `S` cuts the KL 2–4× further, and the connector has no such policy yet. That is the next thing to build, and this measurement is the reason to build it.
+Caveats: as the previous entry, plus — one greedy token per turn is a very coarse quality probe; a real check needs teacher-forced KL at 14B scale against a full recompute, which this probe cannot do through vLLM's offline API.
+
+@acrosley 2026-08-18
+
+## 2026-08-18 — Where re-rotated KV reuse actually breaks: instruction spans, not fact spans (Qwen3-8B + 0.6B)
+
+Command: `python -m marathon.kvshift_probe --model Qwen/Qwen3-8B --turns 20` (WSL2, `~/marathon-venv`, torch 2.13.0+cu130, transformers 5.15.0, sdpa, bf16, peak 18.5 GiB) · Models: `Qwen/Qwen3-8B` and `Qwen/Qwen3-0.6B` · Cost: $0.
+
+Follow-up to the previous entry, which measured position-shifted KV reuse only where `S` was semantically independent of the edit. Three new scenarios make `S` depend on the edited span: **dep-anaphora** (turn 2 states a code; later turns say "that mission code is from now on the primary key" without repeating the value, so `S` must resolve a reference into `E'`), **dep-instruction** (turn 0 flips a standing "always reply in French" to "in German", which governs the final answer 5k tokens later), **dep-contradict** (an authoritative correction is inserted mid-history revoking a code that a *later* turn still instructs the model to quote). Same metrics as before, plus `==ref`: does the policy produce the same answer as full recompute.
+
+One harness bug had to be fixed first, and it invalidated the dependent scenarios' first run: the probe rendered history as a plain `role: content` transcript, so the model *continued the log* instead of obeying it — at full recompute the 0.6B model ignored the language instruction entirely, which silently turns every instruction-following test into a no-op. The probe now renders through the model's own chat template (`--raw` keeps the old behaviour), and only then does full recompute exhibit the behaviour we are trying to preserve. The independent scenarios were re-run under the template too, so all numbers below are comparable.
+
+```
+Qwen3-8B, worst case over each scenario's questions
+scenario         policy          frac    eff   klmean   kl_first  tf_top1  QA/lang  ==ref
+edit-turn0       full-recompute  1.000  1.000   0.0000    0.0000    1.00     4/4     4/4
+ (S independent) reuse-all       0.008  0.008   0.0115    ~0.01     0.94     4/4     3/4
+                 first-512       0.104  0.104   0.0067    ~0.01     1.00     4/4     3/4
+edit-mid         reuse-all       0.008  0.008   0.0051    ~0.01     0.96     4/4     3/4
+edit-grow        reuse-all       0.088  0.088   0.0035    ~0.01     1.00     4/4     4/4
+dep-anaphora     full-recompute  1.000  1.000   0.0000    0.0000    1.00     3/3     3/3
+ (S -> E' ref)   no-rerotate     0.005  0.005   0.0145    0.0199    0.94     3/3     2/3
+                 reuse-all       0.005  0.005   0.0145    0.0199    0.94     3/3     2/3
+                 first-512       0.100  0.100   0.0039    0.0199    0.96     3/3     2/3
+dep-contradict   full-recompute  1.000  1.000   0.0000    0.0000    1.00     2/2     2/2
+ (override)      reuse-all       0.014  0.014   0.0122    0.0579    0.96     2/2     1/2
+                 first-512       0.109  0.109   0.0172    0.0414    0.98     2/2     1/2
+dep-instruction  full-recompute  1.000  1.000   0.0000    0.0000    1.00    en,en    2/2
+ (governing)     reuse-all       0.004  0.004   0.0118    0.3492    0.95    de,de    0/2
+                 first-32        0.010  0.010   0.0036    0.0384    0.98    de,en    1/2
+                 first-512       0.100  0.100   0.0014    0.0177    0.98    de,en    1/2
+                 blend-r0.30     0.300  0.355   0.0051    0.1761    0.95    de,de    0/2
+```
+
+Verdict, in two halves. **Fact-level dependence does not break re-rotated reuse.** In dep-anaphora every policy — including plain `reuse-all` at **0.5%** recompute — resolves "that mission code" to the *new* value 9902-SIGMA, exactly as full recompute does; in dep-contradict every policy honours the inserted override and answers 4417-TANGO rather than the revoked code that later text still tells it to quote. The reason is structural: the query attends to `E'` directly, so a fact only has to survive in `E'`, and `S`'s stale hidden states carry the *pointer*, which the edit did not change. First-token KL does rise (0.02 and 0.058, vs ~0.01 in the independent scenarios) — the strain is visible — but not enough to change an answer.
+
+**Governing instructions are where it breaks.** In dep-instruction, `reuse-all` diverges from full recompute on the *first generated token* at KL **0.35** — 30× the ~0.01 of every other scenario — and produces a different language than the reference in 2/2 questions. Recomputing the first tokens of `S` cuts that first-token KL about 10× (0.35 → 0.038 at first-32, → 0.018 at first-512, i.e. 10% of `S`) and restores agreement in half the cases; no policy we tried restores it reliably, and the `blend` selector was the *worst* of the selective options here (0.176 at r=0.30, 35% effective recompute) because it picks tokens by layer-1 K deviation, which the instruction flip barely moves. So the repair is real but partial, and it is bought with an order of magnitude more compute than the fact cases need.
+
+An honest complication on that scenario: the reference is the shakier party. At full recompute the 8B model **ignored** the standing German instruction and answered in English, while the reuse paths answered in German — i.e. the reuse path was arguably the more obedient one. What these runs establish is that reuse *changes behaviour* on a governing-instruction edit; they do not establish which behaviour is correct, and long-context instruction drift at full recompute is a confound we did not control.
+
+For the delta engine the answer is therefore not "mark every downstream span that mentions the edit". Fact-carrying edits need nothing extra — the value is fetched from `E'` on demand. What needs marking is a much narrower class: edits inside spans that *govern* later generation (system/standing instructions, persona, output-format and language directives, tool-use policy). For those, re-rotated reuse should be refused or backed by a recompute of a leading chunk of `S`. That is a cheap classification — such spans are usually the system prompt and the first turn, and the delta engine already knows the byte offsets — and it is a far smaller tax than the dependency-tracking the previous entry's caveat implied.
+
+Scale changed nothing qualitatively. At 8B the independent-scenario picture is the same as at 0.6B (`reuse-all` klmean 0.0035–0.0115, QA 4/4), and dep-anaphora/dep-contradict behave the same in both. Scale does make the speed number meaningful: at 8B and ~5.3k tokens the prefill is 0.42–0.53 s full versus **0.04 s** reused (~11×), 0.08 s at first-512 and 0.19 s at blend-r0.30 — unlike the 0.6B run, this is compute-bound enough that the recompute fraction and the wall clock finally agree.
+Caveats: one edit per scenario and 2–4 questions each, so `==ref` counts are small and the open-ended summary question drifts from the reference under *every* policy (greedy agreement 0.06–0.15, and it is no better at 18% recompute) — free-running divergence at 40+ tokens is generic, not a reuse artefact. The instruction scenario tests one instruction type (output language) on one model. Only Qwen3 was tested, and the question tail is built with the model's own chat template, so these numbers are not portable to a model with a different template.
+
+@acrosley 2026-08-18
+
+## 2026-08-18 — `--repair-first` does not fix the grow-edit token flip, and a control shows the flip was never a reuse artefact
+
+Commands: `scripts/phase1_probe.sh --mode shift --turns 24 --edit-at 20 --edit-grow 200 --parity-tokens 16 --repair-first {0,64,256,1024,16384}` and `--repair-first 64` on the default δ=4 edit · Model: `Qwen/Qwen3-14B-FP8` · Cost: $0. GPU quiet throughout (Track B idle); every steady-state turn in every run below sits in 0.063–0.116 s, so no row is contended.
+
+New `--repair-first M` in `--mode shift`. vLLM's connector API can only express externally-matched tokens as a *prefix*, so selective recompute has to be an extra phase, not a scatter: phase 1 prefills `P + E'`, phase 2 prefills `P + E' + S[:M]` (M rounded up to a block multiple) so the head of `S` attends to `E'` instead of the replaced `E`, and the final phase loads only `S[M:]` re-rotated. `prefill_s` sums all phases.
+
+Grow edit (turn 0 gains 186 tokens; `S` = ~11.3k tokens), turn 20:
+
+```
+config                     prefill_s  reused_tok  turn20  turn21  turn23(parity)
+prefix (no reuse)            1.273         -     '<think>' '<think>'  '7391-KAPPA'
+shift, M=0                   0.214      11328     '1'      '1'        '7391-KAPPA'
+shift, M=64                  0.240      11264     '1'      '1'        '7391-KAPPA'
+shift, M=256                 0.242      11072     '1'      '1'        '7391-KAPPA'
+shift, M=1024                0.286      10304     '1'      '1'        '7391-KAPPA'
+shift, M=16384 (control)     1.243         16     ' ok'    '<think>'  '7391-KAPPA'
+```
+
+Repair costs what you would expect and buys nothing: M=0 → 1024 adds 72 ms (0.214 → 0.286 s, still 4.4× faster than prefix) and the divergent token does not move. The control settles why. M=16384 exceeds `|S|`, so `load_from` clamps to one block before the end and the connector reuses **16 tokens** — that run is a full recompute in all but name, it costs the same as prefix caching's collapse (1.243 vs 1.273 s), and it emits a *third* answer, `' ok'`. Three phase structures over byte-identical token ids give three different first tokens. So turn 20's greedy token here is a near-tie the model resolves at the numerical-noise level, and what flips it is how the prompt is chunked across requests — different batch shapes, different reduction orders in the prefill kernels — not re-rotated KV. The previous entry's "first output divergence measured" reads as a quality signal; it is not one, and this entry overturns that reading. Track B's independent finding the same day — free-running divergence at 40+ tokens is generic and no better at 18% recompute — points the same way.
+
+Default δ=4 edit with `--repair-first 64`: turn 20 is 0.209 s (11,264 tokens reused, `store[684:11948]`) and the text is `'<think>'`, identical to prefix on every turn, as expected — that case never diverged.
+
+Takeaway: `--repair-first` is implemented and measured, and it is not worth its cost on this workload — no measurable quality change at up to 1024 repaired tokens, +34% on the edit turn. That is the same conclusion the HF prototype reached about selective recompute (`eff` − `frac` bought nothing there either), now confirmed in the serving path, with the added serving-specific reason that each repair phase is a whole extra request: M=64 already costs 26 ms, most of it per-request scheduling rather than the 64 tokens of prefill.
+Caveats: the near-tie diagnosis rests on a single-token observation on one prompt — a proper statement needs teacher-forced KL against a single-pass reference, which this probe still cannot get through vLLM's offline API. `--repair-first` also cannot express the policy the prototype actually favoured (top-r tokens scattered through `S` by K deviation); the prefix-only connector API rules that out without a second, scatter-shaped load path.
+
+@acrosley 2026-08-18

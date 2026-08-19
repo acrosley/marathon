@@ -28,12 +28,26 @@ class Session:
         self.last_payload: TurnPayload | None = None
 
     def edit(self, index: int, content: str) -> None:
-        """Mutate an earlier message in place (takes effect on the next turn)."""
+        """Mutate an earlier message in place (takes effect on the next turn).
+
+        Everything but the content is preserved, ``governing`` included: the flag is a
+        property of the slot, and the reuse plan reads it off the *old* state.
+        """
         self.messages[index] = {**self.messages[index], "content": content}
 
-    def turn(self, role: str, content: str) -> bytes:
-        """Append a message, ship the delta, return the server-verified state bytes."""
-        self.messages.append({"role": role, "content": content})
+    def turn(self, role: str, content: str, governing: bool | None = None) -> bytes:
+        """Append a message, ship the delta, return the server-verified state bytes.
+
+        ``governing`` marks a message that steers *later* generation (system prompt,
+        standing instructions, persona, output format, tool policy). Editing such a
+        message makes position-shifted KV reuse unsafe — see ``reuse_plan``. It defaults
+        to True for the system role. The key is serialized only when True, so canonical
+        bytes of every session that never sets it are unchanged.
+        """
+        message: dict[str, Any] = {"role": role, "content": content}
+        if governing if governing is not None else role == "system":
+            message["governing"] = True
+        self.messages.append(message)
         state = self.replay()
         payload = prepare_turn(self.store, self.baseline_hash, state, content, self.block_size)
         resolved = resolve_turn(self.store, TurnPayload.from_wire(payload.wire_bytes()))
