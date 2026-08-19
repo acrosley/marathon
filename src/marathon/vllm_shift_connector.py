@@ -66,6 +66,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.logger import init_logger
 
+from .shift_kernels import RopeShift, rope_shift, scatter_shifted, warmup
 from .shift_store import DEFAULT_STORE_TOKENS, SessionTable, ShiftStore, slots
 
 if TYPE_CHECKING:
@@ -100,11 +101,6 @@ def stats() -> dict:
         for k in _COUNTERS:
             out[k] += s[k]
     return out
-
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    half = x.shape[-1] // 2
-    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
 
 
 @dataclass
@@ -156,7 +152,7 @@ class MarathonShiftConnector(KVConnectorBase_V1):
         self._kv: dict[str, torch.Tensor] = {}
         self._hnd: bool | None = None
         self._head_size: int | None = None
-        self._rope: tuple[int, torch.Tensor, torch.Tensor] | None = None
+        self._rope: RopeShift | None = None
         hf = vllm_config.model_config.hf_text_config
         head_dim = getattr(hf, "head_dim", None) or hf.hidden_size // hf.num_attention_heads
         rotary = int(head_dim * getattr(hf, "partial_rotary_factor", 1.0))
@@ -166,12 +162,11 @@ class MarathonShiftConnector(KVConnectorBase_V1):
 
     # ------------------------------------------------------------------ helpers
 
-    def _cos_sin(self, delta: int, device, dtype):
-        if self._rope is None or self._rope[0] != delta:
-            ang = float(delta) * self._inv_freq.to(device)
-            emb = torch.cat((ang, ang), dim=-1)
-            self._rope = (delta, emb.cos().to(dtype), emb.sin().to(dtype))
-        return self._rope[1], self._rope[2]
+    def _shift(self, delta: int, device) -> RopeShift:
+        """Rotation tables for δ, rebuilt only when δ changes (once per load)."""
+        if self._rope is None or self._rope.delta != delta or self._rope.cos.device != device:
+            self._rope = rope_shift(delta, self._head_size, self._inv_freq, device)
+        return self._rope
 
     # ------------------------------------------------------------- scheduler side
 
@@ -303,6 +298,9 @@ class MarathonShiftConnector(KVConnectorBase_V1):
         if shape[1] == self._bs and shape[2] == self._bs:
             self._hnd = False  # ambiguous; NHD is vLLM's default
         self._head_size = shape[3] // 2
+        one = next(iter(kv_caches.values()))
+        if one.is_cuda:
+            warmup(one, self._bs, self._hnd)
         logger.info(
             "marathon shift connector: %d layers, kv shape %s, layout %s, store %d tok",
             len(kv_caches),
@@ -328,12 +326,17 @@ class MarathonShiftConnector(KVConnectorBase_V1):
                 if getattr(layer, "kv_cache", None) is not None
             }
             self.register_kv_caches(self._kv)
-        d = self._head_size
+        device = next(iter(self._kv.values())).device
         for load in meta.loads:
             n = load.slots.numel()
             torch.cuda.synchronize()
             _t0 = time.perf_counter()
             _bytes = 0
+            # δ and the destination slots are the same for every layer, so the rotation
+            # tables and the slot transfer are hoisted out of the per-layer loop; each
+            # layer is then one fused read-rotate-scatter pass (see marathon.shift_kernels).
+            shift = self._shift(load.delta, device) if load.delta else None
+            slot = load.slots.to(device, non_blocking=True)
             for name, kv in self._kv.items():
                 src = self._store.read(load.session, name, load.src_start, n)
                 if src is None:
@@ -343,14 +346,9 @@ class MarathonShiftConnector(KVConnectorBase_V1):
                         name,
                     )
                     return
-                src = src.to(kv.device, non_blocking=True)
-                k = src[..., :d]
-                if load.delta:
-                    cos, sin = self._cos_sin(load.delta, kv.device, torch.float32)
-                    kf = k.to(torch.float32)
-                    k = (kf * cos + _rotate_half(kf) * sin).to(kv.dtype)
-                slot = load.slots.to(kv.device, non_blocking=True)
-                kv[self._paged(kv, slot)] = torch.cat((k, src[..., d:]), dim=-1)
+                scatter_shifted(
+                    src.to(kv.device, non_blocking=True), kv, slot, self._bs, self._hnd, shift
+                )
                 _bytes += src.numel() * src.element_size()
             torch.cuda.synchronize()
             _ms = (time.perf_counter() - _t0) * 1e3

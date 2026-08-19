@@ -36,7 +36,7 @@ Fine-tune for the contract that absence-from-diff means unchanged: train on delt
 
 ## Cross-cutting: integrity and operations (never deferred)
 
-Content addressing and hash-chain verification shipped in Phase 0 by design — a trusted substrate is a high-value target, and the model will treat poisoned baselines as settled truth. Still ahead: signed snapshots, single-writer-per-session concurrency (the sane v1 constraint), baseline store TTL/eviction policy, and observability (per-turn metrics exported, not just printed). Every phase keeps the same regression rule: efficiency that changes answers is a regression, not a win.
+Content addressing and hash-chain verification shipped in Phase 0 by design — a trusted substrate is a high-value target, and the model will treat poisoned baselines as settled truth. Single-writer-per-session concurrency and store eviction landed in the KV layer on 2026-08-19: the shift connector's store is keyed by session id with a token budget and LRU eviction across sessions, one in-flight writer per session is enforced rather than assumed, and the scheduler side declines a load whose source positions were evicted (a miss is a recompute, never a wrong answer) — see the "Connector" section of [protocol.md](protocol.md) for what that does *not* yet cover (tensor parallelism, preemption, chunked prefill interleaved with a load). Still ahead: signed snapshots, the same TTL/eviction story for the *baseline* store rather than the KV store, and observability (per-turn metrics exported, not just printed). Every phase keeps the same regression rule: efficiency that changes answers is a regression, not a win.
 
 ## North-star metrics
 

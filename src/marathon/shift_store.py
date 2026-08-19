@@ -38,7 +38,12 @@ from dataclasses import dataclass, field
 
 import torch
 
-CHUNK = 1024  # buffers grow in whole chunks, so an append-only session reallocs rarely
+# A session's buffers are allocated once, as a slab, and double only if the session
+# outgrows it. Measured 2026-08-19 on Qwen3-14B: growing a ~2 GB store in 1024-token
+# steps reallocates all 40 layer buffers every other turn, and the allocator churn slowed
+# *every* turn of the run 2-4x while cutting the load copy from 57 GB/s to 4.7 GB/s. A
+# slab wastes memory on short sessions, bounded by the budget; that is the trade.
+SLAB = 16384  # first allocation, capped at the budget; capacity doubles from there
 DEFAULT_STORE_TOKENS = 32768
 
 
@@ -82,7 +87,8 @@ class SessionTable:
 @dataclass
 class _Entry:
     capacity: int = 0  # positions the buffers can hold
-    filled: int = 0  # positions [0, filled) hold valid KV for the current history
+    base: int = -1  # first position ever written; below it the store holds nothing
+    filled: int = 0  # positions [base, filled) hold valid KV for the current history
     layers: dict[str, torch.Tensor] = field(default_factory=dict)
 
 
@@ -94,8 +100,10 @@ class ShiftStore:
         budget_tokens: int = DEFAULT_STORE_TOKENS,
         device: str = "cuda",
         allocate: bool = True,
+        slab: int | None = None,
     ) -> None:
         self.budget = int(budget_tokens)
+        self.slab = min(int(slab or SLAB), self.budget)
         self.device = device
         self.allocate = allocate
         self._sessions: OrderedDict[str, _Entry] = OrderedDict()  # LRU: oldest first
@@ -122,7 +130,10 @@ class ShiftStore:
         return sum(e.capacity for e in self._sessions.values())
 
     def _grow(self, session: str, entry: _Entry, want: int) -> None:
-        want = min(self.budget, -(-want // CHUNK) * CHUNK)
+        size = self.slab
+        while size < want:
+            size *= 2
+        want = min(self.budget, size)
         # Evict least-recently-used *other* sessions until the new capacity fits.
         while self.used - entry.capacity + want > self.budget:
             victim = next((s for s in self._sessions if s != session), None)
@@ -152,18 +163,31 @@ class ShiftStore:
         """
         need = dst_start + n
         entry = self._touch(session)
-        if dst_start > entry.filled or need > self.budget or n <= 0:
+        first = entry.base < 0
+        # A request only computes what vLLM did not already have: its first save
+        # therefore starts at its prefix-cache hit, not at position 0. That head is
+        # served by vLLM's own prefix cache on every later turn, so the store never
+        # needs it — but it must not claim to hold it either, hence `base`.
+        if need > self.budget or n <= 0 or (not first and dst_start > entry.filled):
             self.refusals += 1
             return False
         if need > entry.capacity:
             self._grow(session, entry, need)
+        if first:
+            entry.base = dst_start
         entry.filled = need
         return True
 
     def covers(self, session: str, start: int, n: int) -> bool:
         """Whether ``[start, start + n)`` is currently held for ``session``."""
         entry = self._sessions.get(session)
-        ok = entry is not None and start >= 0 and n > 0 and start + n <= entry.filled
+        ok = (
+            entry is not None
+            and entry.base >= 0
+            and start >= entry.base
+            and n > 0
+            and start + n <= entry.filled
+        )
         if ok:
             self.hits += 1
             self._touch(session)
@@ -186,7 +210,7 @@ class ShiftStore:
 
     def read(self, session: str, layer: str, start: int, n: int) -> torch.Tensor | None:
         entry = self._sessions.get(session)
-        if entry is None or start + n > entry.filled:
+        if entry is None or start < entry.base or entry.base < 0 or start + n > entry.filled:
             return None
         buf = entry.layers.get(layer)
         if buf is None:
@@ -205,7 +229,7 @@ class ShiftStore:
         return {
             "budget_tokens": self.budget,
             "used_tokens": self.used,
-            "sessions": {s: e.filled for s, e in self._sessions.items()},
+            "sessions": {s: max(e.filled - max(e.base, 0), 0) for s, e in self._sessions.items()},
             "hits": self.hits,
             "misses": self.misses,
             "evictions": self.evictions,
