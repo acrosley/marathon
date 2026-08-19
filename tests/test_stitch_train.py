@@ -644,6 +644,31 @@ def test_grad_prefill_falls_back_on_oom_rather_than_killing_the_run(tiny, monkey
     assert calls == [True, False]  # tried the expressive path, then fell back
     assert parts["grad_prefill"] is False and parts["grad_prefill_oom"] is True
     assert float(parts["stitch_kl"].detach()) >= 0.0
+    # WSL reports GPU exhaustion as a plain RuntimeError, and iteration 3 lost a run to a
+    # fallback that only caught the clean exception
+    calls.clear()
+
+    def wsl_flaky(model_, ex_, old_kv, forced, grad_prefill=False):
+        calls.append(grad_prefill)
+        if grad_prefill:
+            raise RuntimeError("CUDA driver error: device not ready")
+        return real(model_, ex_, old_kv, forced, grad_prefill)
+
+    monkeypatch.setattr(st, "stitched_logits", wsl_flaky)
+    parts = st.example_losses(
+        model, loras, ex, 3, anchor=False, grad_prefill=True, grad_prefill_max_tokens=0
+    )
+    assert calls == [True, False] and parts["grad_prefill_oom"] is True
+    # a RuntimeError that is *not* exhaustion must still propagate untouched
+    monkeypatch.setattr(
+        st,
+        "stitched_logits",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("shapes do not match")),
+    )
+    with pytest.raises(RuntimeError, match="shapes do not match"):
+        st.example_losses(
+            model, loras, ex, 3, anchor=False, grad_prefill=True, grad_prefill_max_tokens=0
+        )
     # an OOM on the *cheap* path is not recoverable and must propagate
     monkeypatch.setattr(
         st,

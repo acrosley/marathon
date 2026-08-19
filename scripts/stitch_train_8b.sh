@@ -28,9 +28,12 @@ CKPT=50           # mid-training checkpoint + held-out eval every N items
 MID_ITEMS=24
 MIN_TOK=4000
 MAX_TOK=8000
-# above the real ceiling (8k session + query), so no item is capped out of the expressive
-# path by prediction; an item that genuinely does not fit OOMs, falls back and is counted
-GP_CAP=8600
+# Measured, not predicted: at a cap of 8600 (every item expressive) the w=2 run peaked at
+# 28.8 GiB by item 50 and died on a longer one -- WSL reporting ENOMEM as "device not
+# ready". 6000 is iteration 2's proven envelope (27.4 GiB peak); items above it fall back
+# to the cheap path and are counted, so the run reports how much of the expressive half it
+# actually got instead of gambling the whole job on the longest session.
+GP_CAP=6000
 SKIP_BASE=""
 
 while [ $# -gt 0 ]; do

@@ -519,6 +519,25 @@ def clean_logits(model, ex: Example, forced: list[int]) -> torch.Tensor:
     return _clean_sequence(model, torch.cat([ex.new_ids, ex.query_ids]), forced)
 
 
+#: WSL2 does not surface GPU exhaustion as a clean ``torch.OutOfMemoryError``. Its GPU
+#: paravirtualisation layer fails the residency ioctl with ``-ENOMEM``
+#: (``dmesg``: ``dxgk: dxgkio_make_resident: Ioctl failed: -12``) and torch reports it as a
+#: plain ``RuntimeError: CUDA driver error: device not ready``. Iteration 1 lost a run to it
+#: 81 items in, and iteration 3 lost one to it again on a 8.5k-token item — the second time
+#: *through* an OOM fallback that only caught the clean exception. Matching the message is
+#: ugly, and it is still better than the alternative, which is that one long item ends a
+#: two-hour job. The fallback is attempted once; if the retry also fails the error escapes,
+#: so a genuinely poisoned context still ends the run rather than looping.
+_OOM_SIGNATURES = ("out of memory", "device not ready", "make_resident")
+
+
+def _is_oom(exc: BaseException) -> bool:
+    """Whether an exception is GPU exhaustion, including WSL's mislabelled form."""
+    if isinstance(exc, torch.OutOfMemoryError):
+        return True
+    return any(sig in str(exc).lower() for sig in _OOM_SIGNATURES)
+
+
 def kv_bytes_per_token(model) -> int:
     """Bytes of K+V cache one token costs across every layer, at the model's dtype."""
     cfg = model.config
@@ -646,13 +665,12 @@ def example_losses(
             stitch_kl = kl_to(
                 teacher_seq, stitched_logits(model, ex, old_kv, forced, used_grad_prefill)
             )
-        except torch.OutOfMemoryError:
+        except (torch.OutOfMemoryError, RuntimeError) as exc:
+            if not _is_oom(exc):
+                raise
             # A token cap is a *prediction* about memory; this is the measurement. An item
             # whose expressive path does not fit is worth training on the cheap path rather
-            # than losing the whole run, which is how the first 8B attempt ended (81 items
-            # in, and WSL surfaced the exhaustion as "CUDA driver error: device not ready"
-            # rather than as a clean OOM). Only OOM is caught: a poisoned CUDA context
-            # raises a plain RuntimeError and must not be retried.
+            # than losing the whole run.
             if not used_grad_prefill:
                 raise
             oom, used_grad_prefill = True, False
