@@ -858,3 +858,51 @@ The next run is specified and was not made: **Qwen3-8B, 4–8k sessions, the ful
 Caveats: one model, one seed pair, one epoch, one query type, 120 held-out items. `gov_frac 0.5` gives ~282 governing and ~317 other training items, near the intended split but not tuned. No hyperparameter search was run — 1e-4 was a first guess and the `clean_kl` spike by step 81 suggests it is too high for r=16 across all four projections. The eval's `*_answer_ok` grades the arg-max of the teacher-forced sequence rather than a free-running greedy decode; that is comparable across base and tuned but is not `kvshift_eval`'s `exact` column. And the method distills toward full recompute, which the dependent-edit study showed is *itself* sometimes the less obedient party — so a KL improvement would not have been an accuracy improvement even had one appeared.
 
 @acrosley 2026-08-19
+
+## 2026-08-19 — The 0.6B pilot's testbed diagnosis confirmed: at 8B the governing failure is right there (8.71×), and `obey` is its worst query
+
+Command: `scripts/stitch_train_8b.sh` step 1 — `python -m marathon.stitch_train eval --model Qwen/Qwen3-8B --items 48 --seed 9001 --gov-frac 0.5 --min-tokens 4000 --max-tokens 8000 --gen-tokens 32 --attn sdpa --base-only` (WSL2, `~/marathon-venv`, torch 2.13.0+cu130, transformers 5.15.0, sdpa, bf16, RTX 5090, ~21.3 GiB peak) · Model: `Qwen/Qwen3-8B` · Cost: $0.
+
+The previous entry's pilot was negative and blamed its own testbed: at 0.6B on 3–5k sessions a governing edit cost only 1.50× a non-governing one, so the adapter had nothing to repair. That was a claim about *why* the run failed, and it needed testing before another epoch was spent. This is the gate — the base model on held-out seed 9001, 4–8k-token sessions, tuned columns skipped because an identity adapter only re-measures the base at double the price (`--base-only`).
+
+**The failure class is exactly where it was said to be.**
+
+```
+bucket          metric               n      mean    median       p95       max  >.05
+governing       base_stitch_kl      20    0.0373    0.0064    0.0845    0.4250     4
+non-governing   base_stitch_kl      28    0.0043    0.0016    0.0174    0.0222     0
+ALL             base_stitch_kl      48    0.0181    0.0030    0.0674    0.4250     4
+
+governing/non-governing KL ratio:  mean 8.71x  (0.0373 / 0.0043)   median 4.03x  (0.0064 / 0.0016)
+planted-fact ok:  governing 12/12 ref = base;  non-governing 16/18 ref = base
+clean-context KL (identity adapter): 0.0000 on all 48 items, mean/median/p95/max alike
+```
+
+**8.71× on the mean** against the 144-session eval's ~9×, and 4.03× on the median against the ~3–4.5× that run showed — both reproduce at 48 items where 120 items at 0.6B gave 1.50× and 1.35×. Four governing items clear KL 0.05 and one clears 0.2 (0.4250); **no** non-governing item clears 0.05, with a maximum of 0.0222. So the diagnosis holds: the 0.6B result was about the model and the regime, not about stitched-KV consistency fine-tuning.
+
+**The harness defect the previous entry admitted is fixed, and fixing it changed the picture.** `build_examples` took `item.queries[:k]`, and `kvshift_eval._queries` always puts `fact-at` first — which is why all 120 eval items in the 0.6B pilot asked the same question and `obey` never ran. It now rotates the entry point into the pool by session id, so a `k=1` population still covers every type. The first run with the fix says the query mattered:
+
+```
+qtype           n    base klmean   base klmedian
+obey           11       0.0570          0.0080
+fact-at        16       0.0103          0.0043
+summarise       7       0.0057          0.0017
+fact-after      8       0.0034          0.0009
+fact-before     6       0.0014          0.0010
+```
+
+`obey` is the worst bucket by a factor of 5.5 on the mean, and the three worst items in the run are `governing/obey` (0.4250), `mid-governing/obey` (0.0845) and `governing/fact-at` (0.0674). That is worth flagging because it **cuts against** the 2026-08-18 2×2 entry, which found governing damage landing on the *fact* questions rather than on `obey` (governing × obey klmean 0.0161 vs governing × other 0.0304) and concluded the mechanism is not "the edited instruction steers the answer". On this smaller sample it is the instruction-following query that suffers most. Two readings are open and this run cannot separate them: 48 items with n=11 `obey` is small enough that one 0.425 outlier moves the mean a long way (the median ordering is much flatter — 0.0080 for `obey` against 0.0043 for `fact-at`), or the earlier run's `obey` cell was diluted because *every* item there also carried `fact-at`. Not resolved; do not quote the mean ordering as settled.
+
+Also worth recording: **clean-context KL is 0.0000 across all 48 items**, exactly, which is the first confirmation on a real 8B model that the shared-`_clean_sequence` fix from the previous entry gives the damage metric a true zero rather than the ~0.005 bf16 floor it started with.
+
+**Training did not complete, twice, and both failures were mine rather than the method's.** The first died immediately: `--attn` defaulted to `eager`, which materialises the full `[heads, q, kv]` fp32 score matrix — about 8 GB for a *single* layer at 8B and 8k tokens. `kvshift_eval` has always defaulted to `sdpa` for this reason and both paths honour the explicit additive mask the stitched forward passes; the default is now `sdpa`. The second died 81 items in with `RuntimeError: CUDA driver error: device not ready`, which is not a driver fault: `dmesg` shows `misc dxg: dxgk: dxgkio_make_resident: Ioctl failed: -12`, i.e. `-ENOMEM` — WSL's GPU paravirtualisation layer reports exhaustion as "device not ready" rather than as a clean torch OOM. Worth knowing for anything else run on this box.
+
+The cause was a modelling choice with a memory price. `stitched_logits` kept the freshly computed span `E'` inside the autograd graph so `k_proj`/`v_proj` could learn what to *write* into the cache, not just how to *read* it — which costs a retained full-length K and V per layer, ~2.4 GB at 8B/8k, on top of the attention activations. It is now a flag (`--grad-prefill`) and off by default; the default runs the stitched prefill under `no_grad` and lets gradients flow only through the continuation, which is the arrangement Phase 3 was specified with (the reused KV is a constant). A test asserts the cheap path still produces a nonzero adapter gradient, because a trainer that silently no-ops is worse than a slow one.
+
+The rerun of steps 2–4 was launched and **stood down within two minutes**: Track N started another `marathon.cold_eval --sessions 20 --turns 70` sweep at 04:12 and took 32 GB, and two tenants on one 32 GB card is how both runs get corrupted. The job was killed before it allocated anything.
+
+**Verdict against the Phase 3 exit criteria: the gate is passed and the criteria remain untested.** Criterion 1 needs a governing/non-governing ratio ≤ 2× after tuning — the *before* number is now measured on the right regime at 8.71×, which is the number that run has to beat, but no adapter has been trained at 8B. Criteria 2 (clean-context KL ≤ 0.002) and 3 (no regression) likewise have their baselines and no treatment. What this entry settles is narrower and was the thing blocking everything else: **the experiment is now pointed at a population where the phenomenon exists**, the metric has a true zero, and the query pool is no longer degenerate.
+
+Caveats: 48 items, one seed, one model. Cell sizes are 20 governing / 28 non-governing, so the four >0.05 items are four events and the one >0.2 is one; the mean ratio in particular rests on that single 0.4250 item, and dropping it would take the governing mean from 0.0373 to roughly 0.017 and the ratio from 8.71× to about 4×. The median ratio (4.03×) is the more robust of the two and is the one to hold the tuned run to. `--base-only` means the tuned and clean columns in that table are copies of the base by construction and carry no information. Session lengths were 4–8k as intended but were not recorded per item in this run.
+
+@acrosley 2026-08-19
