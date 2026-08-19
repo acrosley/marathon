@@ -99,9 +99,7 @@ def token_span(old_ids: list[int], new_ids: list[int]) -> Span:
     while p < len(old_ids) and p < len(new_ids) and old_ids[p] == new_ids[p]:
         p += 1
     s = 0
-    while (
-        s < len(old_ids) - p and s < len(new_ids) - p and old_ids[-1 - s] == new_ids[-1 - s]
-    ):
+    while s < len(old_ids) - p and s < len(new_ids) - p and old_ids[-1 - s] == new_ids[-1 - s]:
         s += 1
     return Span(p=p, e_old=len(old_ids) - p - s, e_new=len(new_ids) - p - s, s=s)
 
@@ -228,9 +226,7 @@ def greedy(model, cache, logits: torch.Tensor, n: int):
         if i == n - 1:
             break
         pos = torch.tensor([seen + i], device=logits.device)
-        mask = torch.zeros(
-            (1, 1, 1, seen + i + 1), dtype=model.dtype, device=logits.device
-        )
+        mask = torch.zeros((1, 1, 1, seen + i + 1), dtype=model.dtype, device=logits.device)
         out = model(
             input_ids=torch.tensor([[nxt]], device=logits.device),
             attention_mask=mask,
@@ -285,11 +281,14 @@ class Policy:
     def label(self) -> str:
         if not self.rerotate:
             return "no-rerotate"
-        return self.name or {
-            "none": "reuse-all",
-            "firstm": f"first-{self.m}",
-            "blend": f"blend-r{self.ratio:g}",
-        }[self.kind]
+        return (
+            self.name
+            or {
+                "none": "reuse-all",
+                "firstm": f"first-{self.m}",
+                "blend": f"blend-r{self.ratio:g}",
+            }[self.kind]
+        )
 
 
 @torch.no_grad()
@@ -367,12 +366,10 @@ def run_policy(
     cache = stitch(old_kv, span, tail, inv_freq, rotate=policy.rerotate)
     s_to = span.p + span.e_new
     # policy selection needs a candidate forward set: everything not reusable + all of S
-    probe_pos = torch.cat(
-        [fresh_always, torch.arange(s_to, s_to + span.s, device=device)]
-    ).sort().values
-    picked, extra = select(
-        model, policy, cache, span, all_ids[probe_pos], probe_pos, total
+    probe_pos = (
+        torch.cat([fresh_always, torch.arange(s_to, s_to + span.s, device=device)]).sort().values
     )
+    picked, extra = select(model, policy, cache, span, all_ids[probe_pos], probe_pos, total)
     positions = torch.cat([fresh_always, picked + s_to]).sort().values
 
     import time

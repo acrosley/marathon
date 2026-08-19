@@ -88,10 +88,49 @@ def build_session(turns: int, edit_turn: int, fact_gap: int) -> tuple[Session, d
 # new sequence* -- that is ground truth here, not our intent.
 
 _OLD_CODE, _NEW_CODE = "5520-DELTA", "9902-SIGMA"
-_FR = {"le", "la", "les", "de", "des", "du", "et", "est", "pour", "dans", "une",
-       "un", "sur", "avec", "ete", "qui", "plus", "cette", "sont", "nous"}
-_DE = {"der", "die", "das", "und", "ist", "mit", "auf", "den", "dem", "ein",
-       "eine", "wurde", "werden", "nicht", "von", "im", "sich", "auch", "wir"}
+_FR = {
+    "le",
+    "la",
+    "les",
+    "de",
+    "des",
+    "du",
+    "et",
+    "est",
+    "pour",
+    "dans",
+    "une",
+    "un",
+    "sur",
+    "avec",
+    "ete",
+    "qui",
+    "plus",
+    "cette",
+    "sont",
+    "nous",
+}
+_DE = {
+    "der",
+    "die",
+    "das",
+    "und",
+    "ist",
+    "mit",
+    "auf",
+    "den",
+    "dem",
+    "ein",
+    "eine",
+    "wurde",
+    "werden",
+    "nicht",
+    "von",
+    "im",
+    "sich",
+    "auch",
+    "wir",
+}
 
 
 def _lang(text: str) -> str:
@@ -110,20 +149,26 @@ def build_dep_anaphora(turns: int):
     """S refers back to the edited value *without restating it* ("that code")."""
     src = 2
     session = Session()
-    _log(session, turns, {
-        src: f" The mission code is {_OLD_CODE}.",
-        src + 3: (" As stated in the earlier entry above, that mission code is from now on "
-                  "the primary key for this project; whenever anyone asks for the primary "
-                  "key, answer with the mission code given in that entry."),
-        src + 6: (" Reminder: the primary key is exactly the mission code given above, "
-                  "copied verbatim, and no other value may be substituted for it."),
-    })
+    _log(
+        session,
+        turns,
+        {
+            src: f" The mission code is {_OLD_CODE}.",
+            src + 3: (
+                " As stated in the earlier entry above, that mission code is from now on "
+                "the primary key for this project; whenever anyone asks for the primary "
+                "key, answer with the mission code given in that entry."
+            ),
+            src + 6: (
+                " Reminder: the primary key is exactly the mission code given above, "
+                "copied verbatim, and no other value may be substituted for it."
+            ),
+        },
+    )
     new = session.messages[src * 2]["content"].replace(_OLD_CODE, _NEW_CODE)
     qs = [
-        ("primary-key", [_NEW_CODE], "What is the primary key?",
-         " The primary key is", 12),
-        ("mission", [_NEW_CODE], "What is the mission code?",
-         " The mission code is", 12),
+        ("primary-key", [_NEW_CODE], "What is the primary key?", " The primary key is", 12),
+        ("mission", [_NEW_CODE], "What is the mission code?", " The mission code is", 12),
         ("open", None, "Summarise the log so far.", "", 48),
     ]
     return session, src * 2, new, qs
@@ -132,10 +177,16 @@ def build_dep_anaphora(turns: int):
 def build_dep_instruction(turns: int):
     """Turn 0 flips a standing instruction that governs the *final* answer."""
     session = Session()
-    _log(session, turns, {
-        0: (" Standing instruction for this entire session: always write your replies "
-            "in French, whatever the language of the question."),
-    })
+    _log(
+        session,
+        turns,
+        {
+            0: (
+                " Standing instruction for this entire session: always write your replies "
+                "in French, whatever the language of the question."
+            ),
+        },
+    )
     new = session.messages[0]["content"].replace("in French", "in German")
     qs = [
         ("lang-pipeline", ["de"], "Describe the build pipeline in one sentence.", "", 40),
@@ -148,18 +199,29 @@ def build_dep_contradict(turns: int):
     """A new constraint is inserted mid-history that later text contradicts."""
     src = 10
     session = Session()
-    _log(session, turns, {
-        src + 3: (" The harbor code is 8814-OMEGA; quote it verbatim whenever anyone "
-                  "asks for the harbor code."),
-    })
+    _log(
+        session,
+        turns,
+        {
+            src + 3: (
+                " The harbor code is 8814-OMEGA; quote it verbatim whenever anyone "
+                "asks for the harbor code."
+            ),
+        },
+    )
     new = session.messages[src * 2]["content"] + (
         " Correction, authoritative and overriding every later mention in this log: "
         "the harbor code 8814-OMEGA has been revoked and is invalid; it must never be "
         "quoted again. The only valid harbor code is 4417-TANGO."
     )
     qs = [
-        ("harbor", ["4417-TANGO"], "What is the valid harbor code?",
-         " The valid harbor code is", 12),
+        (
+            "harbor",
+            ["4417-TANGO"],
+            "What is the valid harbor code?",
+            " The valid harbor code is",
+            12,
+        ),
         ("open", None, "\nuser: Summarise the log so far.\nassistant:", 48),
     ]
     return session, src * 2, new, qs
@@ -173,8 +235,13 @@ def build_edit(turns: int, edit_turn: int, gap: int, grow):
     if grow:
         new += " " + _paragraph(99, grow // 12 + 1)
     qs = [
-        (which, [_NEW_CODE if which == "edit" else code],
-         f"What is the {fact} code?", f" The {fact} code is", 12)
+        (
+            which,
+            [_NEW_CODE if which == "edit" else code],
+            f"What is the {fact} code?",
+            f" The {fact} code is",
+            12,
+        )
         for which, (fact, code) in facts.items()
     ]
     qs.append(("open", None, "Summarise the log so far.", "", 48))
@@ -188,16 +255,15 @@ def render(session: Session, tok=None) -> str:
     it, which silently turns every instruction-following test into a no-op.
     """
     if tok is None:
-        return _SYSTEM + "\n" + "\n".join(
-            f"{m['role']}: {m['content']}" for m in session.messages
-        )
+        return _SYSTEM + "\n" + "\n".join(f"{m['role']}: {m['content']}" for m in session.messages)
     return _template(tok, session.messages)
 
 
 def _template(tok, messages, add_generation_prompt=False) -> str:
     return tok.apply_chat_template(
         [{"role": "system", "content": _SYSTEM}, *messages],
-        tokenize=False, add_generation_prompt=add_generation_prompt,
+        tokenize=False,
+        add_generation_prompt=add_generation_prompt,
         enable_thinking=False,
     )
 
@@ -209,7 +275,7 @@ def question_text(tok, question: str, forced_prefix: str) -> str:
     head = _template(tok, [])
     full = _template(tok, [{"role": "user", "content": question}], True)
     assert full.startswith(head)
-    return full[len(head):] + forced_prefix
+    return full[len(head) :] + forced_prefix
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -221,20 +287,30 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--turns", type=int, default=20)
     ap.add_argument("--attn", default="sdpa", choices=["sdpa", "eager"])
     ap.add_argument("--max-new-tokens", type=int, default=12)
-    ap.add_argument("--open-tokens", type=int, default=48,
-                    help="greedy tokens for the open-ended (unforced) question")
+    ap.add_argument(
+        "--open-tokens",
+        type=int,
+        default=48,
+        help="greedy tokens for the open-ended (unforced) question",
+    )
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--scenario", default=None, help="run just this scenario")
-    ap.add_argument("--raw", action="store_true",
-                    help="plain transcript instead of the model's chat template")
+    ap.add_argument(
+        "--raw", action="store_true", help="plain transcript instead of the model's chat template"
+    )
     ap.add_argument("--json", default=None)
     args = ap.parse_args(argv)
 
     tok = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.bfloat16 if args.device == "cuda" else torch.float32,
-        attn_implementation=args.attn,
-    ).to(args.device).eval()
+    model = (
+        AutoModelForCausalLM.from_pretrained(
+            args.model,
+            dtype=torch.bfloat16 if args.device == "cuda" else torch.float32,
+            attn_implementation=args.attn,
+        )
+        .to(args.device)
+        .eval()
+    )
     dev = next(model.parameters()).device
 
     def _sync():
@@ -304,7 +380,7 @@ def main(argv: list[str] | None = None) -> int:
         t0 = time.perf_counter()
         old_kv, _ = prefill(model, old_ids)
         _sync()
-        print(f"   old-sequence prefill ({old_ids.shape[0]} tok): {time.perf_counter()-t0:.3f}s")
+        print(f"   old-sequence prefill ({old_ids.shape[0]} tok): {time.perf_counter() - t0:.3f}s")
 
         for which, expected, question, forced_prefix, n_tok in questions:
             q = ids(question_text(chat_tok, question, forced_prefix))
@@ -320,33 +396,61 @@ def main(argv: list[str] | None = None) -> int:
 
             rows = [
                 {
-                    **{k: ref[k] for k in ("policy", "recomputed_tokens", "recompute_frac",
-                                           "effective_frac", "prefill_s", "wall_s")},
-                    "text": ref_text, "exact": graded(ref_text)[0], "same_as_ref": True,
-                    "kl_first": 0.0, "kl_mean_forced": 0.0, "kl_max_forced": 0.0,
-                    "tf_top1_agree": 1.0, "greedy_prefix_agree": 1.0,
-                    "top1_match": True, "max_logit_diff": 0.0,
+                    **{
+                        k: ref[k]
+                        for k in (
+                            "policy",
+                            "recomputed_tokens",
+                            "recompute_frac",
+                            "effective_frac",
+                            "prefill_s",
+                            "wall_s",
+                        )
+                    },
+                    "text": ref_text,
+                    "exact": graded(ref_text)[0],
+                    "same_as_ref": True,
+                    "kl_first": 0.0,
+                    "kl_mean_forced": 0.0,
+                    "kl_max_forced": 0.0,
+                    "tf_top1_agree": 1.0,
+                    "greedy_prefix_agree": 1.0,
+                    "top1_match": True,
+                    "max_logit_diff": 0.0,
                 }
             ]
             for pol in policies:
-                got = run_policy(
-                    model, old_kv, span, new_ids, q, pol, n_tok, forced=ref["tokens"]
-                )
+                got = run_policy(model, old_kv, span, new_ids, q, pol, n_tok, forced=ref["tokens"])
                 text = tok.decode(got["tokens"])
                 ok, same = graded(text)
                 rows.append(
                     {
-                        **{k: got[k] for k in ("policy", "recomputed_tokens", "recompute_frac",
-                                               "effective_frac", "prefill_s", "wall_s")},
-                        "text": text, "exact": ok, "same_as_ref": same,
+                        **{
+                            k: got[k]
+                            for k in (
+                                "policy",
+                                "recomputed_tokens",
+                                "recompute_frac",
+                                "effective_frac",
+                                "prefill_s",
+                                "wall_s",
+                            )
+                        },
+                        "text": text,
+                        "exact": ok,
+                        "same_as_ref": same,
                         **compare(ref, got),
                     }
                 )
-            print(f"  -- question: {which} (expects {expected}, full recompute said "
-                  f"{ref_label[:44]!r})")
-            print(f"     {'policy':<16}{'frac':>7}{'eff':>7}{'prefill_s':>10}{'kl1':>9}"
-                  f"{'klmean':>9}{'klmax':>9}{'tf_top1':>9}{'agree':>7}{'exact':>7}"
-                  f"{'==ref':>7}  text")
+            print(
+                f"  -- question: {which} (expects {expected}, full recompute said "
+                f"{ref_label[:44]!r})"
+            )
+            print(
+                f"     {'policy':<16}{'frac':>7}{'eff':>7}{'prefill_s':>10}{'kl1':>9}"
+                f"{'klmean':>9}{'klmax':>9}{'tf_top1':>9}{'agree':>7}{'exact':>7}"
+                f"{'==ref':>7}  text"
+            )
             for r in rows:
                 print(
                     f"     {r['policy']:<16}{r['recompute_frac']:>7.3f}"
@@ -356,8 +460,11 @@ def main(argv: list[str] | None = None) -> int:
                     f"{str(r['exact']):>7}{str(r['same_as_ref']):>7}  {r['text']!r}"
                 )
                 report.append(
-                    {"scenario": name, "question": which,
-                     **{k: v for k, v in r.items() if k not in ("logits", "logits_seq")}}
+                    {
+                        "scenario": name,
+                        "question": which,
+                        **{k: v for k, v in r.items() if k not in ("logits", "logits_seq")},
+                    }
                 )
         del old_kv
         if dev.type == "cuda":
@@ -365,8 +472,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
-            json.dump({"model": args.model, "attn": args.attn, "rerotate_err": err,
-                       "rows": report}, f, indent=1)
+            json.dump(
+                {"model": args.model, "attn": args.attn, "rerotate_err": err, "rows": report},
+                f,
+                indent=1,
+            )
     if dev.type == "cuda":
         print(f"\npeak GPU MiB: {torch.cuda.max_memory_allocated() / 2**20:.0f}")
     return 0

@@ -37,7 +37,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
-
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
@@ -84,9 +83,9 @@ class ShiftConnectorMetadata(KVConnectorMetadata):
 class MarathonShiftConnector(KVConnectorBase_V1):
     def __init__(
         self,
-        vllm_config: "VllmConfig",
+        vllm_config: VllmConfig,
         role: KVConnectorRole,
-        kv_cache_config: "KVCacheConfig",
+        kv_cache_config: KVCacheConfig,
     ):
         super().__init__(vllm_config, role, kv_cache_config)
         self._bs = vllm_config.cache_config.block_size
@@ -110,9 +109,7 @@ class MarathonShiftConnector(KVConnectorBase_V1):
         head_dim = getattr(hf, "head_dim", None) or hf.hidden_size // hf.num_attention_heads
         rotary = int(head_dim * getattr(hf, "partial_rotary_factor", 1.0))
         theta = float(getattr(hf, "rope_theta", 10000.0))
-        self._inv_freq = 1.0 / (
-            theta ** (torch.arange(0, rotary, 2, dtype=torch.float32) / rotary)
-        )
+        self._inv_freq = 1.0 / (theta ** (torch.arange(0, rotary, 2, dtype=torch.float32) / rotary))
         self._rotary = rotary
 
     # ------------------------------------------------------------------ helpers
@@ -132,11 +129,11 @@ class MarathonShiftConnector(KVConnectorBase_V1):
 
     # ------------------------------------------------------------- scheduler side
 
-    def on_new_request(self, request: "Request") -> None:
+    def on_new_request(self, request: Request) -> None:
         self._params[request.request_id] = request.kv_transfer_params or {}
 
     def get_num_new_matched_tokens(
-        self, request: "Request", num_computed_tokens: int
+        self, request: Request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:
         plan = (self._params.get(request.request_id) or {}).get("load")
         if not plan:
@@ -164,21 +161,19 @@ class MarathonShiftConnector(KVConnectorBase_V1):
         return hi - num_computed_tokens, False
 
     def update_state_after_alloc(
-        self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
+        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ):
         if num_external_tokens > 0:
             self._need_load.add(request.request_id)
 
-    def build_connector_meta(self, scheduler_output: "SchedulerOutput"):
+    def build_connector_meta(self, scheduler_output: SchedulerOutput):
         meta = ShiftConnectorMetadata()
         for req in scheduler_output.scheduled_new_reqs:
             rid = req.req_id
             self._blocks[rid] = list(req.block_ids[0])
             if rid in self._need_load:
                 lo, hi, delta = self._plans[rid]
-                meta.loads.append(
-                    _Load(self._slots(self._blocks[rid], lo, hi), lo - delta, delta)
-                )
+                meta.loads.append(_Load(self._slots(self._blocks[rid], lo, hi), lo - delta, delta))
                 self._need_load.discard(rid)
             if (self._params.get(rid) or {}).get("save"):
                 lo = req.num_computed_tokens
@@ -203,7 +198,7 @@ class MarathonShiftConnector(KVConnectorBase_V1):
             self._plans.pop(rid, None)
         return meta
 
-    def request_finished(self, request: "Request", block_ids: list[int]):
+    def request_finished(self, request: Request, block_ids: list[int]):
         self._blocks.pop(request.request_id, None)
         self._params.pop(request.request_id, None)
         self._plans.pop(request.request_id, None)
@@ -243,7 +238,7 @@ class MarathonShiftConnector(KVConnectorBase_V1):
             self._store[name] = st
         return st
 
-    def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
+    def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
         meta = self._get_connector_metadata()
         if not isinstance(meta, ShiftConnectorMetadata) or not meta.loads:
             return
@@ -274,7 +269,11 @@ class MarathonShiftConnector(KVConnectorBase_V1):
                 kv[self._paged(kv, slots)] = torch.cat((k, src[..., d:]), dim=-1)
             logger.info(
                 "shift: loaded %d tokens x %d layers from store[%d:%d], delta=%d",
-                n, len(self._kv), load.src_start, load.src_start + n, load.delta,
+                n,
+                len(self._kv),
+                load.src_start,
+                load.src_start + n,
+                load.delta,
             )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -293,9 +292,9 @@ class MarathonShiftConnector(KVConnectorBase_V1):
             if save.dst_start + n > self._max_store:
                 continue
             slots = save.slots.to(kv_layer.device, non_blocking=True)
-            st[save.dst_start : save.dst_start + n] = kv_layer[
-                self._paged(kv_layer, slots)
-            ].to(st.device, non_blocking=True)
+            st[save.dst_start : save.dst_start + n] = kv_layer[self._paged(kv_layer, slots)].to(
+                st.device, non_blocking=True
+            )
 
     def wait_for_save(self):
         return

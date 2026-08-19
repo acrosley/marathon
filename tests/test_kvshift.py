@@ -82,7 +82,7 @@ def test_byte_span_agrees_with_the_delta_engine():
     head, tail = byte_span(base, target)
     assert head > 0 and tail > 0
     assert base[:head] == target[:head]
-    assert base[len(base) - tail:] == target[len(target) - tail:]
+    assert base[len(base) - tail :] == target[len(target) - tail :]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU-only stitching test")
