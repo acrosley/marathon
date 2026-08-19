@@ -54,6 +54,26 @@ def test_edit_is_one_contiguous_span(kind, corpus):
     assert changed.count(b"\n") <= 1, f"{kind} edit straddles canonical entries"
 
 
+def test_mid_governing_edit_lands_in_a_governing_user_turn_not_at_the_front(corpus):
+    """The whole point of this kind: governing semantics without the front position."""
+    item = build_item(1, "mid-governing", "prose", corpus, seed=7, min_tokens=800, max_tokens=1200)
+    msg = item.session.messages[item.msg_index]
+    assert item.msg_index > 1, "mid-governing must not be the system message"
+    assert msg["role"] == "user"
+    assert msg.get("governing") is True
+    # and the system prompt must NOT also carry a standing instruction, or the edit
+    # would be contradicted by an unedited copy of the same directive
+    assert "Standing instruction" not in item.session.messages[0]["content"]
+
+
+def test_early_fact_edit_sits_near_the_front(corpus):
+    """early-fact is the non-governing twin of a governing edit: same |S|, no flag."""
+    item = build_item(2, "early-fact", "prose", corpus, seed=7, min_tokens=800, max_tokens=1200)
+    assert item.msg_index in (3, 5), "turn 1 or 2, i.e. message 3 or 5"
+    assert not item.session.messages[item.msg_index].get("governing")
+    assert "at_new" in item.facts
+
+
 def test_governing_edit_lands_in_a_governing_message(corpus):
     item = build_item(1, "governing", "qa", corpus, seed=7, min_tokens=800, max_tokens=1200)
     assert item.msg_index == 0
@@ -61,7 +81,7 @@ def test_governing_edit_lands_in_a_governing_message(corpus):
     assert item.session.messages[0].get("governing") is True
 
 
-@pytest.mark.parametrize("kind", [k for k in EDIT_KINDS if k != "governing"])
+@pytest.mark.parametrize("kind", [k for k in EDIT_KINDS if "governing" not in k])
 def test_non_governing_edit_lands_in_a_user_turn(kind, corpus):
     item = build_item(2, kind, "code", corpus, seed=7, min_tokens=800, max_tokens=1200)
     assert item.session.messages[item.msg_index]["role"] == "user"
@@ -70,7 +90,7 @@ def test_non_governing_edit_lands_in_a_user_turn(kind, corpus):
 
 def test_delta_signs_match_the_edit_kind(corpus):
     """insert grows, delete shrinks, fact barely moves; rewrite may go either way."""
-    signs = {"insert": 1, "delete": -1, "fact": 0}
+    signs = {"insert": 1, "delete": -1, "fact": 0, "early-fact": 0, "mid-governing": 0}
     for kind, want in signs.items():
         item = build_item(3, kind, "qa", corpus, seed=11, min_tokens=800, max_tokens=1200)
         old = item.session.replay()

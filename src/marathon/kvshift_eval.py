@@ -209,9 +209,16 @@ _USER_ASK = {
 
 # tokens a user/assistant pair costs beyond its body: the ask, the reply, the
 # planted-fact sentence, the filler sentence, and the chat template's own markup.
+
 _PER_TURN_OVERHEAD = 60
 
-EDIT_KINDS = ["fact", "rewrite", "insert", "delete", "governing"]
+# The last two exist to break the confound the 2026-08-18 60-session run exposed:
+# ``governing`` edits are always at message 0, so "governing" and "at the front with a
+# huge |S|" were the same thing. These complete the 2x2 --
+#   fact          mid,   non-governing      governing      front, governing
+#   early-fact    front, non-governing      mid-governing  mid,   governing
+# with delta held near 0 in all four, so only position and the governing flag vary.
+EDIT_KINDS = ["fact", "rewrite", "insert", "delete", "governing", "early-fact", "mid-governing"]
 FAMILIES = ["code", "prose", "qa"]
 
 
@@ -240,9 +247,13 @@ def build_item(
     count = count_tokens or (lambda s: len(s) // 3)
     rng = random.Random((seed * 1_000_003) ^ (sid * 7919) ^ (EDIT_KINDS.index(edit_kind) * 31))
     instr_a, instr_b = _INSTRUCTIONS[rng.randrange(len(_INSTRUCTIONS))]
-    system = (
-        "You are a meticulous project assistant reading a long working log. "
-        f"Standing instruction for this entire session: {instr_a}. "
+    # for mid-governing the standing instruction moves out of the system prompt and into
+    # a mid-history user turn flagged governing, so the *only* difference from
+    # ``governing`` is where it sits
+    system = "You are a meticulous project assistant reading a long working log. " + (
+        "When asked for a code, reply with the code and nothing else."
+        if edit_kind == "mid-governing"
+        else f"Standing instruction for this entire session: {instr_a}. "
         "When asked for a code, reply with the code and nothing else."
     )
     nouns = rng.sample(_NOUNS, 3)
@@ -262,7 +273,11 @@ def build_item(
         bodies.append(body)
         used += count(body[1]) + _PER_TURN_OVERHEAD
     n_turns = max(6, len(bodies))
-    edit_turn = rng.randrange(2, max(3, n_turns - 2))
+    # early-fact edits turn 1 or 2, so |S| is nearly the whole history as it is for a
+    # governing edit; every other kind edits somewhere in the middle
+    edit_turn = (
+        rng.randrange(1, 3) if edit_kind == "early-fact" else rng.randrange(2, max(3, n_turns - 2))
+    )
     before_turn = rng.randrange(0, edit_turn)
     after_turn = rng.randrange(edit_turn + 1, n_turns)
 
@@ -279,7 +294,13 @@ def build_item(
         # the filler sentence is what the ``delete`` edit removes, so every user turn
         # carries exactly one and it is never the sentence holding a planted fact
         filler = _SENTENCES[(t + sid) % len(_SENTENCES)]
-        session.turn("user", f"Entry {t}.{planted} {filler} {ask}\n{body}")
+        standing = ""
+        governs = None
+        if edit_kind == "mid-governing" and t == edit_turn:
+            standing = f" Standing instruction from here on: {instr_a}."
+            governs = True
+        head = f"Entry {t}.{planted}{standing} {filler} {ask}"
+        session.turn("user", f"{head}\n{body}", governing=governs)
         session.turn(
             "assistant",
             f"Noted entry {t} ({name}). {rng.choice(_SENTENCES)} "
@@ -291,7 +312,9 @@ def build_item(
     item.meta = {
         "n_turns": n_turns,
         "edit_turn": edit_turn,
-        "instruction": instr_a if edit_kind != "governing" else f"{instr_a} -> {instr_b}",
+        "instruction": (
+            f"{instr_a} -> {instr_b}" if edit_kind in ("governing", "mid-governing") else instr_a
+        ),
     }
     item.queries = _queries(rng, facts, family, edit_kind)
     return item
@@ -309,7 +332,12 @@ def _stage_edit(rng, session, kind, edit_turn, facts, family, corpus):
     idx = 1 + edit_turn * 2  # +1 for the system message; each turn is a user/assistant pair
     old = session.messages[idx]["content"]
     head, body = old.split("\n", 1) if "\n" in old else (old, "")
-    if kind == "fact":  # identifier change, delta ~ 0 tokens
+    if kind == "mid-governing":  # same instruction flip as ``governing``, mid-history
+        for a, b in _INSTRUCTIONS:
+            if a in old:
+                return idx, old.replace(a, b)
+        raise AssertionError("no standing instruction found")  # pragma: no cover
+    if kind in ("fact", "early-fact"):  # identifier change, delta ~ 0 tokens
         new_code = _code(rng)
         while new_code == facts["at"][1]:
             new_code = _code(rng)
@@ -365,7 +393,7 @@ def _queries(rng, facts, family, edit_kind):
         )
     rng.shuffle(pool)
     picks = [fact_at, *pool[:2]]
-    if edit_kind == "governing" and not any(p[0] == "obey" for p in picks):
+    if edit_kind in ("governing", "mid-governing") and not any(p[0] == "obey" for p in picks):
         picks[-1] = obey  # a governing edit is only testable if something must obey it
     return picks
 
@@ -452,6 +480,75 @@ def print_table(title: str, rows: list[dict]) -> None:
             f"{r['kl_first_mean']:>9.4f}{r['kl_first_max']:>9.4f}{r['tf_top1']:>9.3f}"
             f"{r['exact']:>7.2f}{r['frac']:>7.3f}{r['over_005']:>6}{r['over_02']:>5}"
         )
+
+
+def spearman(xs: list[float], ys: list[float]) -> float:
+    """Rank correlation, ties averaged. Answers 'is the predictor monotone?'."""
+
+    def ranks(vs):
+        order = sorted(range(len(vs)), key=lambda i: vs[i])
+        out = [0.0] * len(vs)
+        i = 0
+        while i < len(order):
+            j = i
+            while j + 1 < len(order) and vs[order[j + 1]] == vs[order[i]]:
+                j += 1
+            avg = (i + j) / 2 + 1
+            for k in range(i, j + 1):
+                out[order[k]] = avg
+            i = j + 1
+        return out
+
+    n = len(xs)
+    if n < 3:
+        return float("nan")
+    rx, ry = ranks(xs), ranks(ys)
+    mx, my = statistics.fmean(rx), statistics.fmean(ry)
+    num = sum((a - mx) * (b - my) for a, b in zip(rx, ry, strict=True))
+    den = sum((a - mx) ** 2 for a in rx) ** 0.5 * sum((b - my) ** 2 for b in ry) ** 0.5
+    return num / den if den else float("nan")
+
+
+def bin_by(rows: list[dict], field: str, edges: list[float]) -> list[dict]:
+    """Bucket rows by a numeric field and report the KL distribution in each bucket.
+
+    This is the table that answers 'what is the actual predictor of divergence' —
+    run it over ``reuse-all`` rows with ``span_s`` (tokens downstream of the edit) and
+    with the downstream *fraction*, and read off where p95 KL crosses 0.05.
+    """
+    out = []
+    for lo, hi in zip(edges[:-1], edges[1:], strict=True):
+        rs = [r for r in rows if lo <= r[field] < hi]
+        if not rs:
+            continue
+        kl = [r["kl_mean_forced"] for r in rs]
+        out.append(
+            {
+                "bin": f"[{lo:g},{hi:g})",
+                "n": len(rs),
+                "kl_mean": statistics.fmean(kl),
+                "kl_median": statistics.median(kl),
+                "kl_p95": _pct(kl, 0.95),
+                "kl_max": max(kl),
+                "exact": statistics.fmean([float(r["exact_match"]) for r in rs]),
+                "over_005": sum(k > 0.05 for k in kl),
+            }
+        )
+    return out
+
+
+def print_bins(title: str, field: str, bins: list[dict]) -> None:
+    print(
+        f"\n### {title}\n{field:<16}{'n':>4}{'klmean':>9}{'klmed':>9}{'klp95':>9}"
+        f"{'klmax':>9}{'exact':>7}{'>.05':>6}"
+    )
+    for b in bins:
+        print(
+            f"{b['bin']:<16}{b['n']:>4}{b['kl_mean']:>9.4f}{b['kl_median']:>9.4f}"
+            f"{b['kl_p95']:>9.4f}{b['kl_max']:>9.4f}{b['exact']:>7.2f}{b['over_005']:>6}"
+        )
+    crossed = [b["bin"] for b in bins if b["kl_p95"] > 0.05]
+    print(f"p95 KL crosses 0.05 in: {crossed or 'no bin'}")
 
 
 # ----------------------------------------------------------------------- main
@@ -560,6 +657,7 @@ def main(argv: list[str] | None = None) -> int:
                 "byte_head": head,
                 "byte_tail": tail_b,
                 "prompt_tokens": int(new_ids.shape[0] + q.shape[0]),
+                "s_frac": span.s / max(1, int(new_ids.shape[0] + q.shape[0])),
             }
             rows.append(
                 {
@@ -628,9 +726,45 @@ def main(argv: list[str] | None = None) -> int:
     for title, table in tables:
         print_table(title, table)
 
+    # --- what actually predicts divergence: how much context sits after the edit ---
     reuse = [r for r in rows if r["condition"] == "reuse-all"]
-    gov = [r for r in reuse if r["edit_kind"] == "governing"]
-    non = [r for r in reuse if r["edit_kind"] != "governing"]
+    s_bins = bin_by(reuse, "span_s", [0, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 99999])
+    f_bins = bin_by(reuse, "s_frac", [0, 0.2, 0.4, 0.6, 0.8, 0.95, 1.01])
+    print_bins("reuse-all KL vs |S| (tokens downstream of the edit)", "|S| bin", s_bins)
+    print_bins("reuse-all KL vs downstream fraction |S|/prompt", "frac bin", f_bins)
+    kl = [r["kl_mean_forced"] for r in reuse]
+    print(
+        f"\nspearman(KL, |S|) = {spearman([r['span_s'] for r in reuse], kl):+.3f}   "
+        f"spearman(KL, |S|/prompt) = {spearman([r['s_frac'] for r in reuse], kl):+.3f}   "
+        f"spearman(KL, |delta|) = {spearman([abs(r['delta']) for r in reuse], kl):+.3f}"
+    )
+
+    # --- governing flag vs edit position, now that they are no longer confounded ---
+    print(
+        f"\n### governing flag x edit position (reuse-all)\n{'cell':<26}{'n':>4}"
+        f"{'klmean':>9}{'klmed':>9}{'klp95':>9}{'klmax':>9}{'exact':>7}{'meanS':>8}{'>.05':>6}"
+    )
+    cells = [
+        ("front, governing", ["governing"]),
+        ("front, non-governing", ["early-fact"]),
+        ("mid, governing", ["mid-governing"]),
+        ("mid, non-governing", ["fact"]),
+    ]
+    for name, kinds in cells:
+        rs = [r for r in reuse if r["edit_kind"] in kinds]
+        if not rs:
+            continue
+        k = [r["kl_mean_forced"] for r in rs]
+        print(
+            f"{name:<26}{len(rs):>4}{statistics.fmean(k):>9.4f}{statistics.median(k):>9.4f}"
+            f"{_pct(k, 0.95):>9.4f}{max(k):>9.4f}"
+            f"{statistics.fmean([float(r['exact_match']) for r in rs]):>7.2f}"
+            f"{statistics.fmean([r['span_s'] for r in rs]):>8.0f}"
+            f"{sum(x > 0.05 for x in k):>6}"
+        )
+
+    gov = [r for r in reuse if "governing" in r["edit_kind"]]
+    non = [r for r in reuse if "governing" not in r["edit_kind"]]
     print(
         f"\nreuse-all items over KL 0.2: {sum(r['kl_mean_forced'] > 0.2 for r in reuse)}"
         f"/{len(reuse)} (governing {sum(r['kl_mean_forced'] > 0.2 for r in gov)}/{len(gov)}, "
@@ -660,6 +794,8 @@ def main(argv: list[str] | None = None) -> int:
                     "n_items": len(items),
                     "history_tokens": lengths,
                     **{title.replace(" ", "_"): table for title, table in tables},
+                    "kl_vs_span_s": s_bins,
+                    "kl_vs_downstream_frac": f_bins,
                 },
                 f,
                 indent=1,

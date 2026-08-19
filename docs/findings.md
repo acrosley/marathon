@@ -404,3 +404,58 @@ Takeaway: over 60 realistic sessions and 200 graded items, position-shifted re-r
 Caveats: one model (`Qwen3-8B` bf16, sdpa) and one seed — the governing-vs-rewrite ordering rests on 38 vs 41 items and a second seed was not run. Sessions are synthetic, and although their material is real repo text, the turn structure is templated. `continue-code` is n=10 and `governing × obey` is n=12; those cells are indicative only. The three planted codes are the only hard-graded answers; `summarise`, `obey`, `continue-code` and `model-written` are graded solely by agreement with full recompute, which the `prefix-equiv` floor shows is a noisy target. And the position/size-vs-semantics reinterpretation above is an inference from a confounded design, not a controlled result: it needs a run that edits a large early non-governing turn.
 
 @acrosley 2026-08-18
+
+## 2026-08-18 — The 2x2 settles it: the predictor is the governing flag, not the edit's position or |S| — and this overturns the previous entry's reinterpretation
+
+Command: `scripts/kvshift_eval.sh --model Qwen/Qwen3-8B --sessions 84 --gen-tokens 32 --seed 1235` (same WSL2 stack: torch 2.13.0+cu130, transformers 5.15.0, sdpa, bf16, peak 19.7 GiB, 1675 s) · Model: `Qwen/Qwen3-8B` · Cost: $0.
+
+The previous entry ended by arguing that "governing" was only a proxy for "at the very front, so `S` is the whole history", because a standing instruction is always message 0 and the two were perfectly confounded. That argument was wrong, and this run — the discriminating experiment it asked for — says so. Two new edit kinds break the confound, giving a clean 2x2 with δ held near 0 in all four cells:
+
+* **`early-fact`** — a plain identifier swap in the user turn at position 1 or 2. Front position, huge `S`, **not** governing.
+* **`mid-governing`** — the standing instruction is moved out of the system prompt into a mid-history user turn flagged `governing=True` (the system prompt is left neutral, so no unedited copy of the directive survives to contradict the edit), and *that* turn is edited. Mid position, moderate `S`, **is** governing.
+
+Together with the existing `governing` (front, governing) and `fact` (mid, non-governing) that is the full factorial. 84 sessions = 7 edit kinds × 3 families × 4, seed 1235, 269 graded items — which also serves as the **second seed** for the original five kinds.
+
+```
+governing flag x edit position (reuse-all)
+cell                         n   klmean    klmed    klp95    klmax  exact   meanS  >.05
+front, governing            40   0.0264   0.0081   0.0601   0.3676   0.57    6060     4
+front, non-governing        39   0.0029   0.0018   0.0100   0.0132   0.87    5652     0
+mid, governing              38   0.0255   0.0040   0.1134   0.5133   0.68    3533     3
+mid, non-governing          39   0.0020   0.0012   0.0058   0.0110   0.67    3452     0
+```
+
+Read down the columns: **the governing flag moves mean KL by ~9x and the position moves it by nothing.** `early-fact` puts 5,652 tokens of stale-attention `S` after the edit — as much as the governing case's 6,060 — and is the *cleanest* cell in the run (0.0029, zero items over 0.05, exact 0.87). `mid-governing` has 3,533 tokens of `S`, barely more than plain `fact`, and is as damaging as a front governing edit (0.0255 vs 0.0264). The previous entry's size hypothesis predicted the exact opposite of both.
+
+**|S| is not the predictor, and there is no threshold to find.** Binned over all 269 reuse-all items, neither |S| nor the downstream fraction is monotone, and the bins that cross p95 = 0.05 are scattered rather than ordered (|S|: `[1000,2000)` and `[4000,5000)`; fraction: `[0,0.2)` and `[0.95,1.01)`). Rank correlations over all items: **spearman(KL, |S|) = −0.028**, **spearman(KL, |S|/prompt) = +0.042** — no relationship in either direction. The one numeric quantity that does correlate is the shift itself, spearman(KL, |δ|) = +0.237.
+
+Conditioning on the flag is what makes the picture snap into focus:
+
+```
+NON-GOVERNING only (n=191)                    GOVERNING only (n=78)
+|S| bin        n  klmean   klp95  >.05        |S| bin        n  klmean   klp95  >.05
+[0,2000)      19  0.0072  0.0152     1        [0,2000)       9  0.0671  0.5133     1
+[2000,3000)   48  0.0063  0.0147     0        [2000,3000)    3  0.0038  0.0062     0
+[3000,4000)   54  0.0080  0.0385     1        [3000,4000)    7  0.0028  0.0069     0
+[4000,5000)   29  0.0066  0.0268     1        [4000,5000)   28  0.0369  0.1978     4
+[5000,6000)   12  0.0018  0.0031     0        [5000,6000)    7  0.0073  0.0243     0
+[6000,8000)   29  0.0028  0.0100     0        [6000,8000)   24  0.0128  0.0589     2
+p95 crosses 0.05 in: no bin                   p95 crosses 0.05 in: 3 of 6 bins
+klmean 0.0061  p95 0.0229  >.05 3/191         klmean 0.0260  p95 0.1134  >.05 7/78
+>.2 0/191                                     >.2 2/78
+spearman(KL,|S|) = -0.162                     spearman(KL,|S|) = +0.058
+spearman(KL,|delta|) = +0.407                 spearman(KL,|delta|) = +0.311
+```
+
+**Among non-governing edits, p95 KL never crosses 0.05 in any |S| bin or any downstream-fraction bin**, right out to 8k tokens of `S` and a downstream fraction of 0.95+; the correlation with |S| is if anything mildly *negative* (−0.162). Among governing edits it crosses in half the bins with no ordering. Both items in the run above KL 0.2 are governing, and so are the top five items overall — the worst, `sid=69`, is a `mid-governing` edit with **|S| = 1,678 and a downstream fraction of 0.23**, i.e. the single most damaging item in 269 has one of the *smallest* `S` values. A size threshold would not have caught it and would have needlessly refused hundreds of large-|S| fact edits that are fine.
+
+**Seed reproducibility.** The five original kinds rank identically at seed 1235 (n=12 sessions each, as at 1234): fact 0.0020 (was 0.0023), insert 0.0055 (0.0067), delete 0.0062 (0.0115), rewrite 0.0141 (0.0167), governing 0.0264 (0.0350). Overall reuse-all is klmean 0.0119 / median 0.0030 / p95 0.0394 at 1.5% of tokens forwarded, against 0.0142 / 0.0035 / 0.0599 at 1.6% for seed 1234; 10/269 items over KL 0.05 and 2/269 over 0.2. `prefix-equiv` again forwards 68.2% for KL 0.0014 — a 45x cost ratio for a 8.5x KL difference. The `no-rerotate` control is again 6.8x worse (0.0812, 56/269 over 0.05, 25/269 over 0.2), and again the gap is concentrated exactly where δ is large: `rewrite` 0.0141 reused vs **0.3471** unrotated (25x), `delete` 0.0062 vs 0.1550, while `fact`/`early-fact`/`governing`, where δ ∈ {0,1}, show reuse-all ≈ no-rerotate as they must.
+
+**The `obey` cell, revisited.** With `mid-governing` in the mix there are now 58 `obey` items. Governing × obey is klmean 0.0161 / exact 0.46; governing × other queries is **0.0304** / exact 0.70; non-governing × obey is 0.0079 / exact 0.50. So the instruction-following query is *not* where governing edits do their damage — for the second run in a row the damage lands on the fact questions instead. What `obey` does have is a low exact-match under every condition, including `prefix-equiv` at 0.67, which is the reference-instability floor rather than a reuse effect. The mechanism is therefore not "the edited instruction steers the answer"; it is that `S`'s KV attended to the old instruction text and every later token's hidden state is subtly wrong, which shows up wherever the continuation is long enough to accumulate it.
+
+**What `reuse_plan`'s rule should be: exactly what it already is.** Keep the governing flag; do not add a position or |S| threshold, and do not replace the flag with one. Concretely, on this data the current rule refuses 78/269 items and catches both items over KL 0.2 and 7 of the 10 over 0.05; an |S|-based rule with any threshold would refuse far more and catch less. The one honest refinement available is that the flag is *conservative*: 71/78 governing items are under KL 0.05 and would have been fine reused, so `repair` (recompute a leading chunk of `S`) rather than `full` remains the right response — which is what `reuse_plan` already emits. The previous entry's proposed reinterpretation should be treated as retracted.
+
+Takeaway: with the confound broken, the governing flag is the predictor (9x on mean KL, all of the >0.2 tail) and edit position and |S| are not predictors at all — among non-governing edits p95 KL stays under 0.05 in every |S| bin out to 8k. `reuse_plan` keeps its rule unchanged. The 2026-08-18 entry that called "governing" a proxy for "at the front" is overturned by this one; the 2026-08-18 entry before it, which located the failure in governing/instruction spans, is restored — though its *mechanism* (the instruction steering generation) still does not hold, since the damage lands on fact queries, not on the instruction-following query.
+Caveats: one model (`Qwen3-8B` bf16, sdpa), two seeds. `mid-governing` is one synthetic construction of "a governing span that is not the system prompt" — a user turn carrying a standing instruction — and real sessions may carry governing content in forms this does not resemble. The 2x2 holds δ near 0 by design, so it says nothing about a *large* governing edit; `rewrite` is the only large-δ kind and it is non-governing. Cell sizes are 38-40 items (12 sessions each), so the two >0.2 items are 2 events and the KL means are not tightly bounded. `continue-code` is n=14. And as before, exact-match has a reference-instability floor (`prefix-equiv` 0.86 overall, 0.67 on `obey`), so the KL columns carry the argument.
+
+@acrosley 2026-08-18
