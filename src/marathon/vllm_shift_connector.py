@@ -15,7 +15,7 @@ K half re-rotated, and vLLM only has to prefill ``E'`` and the genuinely new tok
 
 Every request carries its reuse plan in ``kv_transfer_params``::
 
-    {"session": "<id>", "load": {"dst_start", "dst_end", "delta"}, "save": true}
+    {"session": "<id>", "load": {"dst_start", "dst_end", "delta"}, "save": true | "full"}
 
 * **session** — the store is keyed by it (:class:`marathon.shift_store.ShiftStore`),
   so sessions never read each other's KV, and a request without one is pass-through:
@@ -30,6 +30,10 @@ Every request carries its reuse plan in ``kv_transfer_params``::
   the session's flat ``[capacity, num_kv_heads, 2*head_size]`` buffer, indexed by
   absolute position. Positions are append-only within a turn; a save at an earlier
   ``dst_start`` truncates everything above it, which is exactly what an edit means.
+  ``save="full"`` re-gathers the *whole* prompt rather than only what this step
+  computed, which is how an edit turn puts the store back into the new position
+  coordinates; without it a session's second edit finds a store indexed by the layout
+  the first edit replaced, and degrades to a recompute.
 * **load** — the scheduler side reports ``dst_end - num_computed_tokens`` as
   externally available, so vLLM skips prefilling them; the worker copies them in from
   the session's buffer with K re-rotated by ``delta``. The scheduler side runs the
@@ -228,13 +232,28 @@ class MarathonShiftConnector(KVConnectorBase_V1):
             self._need_load.add(request.request_id)
 
     def _plan_save(self, meta: ShiftConnectorMetadata, rid: str, lo: int, hi: int) -> None:
-        """Record a save of the positions this step computed, if the store takes them."""
+        """Record a save of the positions this step computed, if the store takes them.
+
+        ``save="full"`` widens the save to ``[0, hi)`` instead of the positions this
+        step actually computed. That is what an *edit* turn needs: the store is a flat
+        position-indexed buffer, so a reused span cannot keep its old index once the
+        edited span before it changed length — the new sequence and the old one no
+        longer agree on where anything lives. Re-gathering the whole prompt out of the
+        paged cache (where the loaded span, the prefix-cache hits and the freshly
+        computed tokens are all resident by now) puts the store back into the *new*
+        coordinates, which makes the session append-only again and the next edit an
+        ordinary one. Loads for a step are all issued in ``start_load_kv`` before any
+        ``save_kv_layer`` runs, so this re-read can never race the load that fed it.
+        """
         session = self._table.session_of(rid)
         blocks = self._blocks.get(rid)
         if hi <= lo or not session or not blocks:
             return
-        if not (self._params.get(rid) or {}).get("save"):
+        mode = (self._params.get(rid) or {}).get("save")
+        if not mode:
             return
+        if mode == "full":
+            lo = 0
         if not self._store.reserve(session, lo, hi - lo):
             logger.warning("shift: session %s refused save of [%d,%d)", session, lo, hi)
             return

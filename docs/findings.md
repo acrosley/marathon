@@ -766,3 +766,37 @@ turn  prompt_tokens  shift prefill_s  control prefill_s  reused tokens  phases
 **Honest limits.** The connector store key carries an epoch that rolls after an edit turn, so a session's *second* edit re-saves under a fresh key with partial coverage and the store declines what it does not hold — safe (a recompute, never a wrong answer) but not fast. v1 therefore accelerates the first edit in a session and degrades gracefully after it; making repeated edits fast needs a save path that can write the loaded segments' new positions, which is not built. The demo is one run per configuration, not a distribution. The client advances its baseline when it builds a payload, so a rejected turn leaves it ahead of the server and the documented recovery is to drop the session. Single GPU, no tensor parallelism, and the HTTP layer is stdlib `http.server` with a lock around a blocking single-tenant engine — correct for one conversation at a time, not a serving front end.
 
 @acrosley 2026-08-19
+
+## 2026-08-19 — Every edit in a session now costs the same as the first: the store is rebuilt in the new coordinates for +5 ms
+
+The previous entry shipped `marathon.server` with an honest hole: only a session's *first* edit was fast. The connector's store key carried an epoch that rolled after an edit turn, so the second edit planned against a layout the first had replaced, the store declined the load, and the turn fell back to a full recompute. This closes it.
+
+**Why it broke.** `ShiftStore` is a flat position-indexed buffer — index *is* the token's absolute position. That is only meaningful in one set of coordinates at a time. An edit changes the length of the edited span, so everything after it moves; the reused span's KV is still correct, but its *index* now names the wrong position, and the freshly computed span cannot be written where it belongs without colliding with the old layout. No amount of bookkeeping on top of a contiguous buffer fixes that: the two layouts genuinely disagree about where things live.
+
+**The fix is one word in `kv_transfer_params`.** The edit turn's final request now sends `"save": "full"`, and the connector's `_plan_save` widens the save from "the positions this step computed" to `[0, hi)`. By the time `save_kv_layer` runs, the whole prompt is resident in the paged KV cache — the loaded span was scattered in by `start_load_kv`, the prefix hits are in shared blocks, the rest was just computed — so re-gathering it writes the store back at the *new* positions. `reserve` already treats a save at position 0 as a truncating rewrite, so the store comes back contiguous and the session is append-only again. The next edit is then an ordinary first edit. All of a step's loads are issued in `start_load_kv` before any `save_kv_layer`, so the re-read cannot race the load that fed it. The server's epoch bookkeeping is deleted.
+
+**Qwen3-0.6B, 24 turns, edits at 8 / 14 / 20, a code planted three turns before each:**
+
+```
+edit turn   prefill_s   tokens reused   connector load
+        8      0.0397            4227   store[604:4812]   delta=20  copy 2.33 ms
+       14      0.0451            7856   store[620:8460]   delta=20  copy 1.57 ms
+       20      0.0527           11487   store[636:12108]  delta=20  copy 2.03 ms
+```
+
+Answer on turn 23: `7391-KAPPA, 5820-OMEGA, 1146-SIGMA` — all three, including the code that has now survived three separate edit turns. Zero `declining reuse`, `refused save` or `no stored KV` warnings in the run. The load windows are the proof the fix works: edit 2 reads `store[620:8460]`, a window that only exists if the store was rewritten in the post-edit-1 coordinates. Under the old epoch scheme that read would have been declined.
+
+**Qwen3-14B-FP8, 24 turns, edits at 12 and 20, against the `--no-reuse` control:**
+
+| edit turn | history | control | Marathon shift | speedup | tokens reused |
+|---:|---:|---:|---:|---:|---:|
+| 12 | 7.8k | 0.651 s | **0.160 s** | 4.1× | 6604 |
+| 20 | 12.6k | 1.287 s | **0.184 s** | 7.0× | 11417 |
+
+The second edit is as fast as the first was, and matches the previous entry's single-edit number at the same length (0.179 s at 12.6k) to within 5 ms. Both modes answer `7391-KAPPA,5820-OMEGA`.
+
+**What the full re-save costs: about 5 ms, far less than expected.** The previous entry's single edit at 12.6k took 0.179 s with no save; the same edit with the whole 12.6k-token prompt re-gathered across 40 layers takes 0.184 s. The gather rides on memory bandwidth that the turn is not otherwise using, and it is paid only on edit turns — steady-state turns are untouched (0.09–0.12 s, identical to the control). Cheap enough that no cleverer scheme is worth building: the alternative designs (a free-list store with a logical→physical interval map, or a server-side remap mirroring the store) both trade this 5 ms for a substantially more complex invariant, and the store's contiguity is what makes the scheduler/worker mirror agree in the first place.
+
+**Limits.** Chunked prefill would make a `"full"` save re-gather a growing prefix on every step — correct but wasteful; chunked prefill interleaved with a load was already documented as untested and the server does not produce it. The re-save assumes the whole prompt is resident in the request's blocks, which is true for the phase driver's final request and not checked. Two runs per configuration, one length sweep point each. Everything else from the previous entry still stands: single GPU, no tensor parallelism, stdlib HTTP with a lock around a blocking engine.
+
+@acrosley 2026-08-19
