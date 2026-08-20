@@ -196,3 +196,23 @@ def test_the_first_save_may_start_above_zero():
     # ...but the store must not claim the head it never wrote
     assert not st.covers("a", 0, 1216)
     assert st.read("a", "layer0", 0, 16) is None
+
+
+def test_hnd_gather_permute_matches_separated_advanced_indexing():
+    """The save path's fast gather must be value-identical to the slow one it replaces.
+
+    On the HND layout ``kv[blk, :, off]`` separates two advanced indices with a slice,
+    which PyTorch services through its slow gather path. Permuting to NHD order first
+    makes the indices adjacent and hits the fast path; the permute is a view, so the
+    values must be identical. This pins that equivalence for both layouts.
+    """
+    torch = pytest.importorskip("torch")
+    blocks, heads, block_size, dim = 7, 4, 16, 8
+    slots = torch.tensor([0, 5, 17, 33, 71, 96, 111], dtype=torch.int64)
+    blk, off = slots // block_size, slots % block_size
+
+    hnd = torch.randn(blocks, heads, block_size, dim)
+    assert torch.equal(hnd[blk, :, off], hnd.permute(0, 2, 1, 3)[blk, off])
+
+    nhd = torch.randn(blocks, block_size, heads, dim)
+    assert nhd[blk, off].shape == (slots.numel(), heads, dim)

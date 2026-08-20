@@ -19,6 +19,7 @@ extra=""
 demote=""
 json=""
 maxstale=""
+maxchurn=""
 fixed=""
 factprobe=""
 repair=""
@@ -39,6 +40,7 @@ while [ $# -gt 0 ]; do
     --fixed-replies) fixed="--fixed-replies"; shift;;
     --fact-probe) factprobe="--fact-probe"; shift;;
     --max-stale) maxstale="$2"; shift 2;;
+    --max-churn) maxchurn="$2"; shift 2;;
     --repair-first) repair="$2"; shift 2;;
     --active-window) window="$2"; shift 2;;
     *) echo "unknown arg: $1"; exit 2;;
@@ -61,7 +63,7 @@ echo "=== $model $extra on port $port (server log: $log) ==="
 cd "$HOME"
 "$py" -m marathon.server --model "$model" --port "$port" --gpu-util "$gpu_util" \
   --max-model-len "$max_model_len" --store-tokens "$store_tokens" \
-  --max-tokens "$max_tokens" $extra ${maxstale:+--max-stale "$maxstale"} ${repair:+--repair-first "$repair"} ${window:+--active-window "$window"} > "$log" 2>&1 &
+  --max-tokens "$max_tokens" $extra ${maxstale:+--max-stale "$maxstale"} ${maxchurn:+--max-churn "$maxchurn"} ${repair:+--repair-first "$repair"} ${window:+--active-window "$window"} > "$log" 2>&1 &
 srv=$!
 trap 'kill $srv 2>/dev/null' EXIT
 

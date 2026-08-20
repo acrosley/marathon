@@ -127,6 +127,9 @@ class _Save:
     session: str
     slots: torch.Tensor  # [T] flat slot indices of the tokens computed this step
     dst_start: int  # first store position
+    #: (block, offset) index tensors on the compute device, built once per step and
+    #: reused across all layers -- see ``MarathonShiftConnector._gather``
+    idx: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 @dataclass
@@ -335,6 +338,32 @@ class MarathonShiftConnector(KVConnectorBase_V1):
         blk, off = slot // self._bs, slot % self._bs
         return (blk, slice(None), off) if self._hnd else (blk, off)
 
+    def _gather(self, kv: torch.Tensor, save: _Save) -> torch.Tensor:
+        """The tokens of ``save`` out of the paged cache, as ``[T, heads, 2*head_size]``.
+
+        Two things matter here and neither is obvious. First, the slot transfer and the
+        block/offset split are per *step*, not per layer: doing them inside the 40-layer
+        loop repeats an H2D copy and two integer divisions over the whole span forty
+        times. Second, on the HND layout the natural index ``kv[blk, :, off]`` separates
+        two advanced indices with a slice, which is PyTorch's slow gather path; a
+        ``permute`` to NHD order first makes them adjacent and hits the fast one. The
+        permute is a view, so it costs nothing.
+
+        Honest note on why this exists: it was written to explain the 5.2 s refresh turns
+        measured 2026-08-20 on Qwen3-14B, and it did not — the same run after this change
+        came back at 6.0 s, i.e. unchanged within run-to-run noise. So the refresh cost
+        lives somewhere else and is still open. This is kept only because it is strictly
+        less work than what it replaced and is pinned value-identical by
+        ``test_hnd_gather_permute_matches_separated_advanced_indexing``; it is not a fix
+        for anything measured.
+        """
+        if save.idx is None:
+            slot = save.slots.to(kv.device, non_blocking=True)
+            save.idx = (slot // self._bs, slot % self._bs)
+        blk, off = save.idx
+        src = kv.permute(0, 2, 1, 3) if self._hnd else kv
+        return src[blk, off]
+
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
         meta = self._get_connector_metadata()
         if not isinstance(meta, ShiftConnectorMetadata) or not meta.loads:
@@ -404,9 +433,8 @@ class MarathonShiftConnector(KVConnectorBase_V1):
             # Mirrors the scheduler's reserve for this step; idempotent across layers.
             if not self._store.reserve(save.session, save.dst_start, n):
                 continue
-            slot = save.slots.to(kv_layer.device, non_blocking=True)
             self._store.write(
-                save.session, layer_name, save.dst_start, kv_layer[self._paged(kv_layer, slot)]
+                save.session, layer_name, save.dst_start, self._gather(kv_layer, save)
             )
 
     def wait_for_save(self):
