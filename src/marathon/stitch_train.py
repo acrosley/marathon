@@ -470,7 +470,7 @@ def greedy_tokens(model, ids: torch.Tensor, gen_tokens: int, chunks: int = 1) ->
 
 
 @torch.no_grad()
-def reference_is_stable(model, ex: Example, gen_tokens: int, chunks: int = 2) -> bool:
+def reference_is_stable(model, ex: Example, forced: list[int], chunks: int = 2) -> bool:
     """Whether the teacher's own greedy continuation survives a benign path perturbation.
 
     The gate compares the student against *one* full recompute of the edited context. That
@@ -484,13 +484,19 @@ def reference_is_stable(model, ex: Example, gen_tokens: int, chunks: int = 2) ->
     47% of the governing bucket's total KL. Two runs of the *same* path agree on 120/120,
     so this is path-dependence rather than run-to-run randomness — which is exactly why
     averaging repeated identical passes buys nothing and a perturbation probe is needed.
+
+    ``forced`` is the teacher's greedy continuation, which the caller already has. Given it,
+    the probe costs one prefill and one *batched* teacher-forced pass rather than a second
+    31-step greedy decode: if the perturbed run's argmax equals ``forced`` at every
+    position, its free-running greedy decode would have produced ``forced`` exactly. Same
+    question, ~17% of an eval item instead of ~33%.
     """
-    return greedy_tokens(model, torch.cat([ex.new_ids, ex.query_ids]), gen_tokens, 1) == (
-        greedy_tokens(model, torch.cat([ex.new_ids, ex.query_ids]), gen_tokens, chunks)
-    )
+    ids = torch.cat([ex.new_ids, ex.query_ids])
+    seq = _clean_sequence(model, ids, forced, chunks=chunks)
+    return seq.argmax(-1).tolist() == list(forced)
 
 
-def _clean_sequence(model, ids: torch.Tensor, forced: list[int]) -> torch.Tensor:
+def _clean_sequence(model, ids: torch.Tensor, forced: list[int], chunks: int = 1) -> torch.Tensor:
     """Logit sequence over ``forced`` from a plain full recompute of ``ids``.
 
     Used for *both* the teacher and the student's clean-context anchor, deliberately: the
@@ -502,7 +508,7 @@ def _clean_sequence(model, ids: torch.Tensor, forced: list[int]) -> torch.Tensor
     also what keeps an 8B anchor affordable.
     """
     with torch.no_grad():
-        kv, first = _prefill(model, ids)
+        kv, first = _prefill(model, ids) if chunks <= 1 else _prefill_chunked(model, ids, chunks)
     cache = GradShiftCache([(k.detach(), v.detach()) for k, v in kv])
     if len(forced) <= 1:
         return first[None]
@@ -888,6 +894,7 @@ def evaluate(
     gen_tokens: int = 32,
     base_only: bool = False,
     ref_stability: bool = False,
+    on_row=None,
 ) -> list[dict]:
     """Per-example rows: reuse-all KL and clean-context KL, base vs adapted, plus accuracy.
 
@@ -899,11 +906,16 @@ def evaluate(
         tuned_clean_kl    damage: adapter on, clean cache (base's is 0 by construction)
         *_answer_ok       planted-fact answer contains the expected code (when there is one)
 
-    ``ref_stability`` adds one extra full recompute per item to record ``ref_stable`` — see
-    :func:`reference_is_stable`. It costs roughly a third more eval time and it is what
-    makes the gated statistic well posed, so gate runs set it and smoke tests do not.
+    ``ref_stability`` adds one prefill and one teacher-forced pass per item to record
+    ``ref_stable`` — see :func:`reference_is_stable`. It costs ~17% more eval time and it is
+    what makes the gated statistic well posed, so gate runs set it and smoke tests do not.
+
+    ``on_row`` is called with each row as it is produced. The gate run is ~1,200 items at
+    ~5 s each, and writing the file only at the end would make an hour and a half of GPU
+    time an all-or-nothing bet on nothing going wrong at item 1,199.
     """
     rows = []
+    t_start = time.perf_counter()
     for ex in examples:
         with adapters(loras, False):
             forced, teacher_seq = teacher_reference(model, ex, gen_tokens)
@@ -923,7 +935,7 @@ def evaluate(
                 tuned_clean = clean_logits(model, ex, forced)
 
         with adapters(loras, False):
-            stable = reference_is_stable(model, ex, gen_tokens) if ref_stability else None
+            stable = reference_is_stable(model, ex, forced) if ref_stability else None
 
         def ok(seq, expected=ex.expected):
             if expected is None or tok is None:
@@ -947,8 +959,18 @@ def evaluate(
                 "tuned_answer_ok": ok(tuned_seq),
             }
         )
-        if ex.old_ids.device.type == "cuda" and len(rows) % 25 == 0:
-            torch.cuda.empty_cache()
+        if on_row:
+            on_row(rows[-1])
+        if len(rows) % 25 == 0:
+            done, total = len(rows), len(examples)
+            rate = (time.perf_counter() - t_start) / done
+            print(
+                f"  eval {done}/{total} ({rate:.1f} s/item, "
+                f"~{rate * (total - done) / 60:.0f} min left)",
+                flush=True,
+            )
+            if ex.old_ids.device.type == "cuda":
+                torch.cuda.empty_cache()
     return rows
 
 
@@ -1346,6 +1368,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--mid-eval-items", type=int, default=24, help="sessions in each mid-training eval"
     )
+    ap.add_argument(
+        "--mid-eval-seed",
+        type=int,
+        default=None,
+        help="seed for the mid-training slice the checkpoint rule selects on. MUST differ "
+        "from the eval seed: it defaulted to --seed+2000, which for the standard "
+        "--seed 7001 training run is 9001 -- the eval seed -- so iteration 3 selected its "
+        "checkpoint using 24 items that were also in its 120-item held-out eval.",
+    )
     args = ap.parse_args(argv)
 
     tok, model, loras = _load(
@@ -1408,7 +1439,7 @@ def main(argv: list[str] | None = None) -> int:
                 tok,
                 dev,
                 args.mid_eval_items,
-                args.seed + 2000,
+                args.mid_eval_seed if args.mid_eval_seed is not None else args.seed + 2000,
                 args.gov_frac,
                 args.min_tokens,
                 args.max_tokens,
@@ -1522,14 +1553,24 @@ def main(argv: list[str] | None = None) -> int:
     # — which is why the bug survived three runs. It is also part of why the iteration-3
     # pre-check disagreed with the in-run base on 33/120 items: a loaded adapter changes the
     # allocation pattern, and that changes which kernels cuBLAS picks for everything after.
-    rows = evaluate(
-        model, loras, examples, tok, args.gen_tokens, args.base_only, args.ref_stability
-    )
+    with contextlib.ExitStack() as stack:
+        sink = stack.enter_context(open(args.jsonl, "w", encoding="utf-8")) if args.jsonl else None
+
+        def write_row(row):
+            sink.write(json.dumps(row) + "\n")
+            sink.flush()  # a killed run must keep the rows it already paid for
+
+        rows = evaluate(
+            model,
+            loras,
+            examples,
+            tok,
+            args.gen_tokens,
+            args.base_only,
+            args.ref_stability,
+            on_row=write_row if sink else None,
+        )
     print("\n" + report(rows))
-    if args.jsonl:
-        with open(args.jsonl, "w", encoding="utf-8") as f:
-            for row in rows:
-                f.write(json.dumps(row) + "\n")
     return 0
 
 

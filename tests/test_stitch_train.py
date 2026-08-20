@@ -844,11 +844,18 @@ def test_chunked_prefill_matches_the_single_shot_one(tiny):
 
 
 def test_reference_stability_probe_runs_and_evaluate_records_it(tiny):
-    from marathon.stitch_train import reference_is_stable
+    from marathon.stitch_train import reference_is_stable, teacher_reference
 
     model, loras = tiny
     ex = _example()
-    assert reference_is_stable(model, ex, 3) is True  # fp32 CPU: nothing to flip
+    forced, _ = teacher_reference(model, ex, 3)
+    assert reference_is_stable(model, ex, forced) is True  # fp32 CPU: nothing to flip
+    # a reference that is *not* what the perturbed run produces must read unstable
+    assert reference_is_stable(model, ex, [(forced[0] + 1) % VOCAB, *forced[1:]]) is False
     rows = evaluate(model, loras, [ex], None, 3, ref_stability=True)
     assert rows[0]["ref_stable"] is True
     assert evaluate(model, loras, [ex], None, 3)[0]["ref_stable"] is None  # off by default
+    # rows stream out as they are produced, so a killed run keeps what it paid for
+    seen = []
+    evaluate(model, loras, [ex, ex], None, 3, on_row=seen.append)
+    assert len(seen) == 2 and seen[0]["base_stitch_kl"] >= 0
