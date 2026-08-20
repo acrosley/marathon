@@ -1305,3 +1305,42 @@ grad-prefill          78/200 items expressive (cap 6000), 0 OOM fallbacks, peak 
 Caveats: one seed pair, one epoch, 200 training items, one model, n=120 held out, cells 46 governing / 14 standing / 60 non-governing. The base tail is 2 events and the governing mean is dominated by them — see finding (1) for why that is worse than it usually is. The mid-training curve uses a 24-item slice, so the selection rule is applied to noisy p95 estimates. `w=4`'s base column is the same run's base, but its *selected checkpoint* differs from `w=2`'s (step 200 vs 150), so the two arms differ in training length as well as in hinge weight and are not a clean one-variable comparison. `planted-fact ok` grades the arg-max of the teacher-forced sequence, not a free-running greedy decode. The dep-probe rows remain single runs on hand-built scenarios, not a distribution.
 
 @acrosley 2026-08-19
+
+## 2026-08-20 — Phase 2 × Phase 1 does not compose: on a paged workload, reuse turns are fast and wrong, refresh turns are right and slow
+
+The churn ceiling landed (`max_churn`, main), the two measurement bugs from yesterday are fixed — scored turns are now asked on *two consecutive* turns so they cannot phase-lock onto the reuse/refresh alternation, and the store is pre-sized from the active window — and the composition question can finally be answered. It is a no.
+
+**First, a correction to yesterday's entry.** I reported that cumulative cold count separated hit from miss with a boundary between 21 and 31. Re-checking every metric reconstructable from that run against the labels:
+
+| metric | hits | misses | separates? |
+|---|---|---|---|
+| sum abs delta | 7213, 7213 | 566, 7747, 7747, 7132, 7132 | no |
+| max abs delta | 5528, 5535 | 566, 4374, 4920, 3749, 4302 | only backwards |
+| churn / prompt | 0.944, 0.916 | 0.071, 1.026, 0.996, 0.956, 0.928 | no |
+| reused fraction | 0.745, 0.751 | 0.917, 0.731, 0.746, 0.728, 0.744 | no |
+| cold count | 13, 21 | **1**, 31, 39, 49, 57 | **no** |
+
+Cold count does not separate: turn 13 misses at cold=1. Yesterday I excluded it as "a second regime", which was fitting the outlier away. `max abs delta` separates only in the physically implausible direction (hits displaced *further*), which on two-versus-five points is noise. **No metric separates, and with 2 hits in 7 the honest reading is that reuse was unreliable throughout.** No threshold was fitted for this run; 0.25 and 1.0 were chosen to bracket the ~0.37 churn fraction a single paging turn carries, so the sweep measures the frontier rather than validating a fitted number.
+
+**Qwen3-14B-FP8, active window 8192, 40 turns, paged turns (13–39) only, against the same run with the connector off.**
+
+| condition | mean | p50 | max | speedup | fact EM |
+|---|---:|---:|---:|---:|---:|
+| control (connector off) | 0.725 s | 0.653 | 2.204 | 1.00× | **14/14** |
+| `max_churn=0.25` | 2.845 s | 2.520 | 11.282 | **0.25×** | 7/14 |
+| `max_churn=1.0` | 0.568 s | 0.263 | 3.519 | **1.27×** | 4/14 |
+
+And the same turns split by kind, which is what the sampling fix bought:
+
+| condition | reuse turns | refresh turns |
+|---|---|---|
+| `max_churn=0.25` | n=13, mean 0.269 s, **EM 2/8** | n=14, mean 5.238 s, EM 5/6 |
+| `max_churn=1.0` | n=22, mean 0.253 s, **EM 1/11** | n=5, mean 1.955 s, EM 3/3 |
+
+**The two halves fail in opposite directions.** A reuse turn is 2.7× faster than the control and answers correctly 25% / 9% of the time. A refresh turn answers correctly 5/6 and 3/3 — indistinguishable from the control — and costs 2.7–7× *more* than the control turn it replaces. Plain append turns are perfect on both axes (0.13 s, EM 6/6). The churn ceiling behaves exactly as a dial should — it moves the reuse fraction from 32% to 55% and EM moves with it, 0.50 → 0.29 — but there is no setting where both are good, because reuse itself is wrong at every churn level observed (`max_churn=0.25` holds churn under 0.248 and still scores 2/8). The best latency on offer is **1.27× at EM 0.29 against a control of 1.00**. That is not a win; it is a 71-point correctness regression bought for 27% latency.
+
+**Why a refresh turn costs more than the full prefill it is equivalent to, and what it is not.** A refresh recomputes the whole window, exactly as the control does, so it should cost what the control costs (0.725 s). It costs 5.2 s. The store is not the cause: pre-sizing worked, and the run logs zero evictions, zero refusals, and loads at 2.8 ms for 665 MB (229 GB/s). The save volume is not the cause either — `saved_token_layers` over the run is one pass per turn, as the CPU harness predicted. I tested one concrete hypothesis on hardware: the save path gathers with `kv[blk, :, off]`, which on the HND layout (this model's) separates two advanced indices with a slice and takes PyTorch's slow path, while loads go through the fused Triton kernel; and the slot transfer and block/offset split were being repeated inside the 40-layer loop. Hoisting both and permuting to make the indices adjacent came back at **6.0 s against 5.2 s — unchanged within noise**. The hypothesis is wrong and the refresh cost is still unexplained. The change is kept because it is strictly less work and is pinned value-identical by a test, but it is labelled in the source as fixing nothing measured.
+
+**Limits.** One run per cell, one model, one window, one paging policy; 14 scored turns per condition. The reuse/refresh EM split is the strongest result here (2/8 and 1/11 against 5/6 and 3/3) and it rests on 14 and 14 scored turns. The refresh-turn cost is measured but not diagnosed; until it is, even "refresh everything" is worse than simply turning the connector off on a paged workload, which is the current recommendation.
+
+@acrosley 2026-08-20
