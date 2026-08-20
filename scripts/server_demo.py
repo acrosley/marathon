@@ -99,17 +99,16 @@ def main(argv: list[str] | None = None) -> int:
         # 'Ok.' and call a corrupted cache a match.
         want = None
         if args.fact_probe:
-            # Exactly one code is alive at a time: it is planted every 4th turn and the
-            # previous one has already been demoted to a stub by the time the next is
-            # planted, so "the access code" is unambiguous and a 0.6B can answer it.
-            # The question lands one turn later, while the code sits inside the *reused*
-            # span. Exact match on it is the decision-grade signal; an open-ended prompt
-            # only ever shows paraphrase drift.
+            # One code alive at a time, planted every 4th turn. The question is asked on
+            # the *two* turns after it, not one: with a reuse/refresh alternation every
+            # other turn, a single fixed offset locks every scored turn onto the same
+            # phase, and the 2026-08-19 14B run scored 7 reuse turns and 0 refresh turns
+            # without noticing. Asking twice covers both parities.
             if t % 4 == 0:
                 fact = f"The access code is {code_for(t)}. "
                 request = "Reply ok."
-            elif t % 4 == 1 and t >= 1:
-                want = code_for(t - 1)
+            elif t % 4 in (1, 2) and t >= 1:
+                want = code_for(t - (t % 4))
                 request = "What is the access code? Answer with only the code."
             else:
                 request = "Reply ok."
