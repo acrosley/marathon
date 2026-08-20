@@ -423,6 +423,73 @@ def _prefill(model, ids: torch.Tensor):
     return [(lyr.keys, lyr.values) for lyr in cache.layers], out.logits[0, -1]
 
 
+def _prefill_chunked(model, ids: torch.Tensor, chunks: int = 2):
+    """:func:`_prefill` with the prompt fed in ``chunks`` pieces instead of one.
+
+    Mathematically identical — same tokens, same causal mask, same weights — but the matmul
+    shapes differ, so cuBLAS may pick a different kernel and sum in a different order. In
+    bf16 that is enough to move a logit by a ULP, which is enough to flip an argmax that was
+    a near-tie. That is the whole point: it is a *benign* perturbation, and any answer that
+    changes under it was never determined by the model in the first place.
+    """
+    from transformers.cache_utils import DynamicCache
+
+    cache = DynamicCache(config=model.config)
+    n = int(ids.shape[0])
+    size = max(1, (n + chunks - 1) // chunks)
+    logits = None
+    for start in range(0, n, size):
+        piece = ids[start : start + size]
+        out = model(input_ids=piece[None], past_key_values=cache, use_cache=True, logits_to_keep=1)
+        logits = out.logits[0, -1]
+    return [(lyr.keys, lyr.values) for lyr in cache.layers], logits
+
+
+@torch.no_grad()
+def greedy_tokens(model, ids: torch.Tensor, gen_tokens: int, chunks: int = 1) -> list[int]:
+    """The teacher's greedy continuation of ``ids``, optionally via a chunked prefill."""
+    kv, logits = _prefill(model, ids) if chunks <= 1 else _prefill_chunked(model, ids, chunks)
+    cache = GradShiftCache([(k, v) for k, v in kv])
+    toks: list[int] = []
+    for i in range(gen_tokens):
+        toks.append(int(logits.argmax()))
+        if i == gen_tokens - 1:
+            break
+        seen = cache.get_seq_length()
+        logits = _forward_at(
+            model,
+            cache,
+            torch.tensor([toks[-1]], device=ids.device),
+            torch.tensor([seen], device=ids.device),
+            seen + 1,
+            1,
+            scatter=False,
+        )[-1]
+    del cache, kv
+    return toks
+
+
+@torch.no_grad()
+def reference_is_stable(model, ex: Example, gen_tokens: int, chunks: int = 2) -> bool:
+    """Whether the teacher's own greedy continuation survives a benign path perturbation.
+
+    The gate compares the student against *one* full recompute of the edited context. That
+    is only a meaningful reference if the full recompute itself is determined: if two
+    mathematically identical recomputes of the same text disagree about the next token, the
+    model is at a near-tie there, and the resulting KL says which arbitrary branch the
+    reference happened to take — not whether stitched KV changed the model's behaviour.
+
+    Measured on iteration 3's data, this is not a hypothetical: 33 of 120 items changed
+    value between the ``--base-only`` and the full-eval code paths, and those items carry
+    47% of the governing bucket's total KL. Two runs of the *same* path agree on 120/120,
+    so this is path-dependence rather than run-to-run randomness — which is exactly why
+    averaging repeated identical passes buys nothing and a perturbation probe is needed.
+    """
+    return greedy_tokens(model, torch.cat([ex.new_ids, ex.query_ids]), gen_tokens, 1) == (
+        greedy_tokens(model, torch.cat([ex.new_ids, ex.query_ids]), gen_tokens, chunks)
+    )
+
+
 def _clean_sequence(model, ids: torch.Tensor, forced: list[int]) -> torch.Tensor:
     """Logit sequence over ``forced`` from a plain full recompute of ``ids``.
 
@@ -820,6 +887,7 @@ def evaluate(
     tok=None,
     gen_tokens: int = 32,
     base_only: bool = False,
+    ref_stability: bool = False,
 ) -> list[dict]:
     """Per-example rows: reuse-all KL and clean-context KL, base vs adapted, plus accuracy.
 
@@ -830,6 +898,10 @@ def evaluate(
         tuned_stitch_kl   the same run with the adapter on
         tuned_clean_kl    damage: adapter on, clean cache (base's is 0 by construction)
         *_answer_ok       planted-fact answer contains the expected code (when there is one)
+
+    ``ref_stability`` adds one extra full recompute per item to record ``ref_stable`` — see
+    :func:`reference_is_stable`. It costs roughly a third more eval time and it is what
+    makes the gated statistic well posed, so gate runs set it and smoke tests do not.
     """
     rows = []
     for ex in examples:
@@ -850,6 +922,9 @@ def evaluate(
                 tuned_seq = stitched_logits(model, ex, tuned_old_kv, forced)
                 tuned_clean = clean_logits(model, ex, forced)
 
+        with adapters(loras, False):
+            stable = reference_is_stable(model, ex, gen_tokens) if ref_stability else None
+
         def ok(seq, expected=ex.expected):
             if expected is None or tok is None:
                 return None
@@ -863,6 +938,7 @@ def evaluate(
                 "family": ex.family,
                 "qtype": ex.qtype,
                 "governing": "governing" in ex.edit_kind,
+                "ref_stable": stable,
                 "base_stitch_kl": float(kl_to(teacher_seq, base_seq)),
                 "tuned_stitch_kl": float(kl_to(teacher_seq, tuned_seq)),
                 "tuned_clean_kl": float(kl_to(teacher_seq, tuned_clean)),
@@ -874,6 +950,104 @@ def evaluate(
         if ex.old_ids.device.type == "cuda" and len(rows) % 25 == 0:
             torch.cuda.empty_cache()
     return rows
+
+
+# ------------------------------------------------------------------- gated statistics
+#
+# Iteration 3 established that the ratio-of-means the first three iterations gated on is
+# not a measurable quantity at this sample size. Two facts, both from that run's data:
+#
+#   * The base measurement is *exactly* reproducible for a fixed code path (two separate
+#     full evals agree on 120/120 items) and *not* reproducible across paths (the
+#     ``--base-only`` pre-check disagrees on 33/120). So the noise is path-dependent, not
+#     stochastic, and averaging k repeats of one path returns k identical numbers.
+#   * 47% of the governing bucket's total KL sits on the 12 items (of 46) whose reference
+#     moves under a benign perturbation. A ratio of two means each dominated by such items
+#     cannot resolve the differences the gates argue over.
+#
+# The replacement is the paired per-item delta: for one item, in one pass, against one
+# teacher, ``tuned - base``. Everything that makes the absolute level unreliable — which
+# branch of a near-tie the teacher took, which kernel cuBLAS picked — is shared by both
+# columns and cancels. What is left is sampling uncertainty over items, which is what the
+# bootstrap interval reports and what more items would actually reduce.
+
+PAIRED_RESAMPLES = 10_000
+
+
+def trimmed_mean(values: list[float], trim: float = 0.2) -> float:
+    """Mean after dropping ``trim`` of the mass from each end (0.2 -> the 20% trimmed mean)."""
+    ordered = sorted(values)
+    if not ordered:
+        raise ValueError("trimmed_mean of an empty sample")
+    k = int(len(ordered) * trim)
+    kept = ordered[k : len(ordered) - k] or ordered
+    return statistics.fmean(kept)
+
+
+def bootstrap_ci(
+    values: list[float],
+    resamples: int = PAIRED_RESAMPLES,
+    alpha: float = 0.05,
+    seed: int = 20260820,
+    statistic=statistics.fmean,
+) -> tuple[float, float]:
+    """Percentile bootstrap interval for ``statistic`` over ``values``.
+
+    Seeded, so a reported interval is reproducible from the same rows. The percentile
+    method is used rather than BCa deliberately: with n≈46 and a heavy right tail the
+    acceleration term is itself poorly estimated, and a slightly conservative interval is
+    the right failure mode for a gate.
+    """
+    if not values:
+        raise ValueError("bootstrap_ci of an empty sample")
+    if len(values) == 1:
+        return (float(values[0]), float(values[0]))
+    rng = random.Random(seed)
+    n = len(values)
+    stats = sorted(
+        statistic([values[rng.randrange(n)] for _ in range(n)]) for _ in range(resamples)
+    )
+    lo = stats[max(0, int((alpha / 2) * resamples) - 1)]
+    hi = stats[min(resamples - 1, int((1 - alpha / 2) * resamples))]
+    return (float(lo), float(hi))
+
+
+def paired_deltas(rows: list[dict], base="base_stitch_kl", tuned="tuned_stitch_kl") -> list[float]:
+    """Per-item ``tuned - base``, both measured in the same pass against the same teacher."""
+    return [r[tuned] - r[base] for r in rows]
+
+
+def delta_summary(
+    rows: list[dict],
+    base="base_stitch_kl",
+    tuned="tuned_stitch_kl",
+    resamples: int = PAIRED_RESAMPLES,
+) -> dict:
+    """The gated statistic for one bucket: mean paired delta with a bootstrap interval.
+
+    ``improved`` is a sign test that needs no distributional assumption at all, and is
+    reported next to the mean because a mean delta can be carried by one item while the
+    sign test says half the population got worse.
+    """
+    deltas = paired_deltas(rows, base, tuned)
+    if not deltas:
+        return {"n": 0}
+    lo, hi = bootstrap_ci(deltas, resamples)
+    return {
+        "n": len(deltas),
+        "mean": statistics.fmean(deltas),
+        "median": statistics.median(deltas),
+        "trimmed": trimmed_mean(deltas),
+        "ci_lo": lo,
+        "ci_hi": hi,
+        "improved": sum(d < 0 for d in deltas),
+        "significant": hi < 0 or lo > 0,
+    }
+
+
+def stable_rows(rows: list[dict]) -> list[dict]:
+    """Rows whose reference survived the perturbation probe (or that were never probed)."""
+    return [r for r in rows if r.get("ref_stable") is not False]
 
 
 def _agg(rows: list[dict], key: str) -> dict:
@@ -985,8 +1159,36 @@ def report(rows: list[dict]) -> str:
                 n = fn([r[f"{tag}_stitch_kl"] for r in non])
                 out.append(
                     f"{tag:<16}{label}governing/non-governing {stat} KL ratio "
-                    f"= {g / max(n, 1e-9):.2f}x  ({g:.4f} / {n:.4f})"
+                    f"= {g / max(n, 1e-9):.2f}x  ({g:.4f} / {n:.4f})   [descriptive only]"
                 )
+
+    # --- the gated statistic ---------------------------------------------------------
+    probed = [r for r in rows if r.get("ref_stable") is not None]
+    if probed:
+        unstable = [r for r in probed if not r["ref_stable"]]
+        share = sum(r["base_stitch_kl"] for r in unstable) / max(
+            sum(r["base_stitch_kl"] for r in probed), 1e-12
+        )
+        out.append(
+            f"\nreference stability: {len(probed) - len(unstable)}/{len(probed)} stable; "
+            f"the {len(unstable)} unstable carry {100 * share:.0f}% of total base KL "
+            f"(excluded from the gate, reported here)"
+        )
+    out.append(
+        f"\n{'bucket (stable only)':<24}{'n':>4}{'mean delta':>12}{'95% CI':>24}"
+        f"{'median':>10}{'trim20':>10}{'improved':>10}"
+    )
+    for name, rs in buckets:
+        rs = stable_rows(rs)
+        if not rs:
+            continue
+        d = delta_summary(rs)
+        ci = f"[{d['ci_lo']:+.5f}, {d['ci_hi']:+.5f}]"
+        imp = f"{d['improved']}/{d['n']}"
+        out.append(
+            f"{name:<24}{d['n']:>4}{d['mean']:>+12.5f}{ci:>24}"
+            f"{d['median']:>+10.5f}{d['trimmed']:>+10.5f}{imp:>10}"
+        )
     return "\n".join(out)
 
 
@@ -1104,6 +1306,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--jsonl", default=None)
     ap.add_argument("--probe-turns", type=int, default=20)
     ap.add_argument("--base-only", action="store_true", help="skip the tuned columns")
+    ap.add_argument(
+        "--ref-stability",
+        action="store_true",
+        help="probe whether each item's teacher survives a benign path perturbation; "
+        "unstable items are excluded from the gated statistic (one extra recompute/item)",
+    )
     ap.add_argument(
         "--grad-prefill",
         action="store_true",
@@ -1308,7 +1516,15 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
 
-    rows = evaluate(model, loras, examples, tok, args.gen_tokens)
+    # `--base-only` was accepted but never forwarded until 2026-08-20, so the pre-check ran
+    # the full path at double cost. It produced the *right* numbers anyway — with no
+    # `--lora` the adapter is identity, so the tuned columns equal the base ones bit for bit
+    # — which is why the bug survived three runs. It is also part of why the iteration-3
+    # pre-check disagreed with the in-run base on 33/120 items: a loaded adapter changes the
+    # allocation pattern, and that changes which kernels cuBLAS picks for everything after.
+    rows = evaluate(
+        model, loras, examples, tok, args.gen_tokens, args.base_only, args.ref_stability
+    )
     print("\n" + report(rows))
     if args.jsonl:
         with open(args.jsonl, "w", encoding="utf-8") as f:

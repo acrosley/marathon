@@ -1305,3 +1305,63 @@ grad-prefill          78/200 items expressive (cap 6000), 0 OOM fallbacks, peak 
 Caveats: one seed pair, one epoch, 200 training items, one model, n=120 held out, cells 46 governing / 14 standing / 60 non-governing. The base tail is 2 events and the governing mean is dominated by them — see finding (1) for why that is worse than it usually is. The mid-training curve uses a 24-item slice, so the selection rule is applied to noisy p95 estimates. `w=4`'s base column is the same run's base, but its *selected checkpoint* differs from `w=2`'s (step 200 vs 150), so the two arms differ in training length as well as in hinge weight and are not a clean one-variable comparison. `planted-fact ok` grades the arg-max of the teacher-forced sequence, not a free-running greedy decode. The dep-probe rows remain single runs on hand-built scenarios, not a distribution.
 
 @acrosley 2026-08-19
+
+## 2026-08-20 — The measurement was the result: on reference-stable items the adapter's governing effect is one session, and the gate had 18% power
+
+Command: CPU-only re-analysis of the 2026-08-19 eval rows (`stitch8b_it3_basecheck.jsonl`, `stitch8b_w2.0_eval.jsonl`, `stitch8b_w4_eval.jsonl`) plus the rewritten statistics in `marathon.stitch_train` · Model: none — no GPU was used · Cost: $0.
+
+Iteration 3 closed by reporting that the base measurement was not reproducible across runs and recommending that the metric be fixed before more training. Following that up did not produce a better version of the previous result; it removed it.
+
+**First: the variation is path dependence, not noise, so averaging cannot help.** Three base passes over the same 120 items exist. The base columns of the `w=2` and `w=4` evals agree on **120/120 items, bit for bit** — two separate processes, two different adapters, identical numbers. The `--base-only` pre-check disagrees with them on **33/120**. The mechanism is that loading an adapter changes the allocation pattern, which changes cuBLAS kernel selection, which in bf16 changes a reduction order, which moves a logit by a ULP — enough to flip an argmax that was a near-tie, after which the entire 32-token teacher-forced continuation differs. Yesterday's entry called this "bf16 non-determinism", which was half right and misleading in its practical consequence: **k repeated passes of the same path return k identical numbers.** Seed- or pass-averaging, the obvious remedy, buys exactly nothing here. Only a deliberate perturbation is informative.
+
+Two corollaries were also found while checking this. `--base-only` was accepted by the CLI and **never forwarded to `evaluate`** (fixed), so the pre-check ran the full path at double cost for three runs — it still produced correct numbers, because with no `--lora` the adapter is identity and the tuned columns equal the base ones bit for bit, which is why it went unnoticed. And it is part of *why* the pre-check disagreed with the in-run base at all.
+
+**Second, and this is the result: restricted to items whose reference is stable, the governing effect is not there.** Stability is now measured directly — recompute the teacher with the prefill in two chunks instead of one (same tokens, same mask, same weights, different matmul shapes) and compare greedy continuations. Applying the paired per-item delta to the `w=2` arm:
+
+```
+bucket           set      n   mean delta         95% CI          median    trim20  improved
+governing        all     46    -0.00498  [-0.01369, +0.00007]  -0.00007  -0.00022     24/46
+governing        stable  34    -0.00509  [-0.01593, +0.00094]  +0.00008  -0.00004     16/34
+standing-gov     stable  14    -0.00080  [-0.00238, +0.00059]  +0.00043  -0.00037      6/14
+non-governing    stable  39    +0.00054  [-0.00011, +0.00126]  +0.00009  +0.00021     17/39
+
+w=4 governing    stable  34    -0.00495  [-0.01905, +0.00341]  +0.00015  +0.00006     15/34
+```
+
+Every interval straddles zero. The sign test is **16/34** for `w=2` and **15/34** for `w=4` — worse than a coin flip in the second case. And the mean is not describing the population at all:
+
+```
+sum of all 34 stable governing deltas                 -0.1732
+  ... of which the single largest improver            -0.1723
+mean excluding that one item                        -0.000027   (mean with it: -0.005093)
+stable governing items crossing below klmean 0.05:  0 fixed, 0 newly broken  (1 -> 1)
+stable governing items crossing below klmean 0.2:   0 fixed, 0 newly broken  (1 -> 1)
+```
+
+**One session out of 34 accounts for the entire governing improvement, and it did not even get fixed** — it was over 0.2 before and it is over 0.2 after. Nothing crossed either threshold in either direction. The 12 unstable governing items that were excluded carry 47% of the bucket's total base KL, which is precisely why the ratio-of-means looked like it was moving.
+
+**Retrospective power, simulated from the observed per-item delta distribution:**
+
+| stable items per bucket | 46 | 100 | 200 | 400 | 800 |
+|---|---|---|---|---|---|
+| superiority (governing) | **18%** | 54% | 87% | 100% | 100% |
+| non-inferiority (non-governing, 20% tolerance) | 25% (n=39) | 38% | 64% | 90% | 100% |
+
+At the n every gate run in this phase has used, the test had **18% power against its own observed effect**. That is the whole story of iterations 1–3: "governing mean KL −43%, −51%, −18%" were three draws from a statistic that cannot resolve the thing it was measuring, on a population where a quarter of the items have an undetermined reference.
+
+**What is now pre-registered** (in [phase3-design.md](phase3-design.md), superseding the aggregation and sample size of the original criteria; the per-item metric `klmean` is unchanged, so training and eval still optimise the same quantity):
+
+- The gated statistic is the **paired per-item delta** — one item, one pass, one teacher, `tuned − base` — with a 10,000-resample percentile bootstrap CI. Shared per-item offsets cancel exactly; ratio-of-means is demoted to a descriptive line and never gated.
+- **Reference-unstable items are excluded and reported**, with their count and their share of total KL.
+- **Mean, median and 20% trimmed mean are always reported together**, plus the sign test.
+- **Base provenance is fixed**: same run, same pass, same teacher. A `--base-only` run is a smoke test, never a gate baseline.
+- **≥400 reference-stable items per gated bucket** — about 1,100 eval sessions, roughly nine times what has been used.
+- Criterion 2 now requires the clean-drift **CI upper bound** ≤ 0.002, not just the point estimate; `w=2` "passed" it at 0.001999. Criterion 3 becomes an explicit **non-inferiority** test on the CI upper bound, because "not significant" is not evidence of no harm. Criterion 4 is demoted from a gate to a diagnostic: two hand-built questions cannot support a ±30% claim, and instruction-following is gated through the `standing-governing` bucket instead, where it has an n.
+
+**The honest status of the phase.** Iterations 1–3 should be quoted as **"not measured"** on criterion 1 rather than as partial successes. Nothing here shows the method fails — the intervals are wide enough to contain a useful effect, and the one item that moved, moved a long way — but nothing so far shows it works either, and the previous three entries claimed more than their statistics could support. The next GPU run should be an eval-only run at n≈1,100 against the existing `w=2` adapter under the new protocol: that is the cheapest experiment that can turn three ambiguous results into one answer, and it needs no training at all.
+
+New code: `bootstrap_ci`, `trimmed_mean`, `paired_deltas`, `delta_summary`, `stable_rows`, `_prefill_chunked`, `greedy_tokens`, `reference_is_stable`, `--ref-stability`; `report()` gains the reference-stability line and the stable-only paired-delta table. 250 tests pass, including one that asserts the paired delta is invariant to a large shared per-item offset that moves the bucket mean by 5×.
+
+Caveats: the stability probe uses one particular benign perturbation (chunked prefill); a different one might mark a different set, so "stable" means "survived this probe", not "provably determined". The power table is simulated from a noisy estimate of the effect — if the true effect is smaller than the observed −0.005, the required n is larger. The unstable/stable split used in this re-analysis was reconstructed from the `--base-only` vs full-eval disagreement rather than from the new probe, which is the same kind of perturbation but not the identical one; the probe itself has not yet been run on a GPU. n=34 stable governing items is small enough that the 47%-of-KL and one-item findings are themselves single-sample observations.
+
+@acrosley 2026-08-20
