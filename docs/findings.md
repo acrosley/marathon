@@ -1451,3 +1451,64 @@ Removing the biggest improver moves the mean by 6%, not by 99%. The interval exc
 Caveats: one adapter, one model, one epoch of training behind it, two eval seeds. The 6 newly-broken items at 0.05 and the 13 fixed at 0.2 are counts in the tens — the tail conclusions are the least stable part of this table even at n=1400. `planted-fact ok` grades the arg-max of the teacher-forced sequence, not a free-running greedy decode (776/814 for the reference, 777 for base and tuned alike — no item lost). The stability probe uses one particular benign perturbation; "stable" means "survived this probe", not "provably determined". The clean-drift bucket breakdown is descriptive — no correction was made for looking at three buckets. And the adapter under test was selected on a slice drawn from seed 9001, so while this eval is clean, the *checkpoint choice* was made with a contaminated slice; a fully clean result needs a retrain with `--mid-eval-seed` set away from the eval seed.
 
 @acrosley 2026-08-20
+
+## 2026-08-20 — The paged population: the failure is 9× worse than the synthetic one and the adapter transfers *nothing* to it — but the answers survive, so serving's wrongness is not only stale attention
+
+Command: `scripts/stitch_paged_gate.sh` — `marathon.stitch_train eval --population paged --items 500 --seed 5101 --lora stitch8b_w2.0.pt.step150 --ref-stability` (WSL2, `~/marathon-venv`, torch 2.13.0+cu130, transformers 5.15.0, sdpa, bf16, RTX 5090; ~85 min) · Model: `Qwen/Qwen3-8B` · Cost: $0.
+
+Two results sat next to each other this morning and could not both be about the same thing. The powered gate run said the w=2 adapter produces a real, broad-based improvement on governing edits and halves the `>0.2` tail. Track L said that on the *real* cold-tier workload, reuse turns are wrong 75–91% of the time even at low churn (fact EM 7/14 against a control's 14/14). The gap has to be the population, so this builds Track L's shape and measures it with the same protocol.
+
+**The population** (`src/marathon/paged_eval.py`) reuses the shipped machinery rather than imitating it: `cold_eval.build_session` for a 40-turn history with facts planted early to late, `cold.ColdTier` for the actual paging policy — same `view`, same `[cold #k hash8: ...]` stubs, same protected-set rules — and `kvshift.token_segments` for a **multi-segment** reuse plan. One item is one paging *transition*: the active view before a turn and after it, where the tier promotes one or two demoted messages back to full text and the budget pays by demoting the oldest eligible message to a stub. The question asks for a fact planted in a message sitting *after* all of that churn, so the fact's KV is reused while conditioned on a prefix that no longer exists.
+
+`token_span` cannot express this — it collapses disjoint edits into one span running from the first change to the last, discarding most of the reuse — so `Example.span` now accepts an explicit `list[Segment]`. As built: **6.4 reuse segments per item, 92% of the new view reused, 5,619 tokens per view, 63 demoted messages, 2 promotions**, stubs present in every item.
+
+**The base failure is much larger than anything the synthetic population shows, and it is not a tail:**
+
+```
+                      n    mean   median     p95     max  >.05
+base   paged        500  0.0305   0.0186  0.1042  0.2238    90
+tuned  paged        500  0.0306   0.0192  0.1022  0.2196    90
+clean drift         500  0.0016   0.0010  0.0050  0.0243     0
+
+reference stability 422/500 stable; the 78 unstable carry 18% of total base KL
+paired delta (stable) n=422   mean -0.00013   CI [-0.00083, +0.00058]   improved 220/422
+planted-fact ok       498/500 for reference, base and tuned alike
+```
+
+Against the synthetic population measured this morning, the paged median of **0.0186** is **~9× the non-governing median (0.0021)** and **2.6× the governing median (0.0071)**, and 18% of items clear KL 0.05 against roughly 1%. The synthetic failure was a tail phenomenon — a heavy right tail over an essentially healthy median. **This one is a shift of the whole distribution**, which is the shape Track L's numbers imply: not "a few turns go wrong" but "the typical reuse turn is off".
+
+**And the adapter does nothing here whatsoever.** Paired mean delta −0.00013 with a CI of [−0.00083, +0.00058], median −0.00013, 220/422 improved — a coin flip. This is the same adapter that on the synthetic governing bucket gave −0.00775 with a CI comfortably clear of zero. **It transfers zero to the workload the composition actually runs.** That is the single most useful number of the day, and it retires the "qualified yes" I gave this morning: the mechanism is real on the population it was trained on, and irrelevant on the one that matters.
+
+**But the answers survive, and that is a finding about the serving failure rather than about the adapter.** `planted-fact ok` is 498/500 for the reference, the base *and* the tuned columns — reuse at KL median 0.0186 is not destroying the planted fact under this measurement. Track L sees fact EM collapse to 7/14. The two are not the same measurement, and the difference bounds what stitched-KV staleness can explain:
+
+* this is 32 **teacher-forced** tokens on an 8B HF model through `kvshift`; Track L is **free-running** generation on 14B-FP8 through the vLLM connector, where divergence compounds and one flipped token redirects the rest;
+* the serving path has components this reproduction does not have at all — the connector's store allocation and staleness ratchet, paged store rebuild, chunked prefill interleaving.
+
+So: **the paged shape reproduces a large distributional failure but not the answer-level catastrophe.** Stale attention over a multi-segment paged view is real and it is ~9× worse than the synthetic proxy, but on this evidence it is not by itself sufficient to explain 75–91% wrongness. Something else in the serving path is contributing, and finding out what is now at least as valuable as training against this population. The cheapest discriminating experiment is a free-running decode on this same population: if exact match collapses here too, teacher forcing was hiding it and the adapter is the whole story; if it holds, the connector is implicated.
+
+**A bug found before it cost a training run.** `example_losses` decides between the improvement objective and the do-no-harm hinge with `is_governing`, which is `"governing" in edit_kind` — and a `paged` item is not governing by that test. With `--preserve-weight` set, every paged item would therefore have been trained with the hinge, which is exactly zero while the adapter is no worse than the base. The population built to be repaired would have contributed no improvement gradient at all, and the run would have looked like a clean null result. There is now an explicit `TARGET_KINDS` / `is_target` distinction, a test that a paged item gets the plain objective while a synthetic non-governing item keeps the hinge, and the checkpoint-selection rule buckets on `target` rather than on `governing` for the same reason.
+
+Caveats: one model, one seed, 500 items, one adapter. The target fact is *recalled* immediately before the transition under test — on a 40-turn session every planted fact has been paged out by then, so the item is "fact resident, churn in front of it" rather than "fact still cold"; that is what the exact trigger does when a user asks about demoted text, but it is a choice and it makes the item easier than a cold-fact question. `planted-fact ok` grades the arg-max of the teacher-forced sequence, not a free-running decode — which is precisely the limitation the paragraph above turns on. The paged population is built from `HashEmbedder`-free paging (the budget trigger), so query-similarity recall is not exercised. And the comparison to the synthetic medians is across populations, not within a run.
+
+@acrosley 2026-08-20
+
+## 2026-08-20 — The mixed retrain died in the backward pass, inside an OOM handler that only wrapped the forward
+
+Command: `scripts/stitch_mixed_retrain.sh` with `ITEMS=200 EVAL_ITEMS=250` — train on `--population mixed` (100 paged + 100 synthetic), w=2, `--grad-prefill --grad-prefill-max-tokens 6000`, `--mid-eval-seed 7999` · Model: `Qwen/Qwen3-8B` · Result: **no adapter, no checkpoints, no rows.** Cost: ~90 min of the window.
+
+Launched at 15:52 to answer the obvious follow-up to the paged gate run — if the adapter trained on synthetic edits transfers nothing to the paged population, does training *on* the paged population work? It got past item 1 and died before item 21 with `RuntimeError: CUDA driver error: device not ready`, WSL's ENOMEM again. Nothing survived: the trainer writes its adapter and its JSONL at the end, and the first `--checkpoint-every 50` save had not been reached.
+
+**The interesting part is where it died.** The traceback is `example_losses` → `Tensor.backward` → `_engine_run_backward`. This phase already has an OOM fallback for exactly this failure — added on 2026-08-20 after the iteration-3 crash, complete with a test and a note in the design doc about WSL mislabelling exhaustion as "device not ready". It wrapped the **forward** only. The backward is the memory *peak*, not the forward: it allocates gradient buffers proportional to everything the forward retained. So the handler was in the stack watching the exact failure it was written for, one frame too high.
+
+Two things were wrong with it and both are now fixed:
+
+* **The retry unit was too small.** Forward, loss and backward are now one closure, and the OOM handler wraps all three. An item whose expressive path does not fit falls back to the cheap path and is counted, which is what was always intended.
+* **A retry after a partial backward double-counts.** A backward that dies part-way has already accumulated some of this item's gradient into the adapter; retrying on top of that counts the surviving fraction twice, silently, and only for the items that OOM. The adapter's gradients are now snapshotted before an expressive attempt and restored before the retry. A test seeds a known gradient, makes `Tensor.backward` really accumulate and *then* raise, and asserts the final gradient equals what a clean cheap-path item would have produced — it fails against the naive retry.
+
+**The lesson worth keeping** is not "add a try/except". It is that a mitigation written from a stack trace tends to cover the frame in the trace rather than the operation that actually exhausts the resource, and that "we already handle this" is a claim to re-check against the next failure rather than a reason to stop looking. The 2026-08-19 crash was in the forward, so the handler went around the forward; the same underlying cause moved one frame and went straight through it.
+
+**What is not yet known**, and is the first thing to run tomorrow: whether training on the paged population repairs it. The paged gate run established that the failure there is ~9× the synthetic one and that the existing adapter is worthless against it, but the constructive half of that experiment has not been run. Memory sizing needs revisiting first — the mixed population interleaves ~5.6k paged views with synthetic items up to 8.3k, 57/200 of which were over the grad-prefill cap, and peak was never printed because the run died before the first checkpoint. A lower cap, or a smaller accumulation window, is the cheap fix; measuring the peak on twenty items before committing an hour is the cheaper one.
+
+Caveats: one crash, one configuration. No claim is made here about whether the mixed population is trainable within 32 GiB — only that this attempt did not get far enough to find out.
+
+@acrosley 2026-08-20

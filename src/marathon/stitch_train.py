@@ -50,7 +50,7 @@ import math
 import random
 import statistics
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from torch import nn
@@ -314,7 +314,11 @@ class Example:
     query_ids: torch.Tensor
     qtype: str
     expected: list[str] | None
+    #: a :class:`~marathon.kvshift.Span` for a single-edit item, or an explicit list of
+    #: :class:`~marathon.kvshift.Segment` for a multi-segment one (the paged population's
+    #: demote-plus-promote turns are several disjoint edits, not one)
     span: object
+    meta: dict = field(default_factory=dict)
 
 
 def build_examples(
@@ -569,7 +573,7 @@ def stitched_logits(
     """
     all_ids = torch.cat([ex.new_ids, ex.query_ids])
     total = int(all_ids.shape[0])
-    segments = span_segments(ex.span)
+    segments = example_segments(ex)
     cache = grad_stitch(old_kv, segments, total, inv_freq_of(model))
     positions = fresh_positions(segments, total, all_ids.device)
     if grad_prefill:
@@ -580,6 +584,11 @@ def stitched_logits(
         return first
     rest = _continue_forced(model, cache.detached(), forced[:-1], total, all_ids.device)
     return torch.cat([first, rest], dim=0)
+
+
+def example_segments(ex: Example) -> list:
+    """The reuse plan for one item: explicit segments, or the single span expanded."""
+    return ex.span if isinstance(ex.span, list) else span_segments(ex.span)
 
 
 def clean_logits(model, ex: Example, forced: list[int]) -> torch.Tensor:
@@ -659,6 +668,20 @@ def is_governing(ex: Example) -> bool:
     return "governing" in ex.edit_kind
 
 
+#: Kinds the adapter is asked to *improve* rather than merely not to damage. Governing
+#: edits are the original target; ``paged`` joins them because the whole reason that
+#: population exists is that it is the failure being repaired. Getting this wrong is not a
+#: cosmetic mistake -- with ``--preserve-weight`` set, anything outside this set is trained
+#: with the do-no-harm hinge, which is zero as long as the adapter is no worse than the
+#: base, so a paged item outside it would contribute no improvement gradient at all.
+TARGET_KINDS = ("paged",)
+
+
+def is_target(ex: Example) -> bool:
+    """Whether the loss asks this example to get *better* (vs merely not worse)."""
+    return is_governing(ex) or ex.edit_kind in TARGET_KINDS
+
+
 def example_losses(
     model,
     loras: list[LoRALinear],
@@ -703,7 +726,7 @@ def example_losses(
     the footprint. With ``backward=None`` the tensors are returned instead, for tests.
     """
     governing = is_governing(ex)
-    guard = preserve_weight > 0 and not governing
+    guard = preserve_weight > 0 and not is_target(ex)
     base_kl = None
     with adapters(loras, False), torch.no_grad():
         forced, teacher_seq = teacher_reference(model, ex, gen_tokens)
@@ -733,35 +756,58 @@ def example_losses(
         used_grad_prefill = grad_prefill and (
             grad_prefill_max_tokens <= 0 or total_tokens <= grad_prefill_max_tokens
         )
+
+        def _forward_backward(use_gp: bool):
+            """Forward, loss, and (when training) backward as one retryable unit.
+
+            The backward has to be inside the retry, not after it: it is the memory *peak*,
+            not the forward. The 2026-08-20 mixed retrain died at
+            ``example_losses -> Tensor.backward`` with WSL's ENOMEM while an OOM handler
+            that only wrapped the forward looked on.
+            """
+            stitch = kl_to(teacher_seq, stitched_logits(model, ex, old_kv, forced, use_gp))
+            # governing/paged: get better. guarded kinds: just do not get worse than the base.
+            t = (
+                torch.clamp(stitch - (base_kl + preserve_slack), min=0.0) * preserve_weight
+                if guard
+                else stitch
+            )
+            if backward is not None:
+                if t.requires_grad:
+                    (t * backward).backward()
+                t, stitch = float(t.detach()), float(stitch.detach())
+            return stitch, t
+
+        # A backward that dies part-way has already accumulated part of this item's
+        # gradient. Retrying on top of that would count the surviving fraction twice, so the
+        # adapter's grads are snapshotted and restored before the retry. Only worth doing
+        # when there is something to retry *to*.
+        snapshot = (
+            [(lo.lora_a.grad, lo.lora_b.grad) for lo in loras]
+            if backward is not None and used_grad_prefill
+            else None
+        )
+        if snapshot is not None:
+            snapshot = [
+                (None if a is None else a.clone(), None if b is None else b.clone())
+                for a, b in snapshot
+            ]
         oom = False
         try:
-            stitch_kl = kl_to(
-                teacher_seq, stitched_logits(model, ex, old_kv, forced, used_grad_prefill)
-            )
+            stitch_kl, term = _forward_backward(used_grad_prefill)
         except (torch.OutOfMemoryError, RuntimeError) as exc:
-            if not _is_oom(exc):
-                raise
             # A token cap is a *prediction* about memory; this is the measurement. An item
             # whose expressive path does not fit is worth training on the cheap path rather
             # than losing the whole run.
-            if not used_grad_prefill:
+            if not _is_oom(exc) or not used_grad_prefill:
                 raise
             oom, used_grad_prefill = True, False
+            for lo, (a, b) in zip(loras, snapshot or [], strict=False):
+                lo.lora_a.grad, lo.lora_b.grad = a, b
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            stitch_kl = kl_to(teacher_seq, stitched_logits(model, ex, old_kv, forced, False))
-        # governing: get better. non-governing: just do not get worse than the base already is.
-        term = (
-            torch.clamp(stitch_kl - (base_kl + preserve_slack), min=0.0) * preserve_weight
-            if guard
-            else stitch_kl
-        )
-        if backward is not None:
-            if term.requires_grad:
-                (term * backward).backward()
-            term = float(term.detach())
-            stitch_kl = float(stitch_kl.detach())
-        del old_kv
+            stitch_kl, term = _forward_backward(False)
+        snapshot, old_kv = None, None
 
         if anchor:
             clean_kl = kl_to(teacher_seq, clean_logits(model, ex, forced))
@@ -950,6 +996,9 @@ def evaluate(
                 "family": ex.family,
                 "qtype": ex.qtype,
                 "governing": "governing" in ex.edit_kind,
+                # what the loss asked of this item, which is what the checkpoint rule must
+                # bucket on -- a paged item is a target, not part of the do-no-harm set
+                "target": is_target(ex),
                 "ref_stable": stable,
                 "base_stitch_kl": float(kl_to(teacher_seq, base_seq)),
                 "tuned_stitch_kl": float(kl_to(teacher_seq, tuned_seq)),
@@ -1327,6 +1376,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", default=None, help="where to write the adapter / rows")
     ap.add_argument("--jsonl", default=None)
     ap.add_argument("--probe-turns", type=int, default=20)
+    ap.add_argument(
+        "--population",
+        default="synthetic",
+        choices=["synthetic", "paged", "mixed"],
+        help="synthetic = kvshift_eval single-span edits; paged = cold-tier demote/promote "
+        "transitions (marathon.paged_eval), the shape Track L's failing workload has; "
+        "mixed = half and half",
+    )
+    ap.add_argument("--paged-turns", type=int, default=40)
+    ap.add_argument("--paged-active-tokens", type=int, default=6000)
     ap.add_argument("--base-only", action="store_true", help="skip the tuned columns")
     ap.add_argument(
         "--ref-stability",
@@ -1396,22 +1455,48 @@ def main(argv: list[str] | None = None) -> int:
                     f.write(json.dumps(row) + "\n")
         return 0
 
-    examples = build_examples(
-        tok,
-        dev,
-        args.items,
-        args.seed,
-        args.gov_frac,
-        args.min_tokens,
-        args.max_tokens,
-        args.queries_per_item,
-        standing_frac=args.standing_frac,
-    )
+    def _synthetic(n, seed):
+        return build_examples(
+            tok,
+            dev,
+            n,
+            seed,
+            args.gov_frac,
+            args.min_tokens,
+            args.max_tokens,
+            args.queries_per_item,
+            standing_frac=args.standing_frac,
+        )
+
+    def _paged(n, seed):
+        from .paged_eval import build_paged_examples
+
+        return build_paged_examples(tok, dev, n, seed, args.paged_turns, args.paged_active_tokens)
+
+    if args.population == "paged":
+        examples = _paged(args.items, args.seed)
+    elif args.population == "mixed":
+        half = args.items // 2
+        examples = _synthetic(args.items - half, args.seed) + _paged(half, args.seed)
+        random.Random(args.seed).shuffle(examples)
+    else:
+        examples = _synthetic(args.items, args.seed)
     print(
         f"{args.cmd}: {len(examples)} examples from {args.items} sessions "
-        f"(seed {args.seed}, gov_frac {args.gov_frac}), model {args.model}",
+        f"(seed {args.seed}, population {args.population}, gov_frac {args.gov_frac}), "
+        f"model {args.model}",
         flush=True,
     )
+    paged = [e for e in examples if e.edit_kind == "paged"]
+    if paged:
+        seg = statistics.fmean(e.meta["segments"] for e in paged)
+        reuse = statistics.fmean(e.meta["reused"] / e.meta["new_tokens"] for e in paged)
+        print(
+            f"  paged: {len(paged)} items, {seg:.1f} reuse segments/item, "
+            f"{100 * reuse:.0f}% of the new view reused, "
+            f"{statistics.fmean(e.meta['new_tokens'] for e in paged):.0f} tokens/view",
+            flush=True,
+        )
 
     if args.cmd == "train":
         if args.grad_prefill:
@@ -1457,8 +1542,8 @@ def main(argv: list[str] | None = None) -> int:
             row = {"step": step, "path": path, "peak_gib": _peak_gib()}
             if mid:
                 rows = evaluate(model, loras, mid, tok, args.gen_tokens)
-                g = [r for r in rows if r["governing"]]
-                n = [r for r in rows if not r["governing"]]
+                g = [r for r in rows if r.get("target", r["governing"])]
+                n = [r for r in rows if not r.get("target", r["governing"])]
                 # p95 and the medians, not just the means: `select_checkpoint` needs the
                 # governing tail and the non-governing typical item, which are exactly the
                 # two statistics the exit criteria are written on.

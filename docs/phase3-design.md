@@ -88,6 +88,26 @@ A result that fails (2) or (3) is a failure regardless of (1): *efficiency that 
 
 If the criteria are met, the payoff is concrete: `reuse_plan` can downgrade governing edits from `repair` to `reuse`, which is the difference between 1.5% and 68% of tokens forwarded on precisely the edit that invalidates the most history.
 
+## The paged population (2026-08-20), and what it changes
+
+The measurement rebuild fixed *how* results are aggregated. This fixes *what they are measured on*, which turned out to matter more.
+
+**Why it exists.** The powered gate run found a real, broad-based improvement on governing edits. Track L, the same day, measured that reuse turns on the actual cold-tier workload are wrong 75–91% of the time. Both cannot be descriptions of the same system unless the populations differ, and they do: every Phase 3 number until now came from `kvshift_eval`'s **single contiguous edit** in an otherwise untouched history, while a paged turn is **a front demotion plus up to two promotions** — several disjoint edits, each shifting everything after it.
+
+**What it is.** `marathon.paged_eval.build_paged_examples` composes the shipped pieces rather than imitating them — `cold_eval.build_session` for the history, `cold.ColdTier` for the paging policy and its `[cold #k hash8: ...]` stubs, `kvshift.token_segments` for the multi-segment reuse plan — and produces ordinary `Example` objects, so the paired-delta protocol and the stability probe apply to it unchanged. One item is one paging transition, with the question asking for a fact that sits behind the churn in the reused suffix. Measured shape: 6.4 reuse segments per item, 92% of the view reused, ~5.6k tokens, 63 demoted messages.
+
+`Example.span` now accepts an explicit `list[Segment]` as well as a single `Span`, because `token_span` collapses disjoint edits into one span from the first change to the last and would discard most of the reuse the workload depends on. `example_segments` is the accessor; both shapes flow through the same differentiable stitch.
+
+**What it changed about the phase.** On this population the base failure is **median `klmean` 0.0186** against the synthetic population's 0.0021 non-governing and 0.0071 governing, with 18% of items over 0.05 against ~1%: not a heavy tail over a healthy median, but the whole distribution moved. And the `w=2` adapter — which shows a clean effect on synthetic governing edits — has a paired delta of −0.00013 with a CI of [−0.00083, +0.00058] here. **It transfers nothing.**
+
+Two consequences are now pre-registered.
+
+**1. The paged population is the primary one.** A Phase 3 result is reported on it, and the synthetic population is retained as the regression set and as the historical comparison. A gate passed only on synthetic edits is not evidence about the system that ships, and should be described as "on the synthetic population" wherever it appears. The sample-size rule carries over unchanged: ≥400 reference-stable items in each gated bucket.
+
+**2. Training targets versus the do-no-harm set is now explicit.** `example_losses` chose between the improvement objective and the hinge with `is_governing`, i.e. `"governing" in edit_kind`, and a `paged` item fails that test. With `--preserve-weight` set, every paged item would have been trained with a hinge that is exactly zero while the adapter is no worse than the base — the population built to be repaired would have contributed no improvement gradient, and the run would have produced a clean-looking null. `TARGET_KINDS` and `is_target` now name the distinction, the checkpoint rule buckets on `target` rather than on `governing`, and a test pins that a paged item gets the plain objective while a synthetic non-governing item keeps the hinge. **Any new population added to this phase must declare which side it is on, in code, with a test.**
+
+**The open question this population raises rather than settles.** `planted-fact ok` is 498/500 for reference, base and tuned alike: at a KL median of 0.0186 the planted answer still survives, while Track L sees fact EM fall to 7/14. The measurements differ in two ways that matter — 32 teacher-forced tokens here against free-running generation there, and an 8B HF stitched cache here against 14B-FP8 through the vLLM connector, which has a store, a staleness ratchet and chunked prefill that this reproduction does not model at all. So the paged shape reproduces a large *distributional* failure but not the *answer-level* one, and stale attention is on this evidence **necessary but not sufficient** to explain serving's wrongness. The discriminating experiment is a free-running decode on this same population: if exact match collapses here too, teacher forcing was hiding it; if it holds, the connector is implicated and the adapter cannot be the whole fix. Until that is run, no claim should be made that fixing stitched-KV robustness would fix the composition.
+
 ## The measurement rebuild (2026-08-20), pre-registered
 
 Iteration 3 ended by reporting that the base measurement was irreproducible. Following that up changed the conclusion of the whole phase, so the gates are rewritten here **before** any further training, and the criteria in the section above are superseded by the ones below wherever they conflict.
