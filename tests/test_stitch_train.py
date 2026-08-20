@@ -859,3 +859,160 @@ def test_reference_stability_probe_runs_and_evaluate_records_it(tiny):
     seen = []
     evaluate(model, loras, [ex, ex], None, 3, on_row=seen.append)
     assert len(seen) == 2 and seen[0]["base_stitch_kl"] >= 0
+
+
+# --------------------------------------------- the paged population (Track L's shape)
+
+
+def test_paged_examples_are_multi_segment_paging_transitions():
+    """The point of the population: several disjoint edits, not one contiguous rewrite."""
+    from marathon.kvshift import Segment, token_span
+    from marathon.kvshift_eval import SNAPSHOT, load_corpus
+    from marathon.paged_eval import build_paged_examples
+
+    tok, corpus = ByteTokenizer(), load_corpus(SNAPSHOT)
+    exs = build_paged_examples(
+        tok, "cpu", 6, seed=4242, turns=24, active_tokens=9000, corpus=corpus
+    )
+    assert exs, "no paged items built"
+    for e in exs:
+        assert e.edit_kind == "paged" and e.qtype == "paged-fact"
+        # an explicit multi-segment plan, which is what token_span cannot express
+        assert isinstance(e.span, list) and len(e.span) >= 2
+        assert all(isinstance(s, Segment) for s in e.span)
+        # segments are in destination order and none overlaps its neighbour
+        for a, b in zip(e.span, e.span[1:], strict=False):
+            assert a.dst_end <= b.dst_start
+        # the reuse must reach the end, or there is no stale suffix to be wrong about
+        assert e.span[-1].dst_end >= int(e.new_ids.shape[0]) - 1
+        # the churn really is churn: a single-span view of the same edit would give up
+        # far more of the history than the multi-segment plan does
+        reused = sum(s.length for s in e.span)
+        span = token_span(e.old_ids.tolist(), e.new_ids.tolist())
+        assert reused > span.p + span.s, (reused, span.p + span.s)
+        assert e.expected and e.meta["promoted"] >= 1
+    # the stubs the cold tier writes must actually be in the view being reused
+    assert all("[cold #" in tok.decode(e.old_ids.tolist()) for e in exs)
+
+
+def test_paged_examples_run_through_the_stitched_forward(tiny):
+    """Multi-segment plans must flow through the same graph as single-span ones."""
+    from marathon.kvshift_eval import SNAPSHOT, load_corpus
+    from marathon.paged_eval import build_paged_examples
+    from marathon.stitch_train import example_segments
+
+    model, loras = tiny
+    tok, corpus = ByteTokenizer(), load_corpus(SNAPSHOT)
+    exs = build_paged_examples(tok, "cpu", 3, seed=99, turns=24, active_tokens=9000, corpus=corpus)
+    if not exs:
+        pytest.skip("no paged items at this size")
+    ex = exs[0]
+    ex = Example(
+        ex.sid,
+        ex.edit_kind,
+        ex.family,
+        ex.old_ids % VOCAB,
+        ex.new_ids % VOCAB,
+        ex.query_ids % VOCAB,
+        ex.qtype,
+        ex.expected,
+        ex.span,
+        ex.meta,
+    )
+    assert len(example_segments(ex)) >= 2
+    rows = evaluate(model, loras, [ex], None, 3)
+    assert rows[0]["base_stitch_kl"] >= 0 and rows[0]["edit_kind"] == "paged"
+
+
+def test_example_segments_accepts_both_plan_shapes():
+    from marathon.kvshift import Segment, token_span
+    from marathon.stitch_train import example_segments
+
+    ex = _example()
+    assert example_segments(ex) == span_segments(ex.span)
+    segs = [Segment(0, 4, 0), Segment(8, 12, 6)]
+    ex2 = Example(0, "paged", "paged", ex.old_ids, ex.new_ids, ex.query_ids, "q", None, segs)
+    assert example_segments(ex2) is segs
+    assert isinstance(token_span([1, 2, 3], [1, 9, 3]), object)
+
+
+def test_paged_items_are_trained_as_targets_not_guarded(tiny):
+    """A paged item must get the improvement objective, not the do-no-harm hinge.
+
+    With the hinge it would contribute zero gradient whenever it is already no worse than
+    the base -- i.e. the population built to be repaired would train nothing.
+    """
+    from marathon.stitch_train import is_governing, is_target
+
+    model, loras = tiny
+    ex = _example()
+    paged = Example(
+        1, "paged", "paged", ex.old_ids, ex.new_ids, ex.query_ids, "paged-fact", None, ex.span
+    )
+    assert not is_governing(paged) and is_target(paged)
+    plain = _nongov_example()
+    assert not is_target(plain)
+    # the guarded item reports a base column (the hinge needs it); the target does not
+    got = example_losses(model, loras, paged, 3, anchor=False, preserve_weight=2.0)
+    assert got["base_stitch_kl"] is None
+    assert (
+        example_losses(model, loras, plain, 3, anchor=False, preserve_weight=2.0)["base_stitch_kl"]
+        is not None
+    )
+
+
+def test_oom_during_backward_falls_back_without_double_counting_the_gradient(tiny, monkeypatch):
+    """The retry must cover the backward, and must not count a half-done one twice.
+
+    The 2026-08-20 mixed retrain died in `Tensor.backward` while an OOM handler that only
+    wrapped the forward watched it happen. The fake here accumulates real gradient and
+    *then* raises, which is the case that makes a naive retry double-count.
+    """
+    import marathon.stitch_train as st
+
+    model, loras = tiny
+    ex = _example()
+
+    def clear():
+        for lora in loras:
+            lora.lora_a.grad = lora.lora_b.grad = None
+
+    def seed():
+        """A known pre-existing gradient, as an accumulation window would carry."""
+        clear()
+        for i, lora in enumerate(loras):
+            lora.lora_b.grad = torch.full_like(lora.lora_b, 0.01 * (i + 1))
+
+    # reference: what a clean cheap-path item adds on top of the seed
+    seed()
+    st.example_losses(model, loras, ex, 3, anchor=False, backward=1.0, grad_prefill=False)
+    want = [lora.lora_b.grad.clone() for lora in loras]
+
+    real_backward = torch.Tensor.backward
+    fired: list[int] = []
+
+    def flaky(self, *a, **k):
+        real_backward(self, *a, **k)  # really accumulate...
+        if not fired:
+            fired.append(1)
+            raise torch.OutOfMemoryError("CUDA out of memory")  # ...then die
+
+    monkeypatch.setattr(torch.Tensor, "backward", flaky)
+    seed()
+    parts = st.example_losses(
+        model,
+        loras,
+        ex,
+        3,
+        anchor=False,
+        backward=1.0,
+        grad_prefill=True,
+        grad_prefill_max_tokens=0,
+    )
+    monkeypatch.undo()
+    assert fired, "the fake never raised -- the test is not exercising the retry"
+    assert parts["grad_prefill_oom"] is True and parts["grad_prefill"] is False
+    got = [lora.lora_b.grad for lora in loras]
+    for g, w in zip(got, want, strict=True):
+        assert torch.allclose(g, w, atol=1e-6), "partial backward leaked into the retry"
+    clear()
