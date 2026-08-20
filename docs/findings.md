@@ -1343,4 +1343,111 @@ And the same turns split by kind, which is what the sampling fix bought:
 
 **Limits.** One run per cell, one model, one window, one paging policy; 14 scored turns per condition. The reuse/refresh EM split is the strongest result here (2/8 and 1/11 against 5/6 and 3/3) and it rests on 14 and 14 scored turns. The refresh-turn cost is measured but not diagnosed; until it is, even "refresh everything" is worse than simply turning the connector off on a paged workload, which is the current recommendation.
 
+## 2026-08-20 — The measurement was the result: on reference-stable items the adapter's governing effect is one session, and the gate had 18% power
+
+Command: CPU-only re-analysis of the 2026-08-19 eval rows (`stitch8b_it3_basecheck.jsonl`, `stitch8b_w2.0_eval.jsonl`, `stitch8b_w4_eval.jsonl`) plus the rewritten statistics in `marathon.stitch_train` · Model: none — no GPU was used · Cost: $0.
+
+Iteration 3 closed by reporting that the base measurement was not reproducible across runs and recommending that the metric be fixed before more training. Following that up did not produce a better version of the previous result; it removed it.
+
+**First: the variation is path dependence, not noise, so averaging cannot help.** Three base passes over the same 120 items exist. The base columns of the `w=2` and `w=4` evals agree on **120/120 items, bit for bit** — two separate processes, two different adapters, identical numbers. The `--base-only` pre-check disagrees with them on **33/120**. The mechanism is that loading an adapter changes the allocation pattern, which changes cuBLAS kernel selection, which in bf16 changes a reduction order, which moves a logit by a ULP — enough to flip an argmax that was a near-tie, after which the entire 32-token teacher-forced continuation differs. Yesterday's entry called this "bf16 non-determinism", which was half right and misleading in its practical consequence: **k repeated passes of the same path return k identical numbers.** Seed- or pass-averaging, the obvious remedy, buys exactly nothing here. Only a deliberate perturbation is informative.
+
+Two corollaries were also found while checking this. `--base-only` was accepted by the CLI and **never forwarded to `evaluate`** (fixed), so the pre-check ran the full path at double cost for three runs — it still produced correct numbers, because with no `--lora` the adapter is identity and the tuned columns equal the base ones bit for bit, which is why it went unnoticed. And it is part of *why* the pre-check disagreed with the in-run base at all.
+
+**Second, and this is the result: restricted to items whose reference is stable, the governing effect is not there.** Stability is now measured directly — recompute the teacher with the prefill in two chunks instead of one (same tokens, same mask, same weights, different matmul shapes) and compare greedy continuations. Applying the paired per-item delta to the `w=2` arm:
+
+```
+bucket           set      n   mean delta         95% CI          median    trim20  improved
+governing        all     46    -0.00498  [-0.01369, +0.00007]  -0.00007  -0.00022     24/46
+governing        stable  34    -0.00509  [-0.01593, +0.00094]  +0.00008  -0.00004     16/34
+standing-gov     stable  14    -0.00080  [-0.00238, +0.00059]  +0.00043  -0.00037      6/14
+non-governing    stable  39    +0.00054  [-0.00011, +0.00126]  +0.00009  +0.00021     17/39
+
+w=4 governing    stable  34    -0.00495  [-0.01905, +0.00341]  +0.00015  +0.00006     15/34
+```
+
+Every interval straddles zero. The sign test is **16/34** for `w=2` and **15/34** for `w=4` — worse than a coin flip in the second case. And the mean is not describing the population at all:
+
+```
+sum of all 34 stable governing deltas                 -0.1732
+  ... of which the single largest improver            -0.1723
+mean excluding that one item                        -0.000027   (mean with it: -0.005093)
+stable governing items crossing below klmean 0.05:  0 fixed, 0 newly broken  (1 -> 1)
+stable governing items crossing below klmean 0.2:   0 fixed, 0 newly broken  (1 -> 1)
+```
+
+**One session out of 34 accounts for the entire governing improvement, and it did not even get fixed** — it was over 0.2 before and it is over 0.2 after. Nothing crossed either threshold in either direction. The 12 unstable governing items that were excluded carry 47% of the bucket's total base KL, which is precisely why the ratio-of-means looked like it was moving.
+
+**Retrospective power, simulated from the observed per-item delta distribution:**
+
+| stable items per bucket | 46 | 100 | 200 | 400 | 800 |
+|---|---|---|---|---|---|
+| superiority (governing) | **18%** | 54% | 87% | 100% | 100% |
+| non-inferiority (non-governing, 20% tolerance) | 25% (n=39) | 38% | 64% | 90% | 100% |
+
+At the n every gate run in this phase has used, the test had **18% power against its own observed effect**. That is the whole story of iterations 1–3: "governing mean KL −43%, −51%, −18%" were three draws from a statistic that cannot resolve the thing it was measuring, on a population where a quarter of the items have an undetermined reference.
+
+**What is now pre-registered** (in [phase3-design.md](phase3-design.md), superseding the aggregation and sample size of the original criteria; the per-item metric `klmean` is unchanged, so training and eval still optimise the same quantity):
+
+- The gated statistic is the **paired per-item delta** — one item, one pass, one teacher, `tuned − base` — with a 10,000-resample percentile bootstrap CI. Shared per-item offsets cancel exactly; ratio-of-means is demoted to a descriptive line and never gated.
+- **Reference-unstable items are excluded and reported**, with their count and their share of total KL.
+- **Mean, median and 20% trimmed mean are always reported together**, plus the sign test.
+- **Base provenance is fixed**: same run, same pass, same teacher. A `--base-only` run is a smoke test, never a gate baseline.
+- **≥400 reference-stable items per gated bucket** — about 1,100 eval sessions, roughly nine times what has been used.
+- Criterion 2 now requires the clean-drift **CI upper bound** ≤ 0.002, not just the point estimate; `w=2` "passed" it at 0.001999. Criterion 3 becomes an explicit **non-inferiority** test on the CI upper bound, because "not significant" is not evidence of no harm. Criterion 4 is demoted from a gate to a diagnostic: two hand-built questions cannot support a ±30% claim, and instruction-following is gated through the `standing-governing` bucket instead, where it has an n.
+
+**The honest status of the phase.** Iterations 1–3 should be quoted as **"not measured"** on criterion 1 rather than as partial successes. Nothing here shows the method fails — the intervals are wide enough to contain a useful effect, and the one item that moved, moved a long way — but nothing so far shows it works either, and the previous three entries claimed more than their statistics could support. The next GPU run should be an eval-only run at n≈1,100 against the existing `w=2` adapter under the new protocol: that is the cheapest experiment that can turn three ambiguous results into one answer, and it needs no training at all.
+
+New code: `bootstrap_ci`, `trimmed_mean`, `paired_deltas`, `delta_summary`, `stable_rows`, `_prefill_chunked`, `greedy_tokens`, `reference_is_stable`, `--ref-stability`; `report()` gains the reference-stability line and the stable-only paired-delta table. 250 tests pass, including one that asserts the paired delta is invariant to a large shared per-item offset that moves the bucket mean by 5×.
+
+Caveats: the stability probe uses one particular benign perturbation (chunked prefill); a different one might mark a different set, so "stable" means "survived this probe", not "provably determined". The power table is simulated from a noisy estimate of the effect — if the true effect is smaller than the observed −0.005, the required n is larger. The unstable/stable split used in this re-analysis was reconstructed from the `--base-only` vs full-eval disagreement rather than from the new probe, which is the same kind of perturbation but not the identical one; the probe itself has not yet been run on a GPU. n=34 stable governing items is small enough that the 47%-of-KL and one-item findings are themselves single-sample observations.
+
+@acrosley 2026-08-20
+
+## 2026-08-20 — The powered gate run: the adapter's governing effect is real and broad-based, it halves the >0.2 tail, and it still fails two of the four criteria
+
+Command: `scripts/stitch_gate_eval.sh` (n=1400, seed 9101) plus a top-up at `--items 705 --seed 9102` after the first run was killed at item 675 — eval-only, no training, `--ref-stability` on, against the existing `w=2` adapter at checkpoint 150 (WSL2, `~/marathon-venv`, torch 2.13.0+cu130, transformers 5.15.0, sdpa, bf16, RTX 5090; 4.7 s/item, ~20.5 GiB) · Model: `Qwen/Qwen3-8B` · Cost: $0.
+
+The previous entry rebuilt the measurement and concluded that at n=46 the governing effect was one session and the gate had 18% power. This is the same adapter measured properly: **1400 items across two held-out seeds, 1123 reference-stable, 502 stable governing and 525 stable non-governing — both gated buckets over the pre-registered 400.** Seed 9101/9102 were chosen because the iteration-3 eval seed 9001 had been contaminated: that training run drew its mid-training checkpoint-selection slice from `--seed+2000` = 9001, so 24 of its 120 "held-out" items had been used to pick the very checkpoint under test. Neither seed here was trained on or selected on.
+
+**The headline is a correction to the previous entry.** At n=46 the governing improvement looked like one lucky session: sum of deltas −0.1732 of which −0.1723 was a single item, and a mean of −0.000027 once it was removed. At n=502 that is simply not what the data says:
+
+```
+bucket (stable only)       n  mean delta                  95% CI    median    trim20  improved
+governing                502    -0.00775    [-0.01038, -0.00537]  -0.00025  -0.00059   285/502
+standing-gov              96    -0.00177    [-0.00280, -0.00083]  -0.00058  -0.00089     55/96
+governing+std            598    -0.00679    [-0.00900, -0.00475]  -0.00030  -0.00064   340/598
+non-governing            525    +0.00021    [-0.00012, +0.00054]  +0.00014  +0.00020   225/525
+
+sign test (governing)     285/502 improve, p ~ 0.002 against a coin
+largest single improver   -0.2268 ; mean excluding it -0.00731 against -0.00775 with it
+reference stability       1123/1400 stable (80%); the 277 unstable carry 23% of base KL
+```
+
+Removing the biggest improver moves the mean by 6%, not by 99%. The interval excludes zero with room, the median and the 20% trimmed mean carry the same sign, and the sign test is 285/502. **The effect is real, and it is spread across the population.** The n=46 reading was an artefact of the sample, and this entry supersedes it — the honest lesson is that a statistic too weak to detect an effect is also too weak to rule one out, and the previous entry leaned on the second half of that in a way the data did not support.
+
+**Against the criteria as rewritten on 2026-08-20:**
+
+| criterion | measured | |
+|---|---|---|
+| 1a. superiority | governing paired mean delta −0.00775, CI **[−0.01038, −0.00537]** | **pass** |
+| 1b. tail | **>0.2: 26 → 13, 13 fixed, 0 newly broken.** >0.05: 49 → 41, 14 fixed, **6 newly broken** | **fail** |
+| 1c. corroboration | median −0.00025 and trim20 −0.00059 agree in sign with the mean | **pass** |
+| 2. clean context | 0.00201 mean, CI **[0.00186, 0.00218]** — over on both the point estimate and the bound | **fail** |
+| 3. no regression | non-governing delta +0.00021, CI upper **+0.00054** < tolerance 0.00097 | **pass** |
+| 5. win kept | tokens forwarded unchanged | pass |
+
+**Criterion 1 fails on a technicality that is not a technicality.** The `>0.2` half is the best result this phase has produced: **the items that force `reuse_plan` to refuse are halved, 26 → 13, with not one item newly pushed over.** But at the 0.05 threshold the adapter creates 6 new failures while fixing 14, and the pre-registered rule says none may newly appear. That rule was written for a reason — an adapter that trades a fixed item for a broken one is not obviously an improvement to a planner that has to decide per edit — and it is being applied as written rather than renegotiated now that it bites.
+
+**The shape of the effect matters more than the verdict.** The mean improves by 0.0078 while the median improves by 0.00025, against a base median of 0.0071. So this is **a tail repair, not a distribution shift**: the adapter does approximately nothing for the typical governing edit and a great deal for the worst ones. That is, for once, the useful direction — the tail is the whole reason governing edits get recomputed — but it should not be described as "governing KL fell 24%", which is the mean talking.
+
+**Criterion 2 is the new rule earning its place, twice over.** Iteration 3's `w=2` "passed" this at 0.001999 as a bare point estimate with no interval. Measured on 1123 items it reads 0.00201 with a CI of [0.00186, 0.00218] — it fails now on the point estimate too, and the earlier pass was a small-sample accident. The damage is concentrated in the `standing-governing` bucket (clean drift 0.00334, against 0.00211 governing and 0.00167 non-governing), i.e. in the probe-shaped sessions added in iteration 3. That is worth following: the bucket added to close a distribution gap is the one taking the most collateral.
+
+**Reference stability, measured for the first time rather than inferred.** 80% of items are stable (1123/1400), and the unstable ones carry 23% of total base KL. The previous entry's proxy figures — 74% stable, 47% of KL — came from the `--base-only`-versus-full-eval disagreement on 120 items and were both wrong, the second badly. The probe itself (chunked prefill, argmax compared against the teacher's own continuation) costs ~7% of eval time, not the 17% budgeted.
+
+**Process note.** The first run was killed at item 675 when its supervising background task was stopped. It cost nothing: rows had been changed to stream and flush per item earlier the same day, so all 695 completed items were on disk, and the balance was run as a second seed. Pooling two seeds is legitimate here because every comparison is within-item and within-pass. The relaunch used `setsid` so the job is not a child of the launching shell — the third distinct way a launch has failed in this phase, after `nohup`-without-`setsid` and PowerShell eating a redirect.
+
+**What this means for the composition.** Track L's measurement that paged/stitched reuse turns are wrong 75–91% of the time on the real cold-tier workload makes this the load-bearing bet, and the answer this run gives is *qualified yes*: the mechanism is real, it is trainable, and it halves the worst tail. But two limits should be stated before anyone plans on it. The effect size is small in absolute terms and concentrated in the tail. And **this population is not Track L's**: synthetic single-span edits at 4–8k where the base sits at mean KL 0.032, against paged, stub-heavy, multi-reuse-turn composition. A pass here would not license a claim there, and a fail here would not condemn it. The highest-value next experiment is not another hyperparameter sweep on this population — it is rebuilding the eval population around Track L's failing turns and re-running this same protocol on it.
+
+Caveats: one adapter, one model, one epoch of training behind it, two eval seeds. The 6 newly-broken items at 0.05 and the 13 fixed at 0.2 are counts in the tens — the tail conclusions are the least stable part of this table even at n=1400. `planted-fact ok` grades the arg-max of the teacher-forced sequence, not a free-running greedy decode (776/814 for the reference, 777 for base and tuned alike — no item lost). The stability probe uses one particular benign perturbation; "stable" means "survived this probe", not "provably determined". The clean-drift bucket breakdown is descriptive — no correction was made for looking at three buckets. And the adapter under test was selected on a slice drawn from seed 9001, so while this eval is clean, the *checkpoint choice* was made with a contaminated slice; a fully clean result needs a retrain with `--mid-eval-seed` set away from the eval seed.
+
 @acrosley 2026-08-20

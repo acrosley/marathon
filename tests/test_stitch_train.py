@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import random
+import statistics
 
 import pytest
 
@@ -698,3 +699,163 @@ def test_select_checkpoint_follows_the_pre_registered_rule():
     assert select_checkpoint([ck(50, 0.01, 0.9, 0.9)]) is None
     # a run with no mid-eval rows has nothing to select from
     assert select_checkpoint([{"step": 50}]) is None
+
+
+# ------------------------------------ 2026-08-20: the gated statistic and its assumptions
+
+
+def _row(kind, gov, base, tuned, stable=True, qtype="obey"):
+    return dict(
+        sid=0,
+        edit_kind=kind,
+        family="f",
+        qtype=qtype,
+        governing=gov,
+        ref_stable=stable,
+        base_stitch_kl=base,
+        tuned_stitch_kl=tuned,
+        tuned_clean_kl=0.001,
+        ref_answer_ok=None,
+        base_answer_ok=None,
+        tuned_answer_ok=None,
+    )
+
+
+def test_trimmed_mean_drops_both_tails():
+    from marathon.stitch_train import trimmed_mean
+
+    # one wild outlier at each end; the 20% trim removes them
+    vals = [-100.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 100.0]
+    assert trimmed_mean(vals, 0.2) == pytest.approx(4.5)
+    assert trimmed_mean(vals, 0.0) == pytest.approx(statistics.fmean(vals))
+    # a trim that would empty the sample keeps it rather than dividing by zero
+    assert trimmed_mean([1.0, 2.0], 0.5) == pytest.approx(1.5)
+    with pytest.raises(ValueError):
+        trimmed_mean([])
+
+
+def test_bootstrap_ci_is_seeded_brackets_the_mean_and_narrows_with_n():
+    from marathon.stitch_train import bootstrap_ci
+
+    rng = random.Random(0)
+    sample = [rng.gauss(-0.01, 0.02) for _ in range(60)]
+    lo, hi = bootstrap_ci(sample, resamples=2000)
+    assert lo < statistics.fmean(sample) < hi
+    # seeded: the same rows must give the same interval, or a reported CI is not checkable
+    assert bootstrap_ci(sample, resamples=2000) == (lo, hi)
+    # more data, tighter interval
+    big = [rng.gauss(-0.01, 0.02) for _ in range(600)]
+    lo2, hi2 = bootstrap_ci(big, resamples=2000)
+    assert (hi2 - lo2) < (hi - lo)
+    # a degenerate sample is a point, not a crash
+    assert bootstrap_ci([0.5]) == (0.5, 0.5)
+    with pytest.raises(ValueError):
+        bootstrap_ci([])
+
+
+def test_delta_summary_pairs_per_item_and_flags_significance():
+    from marathon.stitch_train import delta_summary, paired_deltas
+
+    # every item improves by exactly 0.01 -> the interval must exclude zero
+    rows = [_row("governing", True, 0.05 + i / 100, 0.04 + i / 100) for i in range(30)]
+    assert paired_deltas(rows) == pytest.approx([-0.01] * 30)
+    d = delta_summary(rows, resamples=2000)
+    assert d["n"] == 30 and d["improved"] == 30
+    assert d["mean"] == pytest.approx(-0.01) and d["significant"] is True
+    assert d["ci_hi"] < 0
+    # noise around zero must NOT be called significant
+    rng = random.Random(7)
+    noisy = [
+        _row("governing", True, b := rng.uniform(0.001, 0.05), b + rng.gauss(0, 0.004))
+        for _ in range(40)
+    ]
+    assert delta_summary(noisy, resamples=2000)["significant"] is False
+
+
+def test_the_paired_delta_survives_what_the_ratio_of_means_does_not():
+    """The point of the rewrite, as a test.
+
+    Iteration 3's failure mode: a shared per-item offset (which branch of a near-tie the
+    teacher took) moves both columns together. It swamps a ratio of independently measured
+    means and cancels exactly in the paired delta.
+    """
+    from marathon.stitch_train import delta_summary
+
+    rng = random.Random(11)
+    truth = [(rng.uniform(0.002, 0.03), -0.004) for _ in range(40)]
+    clean = [_row("governing", True, b, b + d) for b, d in truth]
+    # now let a quarter of the items' references flip, adding a large shared offset
+    shifted = []
+    for i, (b, d) in enumerate(truth):
+        off = 0.4 if i % 4 == 0 else 0.0
+        shifted.append(_row("governing", True, b + off, b + d + off))
+    a, c = delta_summary(clean, resamples=2000), delta_summary(shifted, resamples=2000)
+    assert a["mean"] == pytest.approx(c["mean"], abs=1e-12)  # identical, offset cancels
+    assert c["significant"] is True
+    # the same perturbation moves the ratio-style bucket mean by an order of magnitude
+    plain = statistics.fmean(r["base_stitch_kl"] for r in clean)
+    hit = statistics.fmean(r["base_stitch_kl"] for r in shifted)
+    assert hit > 5 * plain
+
+
+def test_report_excludes_unstable_items_from_the_gate_and_says_so():
+    from marathon.stitch_train import report, stable_rows
+
+    rows = [_row("governing", True, 0.01, 0.008) for _ in range(6)]
+    rows += [_row("governing", True, 0.40, 0.39, stable=False)]  # a flipped reference
+    rows += [_row("fact", False, 0.004, 0.004) for _ in range(6)]
+    assert len(stable_rows(rows)) == 12
+    text = report(rows)
+    assert "reference stability: 12/13 stable" in text
+    assert "bucket (stable only)" in text
+    assert "[descriptive only]" in text  # the ratio is demoted, not deleted
+    # the gated governing row must be computed on 6 items, not 7
+    lines = text.split("\n")
+    gate = lines[next(i for i, ln in enumerate(lines) if "bucket (stable only)" in ln) :]
+    gov_line = next(ln for ln in gate if ln.startswith("governing "))
+    assert gov_line.split()[1] == "6", gov_line
+
+
+def test_unprobed_rows_count_as_stable():
+    """`ref_stable=None` means "not measured", which must not silently empty the gate."""
+    from marathon.stitch_train import report, stable_rows
+
+    rows = [_row("governing", True, 0.01, 0.009, stable=None) for _ in range(4)]
+    rows += [_row("fact", False, 0.004, 0.004, stable=None) for _ in range(4)]
+    assert len(stable_rows(rows)) == 8
+    assert "reference stability" not in report(rows)
+
+
+def test_chunked_prefill_matches_the_single_shot_one(tiny):
+    """The perturbation must be mathematically benign: same tokens, same maths."""
+    from marathon.stitch_train import _prefill, _prefill_chunked, greedy_tokens
+
+    model, _ = tiny
+    ids = torch.arange(3, 43) % VOCAB
+    with torch.no_grad():
+        (kv_a, log_a), (kv_b, log_b) = _prefill(model, ids), _prefill_chunked(model, ids, 3)
+    assert len(kv_a) == len(kv_b)
+    for (ka, va), (kb, vb) in zip(kv_a, kv_b, strict=True):
+        assert ka.shape == kb.shape
+        assert torch.allclose(ka, kb, atol=1e-4) and torch.allclose(va, vb, atol=1e-4)
+    assert torch.allclose(log_a, log_b, atol=1e-4)
+    # and in fp32 on CPU it is stable, so the probe reports stable rather than crying wolf
+    assert greedy_tokens(model, ids, 4, 1) == greedy_tokens(model, ids, 4, 3)
+
+
+def test_reference_stability_probe_runs_and_evaluate_records_it(tiny):
+    from marathon.stitch_train import reference_is_stable, teacher_reference
+
+    model, loras = tiny
+    ex = _example()
+    forced, _ = teacher_reference(model, ex, 3)
+    assert reference_is_stable(model, ex, forced) is True  # fp32 CPU: nothing to flip
+    # a reference that is *not* what the perturbed run produces must read unstable
+    assert reference_is_stable(model, ex, [(forced[0] + 1) % VOCAB, *forced[1:]]) is False
+    rows = evaluate(model, loras, [ex], None, 3, ref_stability=True)
+    assert rows[0]["ref_stable"] is True
+    assert evaluate(model, loras, [ex], None, 3)[0]["ref_stable"] is None  # off by default
+    # rows stream out as they are produced, so a killed run keeps what it paid for
+    seen = []
+    evaluate(model, loras, [ex, ex], None, 3, on_row=seen.append)
+    assert len(seen) == 2 and seen[0]["base_stitch_kl"] >= 0

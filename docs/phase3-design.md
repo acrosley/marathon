@@ -68,6 +68,8 @@ zero while the adapter is at least as good as the base, growing only on regressi
 
 ## Exit criteria
 
+> **Superseded 2026-08-20** on aggregation and sample size by "The measurement rebuild" below; the per-item metric (`klmean`) is unchanged. The criteria numbered here are kept for the record of what iterations 1-3 were judged against.
+
 **Pre-registered metric.** Every KL number in every criterion below is **`klmean`**: the mean KL over 32 teacher-forced continuation tokens of the *reference's own greedy output*, student against the frozen base model's full recompute of the edited context, under `reuse-all`. Not `kl_first`, not free-running exact match. This is stated once here because the first round of criteria did not state it and it cost a real comparison: criterion 4 quoted 0.3492, which is a **`kl_first`** number from the 2026-08-18 probe, and the 8B run reported `klmean`, so "did it move?" had no well-posed answer. `kl_first` and `klmean` differ by more than an order of magnitude on the same item — `dep-instruction` reuse-all was `kl_first` 0.3492 against `klmean` 0.0118 — so they are never to be compared across criteria.
 
 **Reported statistics.** Wherever a bucket is summarised, report **mean and median together**, plus the counts over 0.05 and over 0.2. The two disagree in a way that matters: on the same base model the governing/non-governing ratio was 8.71× mean / 4.03× median at n=48 and 7.25× / 2.27× at n=60. The mean tracks the tail (which is what forces `reuse_plan` to refuse) and the median tracks the typical item (which is what a user experiences), and a fix that moves only one of them is only half a fix.
@@ -85,6 +87,51 @@ Measured on **held-out seeds** never trained on:
 A result that fails (2) or (3) is a failure regardless of (1): *efficiency that changes answers is a regression, not a win*, and that rule is not suspended because the mechanism is now training instead of caching. The 8B run is exactly that case — a real 43% mean / 61% p95 cut on governing edits, disqualified by a 37% regression everywhere else.
 
 If the criteria are met, the payoff is concrete: `reuse_plan` can downgrade governing edits from `repair` to `reuse`, which is the difference between 1.5% and 68% of tokens forwarded on precisely the edit that invalidates the most history.
+
+## The measurement rebuild (2026-08-20), pre-registered
+
+Iteration 3 ended by reporting that the base measurement was irreproducible. Following that up changed the conclusion of the whole phase, so the gates are rewritten here **before** any further training, and the criteria in the section above are superseded by the ones below wherever they conflict.
+
+**What the follow-up found.** Three base passes over the same 120 items exist from 2026-08-19. Two of them — the base columns of the `w=2` and `w=4` evals — agree on **120/120 items, bit for bit**. The third, the `--base-only` pre-check, disagrees on **33/120**. So the variation is not run-to-run randomness that averaging would remove: it is *path dependence*. Loading an adapter changes the allocation pattern, that changes which kernels cuBLAS selects, and in bf16 a differently-ordered reduction moves a logit by a ULP — which is enough to flip an argmax that was a near-tie, after which the whole 32-token teacher-forced continuation differs. Averaging k repeats of one path returns k identical numbers and buys exactly nothing; only a *perturbation* probe is informative.
+
+That matters because of where those items sit: the 12 reference-unstable governing items (26% of the bucket) carry **47% of the bucket's total base KL**. The headline statistic of the last three iterations was a ratio of two means, each dominated by items whose reference is a coin flip.
+
+**And when the paired statistic is applied to that data, the effect disappears.** On reference-stable governing items (n=34), the `w=2` adapter's paired mean delta is −0.0051 with a 95% bootstrap CI of **[−0.0159, +0.0009]** — straddling zero. The median delta is +0.00008, the 20% trimmed mean is −0.00004, and the sign test is **16/34**, a coin flip. The sum of all 34 deltas is −0.1732, of which **−0.1723 is a single item**; excluding it the mean delta is −0.000027. No stable governing item crossed below 0.05 or below 0.2 in either direction. The retrospective power of that test, against its own observed effect, is **18%**. Three iterations of "governing KL fell 43% / 51% / 18%" were reading a mean carried by unstable items and one lucky session.
+
+### The metric
+
+`klmean` stays the per-item quantity. It is the eval's headline number *and* the training loss, and that identity — "the loss went down" and "the reported metric went down" are the same sentence — is the main thing this phase has going for it. What changes is everything above the per-item level.
+
+**The gated statistic is the paired per-item delta**: for one item, in one pass, against one teacher, `tuned − base`. Whatever makes the absolute level unreliable — which branch of a near-tie the teacher took, which kernel was selected — is shared by both columns and cancels exactly. What remains is sampling uncertainty over items, which is what a 10,000-resample percentile bootstrap reports and what more items actually reduces. Ratio-of-means is demoted to a descriptive line and is never gated on: it is a quotient of two independently noisy estimates and it answers no question anyone has.
+
+**Reference-unstable items are excluded from the gate and reported.** Stability is measured directly: recompute the teacher a second time with the prefill fed in two chunks instead of one — same tokens, same mask, same weights, different matmul shapes — and mark the item unstable if the greedy continuation differs. An item whose reference moves under a benign perturbation cannot attribute a KL difference to stitched KV, because the reference itself was not determined. Their count and their share of total KL are always reported; they are never silently dropped.
+
+**Three statistics are always reported together** — mean delta with CI, median delta, 20% trimmed mean delta — plus the sign test. The mean speaks for the tail, the median for the typical item, and a disagreement between them is information, not something to resolve by picking one.
+
+**Base provenance is fixed.** The base column must come from the same run, the same pass and the same teacher as the tuned column. A `--base-only` run is a smoke test for "does the failure class exist here", never a baseline for a gate. Comparing a tuned number against a base measured in a different process is what produced the 33/120 disagreement.
+
+### Sample size, which is the binding constraint
+
+Simulating from the observed per-item delta distribution, power to detect the governing improvement (CI upper bound below 0):
+
+| stable items per bucket | 46 | 100 | 200 | 400 | 800 |
+|---|---|---|---|---|---|
+| superiority (governing) | 18% | 54% | 87% | 100% | 100% |
+| non-inferiority (non-governing, 20% tolerance) | 25% (n=39) | 38% | 64% | 90% | 100% |
+
+**Gate runs use ≥400 reference-stable items per gated bucket.** With ~26% of items unstable and `gov_frac 0.5`, that is roughly **1,100 eval sessions**, against the 120 used so far — about nine times the eval cost, and it is not optional: at n=46 the gate cannot distinguish the effect it exists to measure. Caveat stated in advance: these powers are simulated from a noisy estimate of the effect, so if the true effect is smaller than the observed −0.005 the required n is larger, not smaller.
+
+### The criteria, restated
+
+Measured on held-out seeds never trained on, on reference-stable items, with the base from the same pass:
+
+1. **The failure class closes.** (a) the 95% CI upper bound of the governing paired mean delta is **< 0**; (b) the paired count of governing items over `klmean` 0.2 **strictly decreases** with none newly appearing, and likewise for 0.05; (c) the median and trimmed-mean deltas do not carry the opposite sign to the mean. The gov/non-gov ratio is reported and not gated.
+2. **Clean context is undamaged.** Clean-context `klmean` mean ≤ **0.002** *and* its bootstrap CI upper bound ≤ 0.002. The upper bound is the new part, and it exists because `w=2` passed this criterion at 0.001999 — one part in a million, on a statistic with no interval attached.
+3. **No regression.** A **non-inferiority** test: the CI *upper* bound of the non-governing paired mean delta is below 20% of the same-run base non-governing mean. "Not statistically significant" is not evidence of no harm and no longer counts as a pass.
+4. **The dependent-instruction scenario** is demoted from a gate to a **diagnostic**. Two hand-built questions cannot support a "≥30% fall" claim, and treating them as a gate has produced three contradictory verdicts. Instruction-following is gated through the `standing-governing` bucket under criterion 1 instead, where it has an n.
+5. **The win is kept.** Unchanged, holds by construction.
+
+A number produced under the old protocol is not comparable with one produced under this one, and iterations 1–3 are to be quoted as "not measured" on criterion 1 rather than as partial successes.
 
 ## Iteration 3: pre-registration
 
