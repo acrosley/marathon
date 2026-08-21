@@ -88,6 +88,28 @@ A result that fails (2) or (3) is a failure regardless of (1): *efficiency that 
 
 If the criteria are met, the payoff is concrete: `reuse_plan` can downgrade governing edits from `repair` to `reuse`, which is the difference between 1.5% and 68% of tokens forwarded on precisely the edit that invalidates the most history.
 
+## Status 2026-08-21: the bet is answered, and the answer is no
+
+This section supersedes the framing above. The pre-registered protocol and the paged population stand; what changes is what they were pointed at and what they found.
+
+**The phase's bet** was that a small adapter could make position-shifted reuse robust enough for `reuse_plan` to downgrade governing edits — and later, paged reuse turns — from `repair` to `reuse`. Three results now bear on it, and they close it.
+
+**1. The adapter can be trained on the population that matters, and the effect is small.** Training on a 50/50 mix of paged and synthetic items produces a paired mean delta of **−0.00325, 95% CI [−0.00468, −0.00183]** on 428 reference-stable paged items — an interval clear of zero, 60% of items improving, against the synthetic-trained adapter's **−0.00013, CI [−0.00083, +0.00058]** on the identical items. So the population *is* trainable and the earlier null was about the training set, not the method. But it is 10% on the mean and 5% on the median, and it is bought with clean-context drift of **0.00452 against a 0.002 budget** and a 2–3× regression on the guarded set. Criteria 1b, 2 and 3 fail. The pre-registered checkpoint rule found **no feasible checkpoint** — its "may select nothing" branch firing correctly for the first time.
+
+**2. What the adapter repairs is wording, not answers.** A free-running greedy decode on 250 paged items — the serving-shaped measurement, not the teacher-forced one — gives exact match **117/250** against full recompute, so half the served answers do differ and teacher forcing had been hiding that. But planted-fact EM is **250/250 on both sides**, no answer diverges at token 0, and the median decode stays identical for **29 of 32 tokens**. Divergence arrives late; the fact is emitted early and identically. Stale attention over paged multi-segment views changes how an answer is worded, not what it says.
+
+**3. The composition's wrongness is a serving-path bug.** Track L established independently that stitched KV is numerically correct in the live engine, that the collapse reproduces on Qwen3-8B bf16 in vLLM (0.75 off vs 0.35 on), and that `--max-segments 1` recovers half the gap — implicating the k+1 phase trick and compounding re-saves rather than the model. Two independent routes, the same conclusion.
+
+**Therefore: stop tuning this adapter.** The failure this phase exists to repair is real, measurable and now well characterised — and it is not what is breaking the composition. Continuing to sweep hyperparameters against it would be optimising a quantity nobody downstream is waiting on, while the actual blocker sits in the connector.
+
+**What remains worth doing here is diagnostic, not constructive:**
+
+- **Does the wording divergence matter to anyone?** 53% of served answers differ in wording while 100% keep the fact. Whether that is a defect depends on the consumer, and no consumer has been asked. If nothing downstream cares, the residual Phase 1 failure class is a curiosity rather than a cost, and `reuse_plan`'s refusal on governing edits could be revisited on the tail evidence alone.
+- **What is the `>0.05` tail on paged views made of?** 84 of 428 stable items sit above it and the adapter fixes 21 while breaking 8. That churn is unexplained, and a tail that moves in both directions under training is not understood.
+- **Re-measure criterion 3 properly** before the "2–3× regression" is quoted anywhere: it currently rests on a 16-item mid-training slice, which is not an instrument a gate should depend on.
+
+**A methodological result worth carrying to other phases.** Peak training memory on this population tracks **segment structure, not context length**: a paged item costs +3.6 GiB over a synthetic item of the same ~5.4k tokens, and the worst item in the sizing sweep was the *shortest* paged one. Every `--grad-prefill` cap in this phase was computed as `tokens × bytes-per-token`, which is why an estimate that looked comfortable died in the backward pass. Sizing must run the real step — forward, loss *and* backward — on the real population, and a 20-item sample still under-estimated the 200-item peak by 2.4 GiB (26.73 measured vs 29.09 actual).
+
 ## The paged population (2026-08-20), and what it changes
 
 The measurement rebuild fixed *how* results are aggregated. This fixes *what they are measured on*, which turned out to matter more.

@@ -13,12 +13,18 @@ cd "$REPO"
 # shellcheck disable=SC1090
 source ~/marathon-venv/bin/activate
 export PYTHONPATH="$REPO/src" PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# CAP comes from scripts/stitch_sizing.py, not from an estimate: the 2026-08-20 attempt
+# picked 6000 from arithmetic and died in the backward pass. GP=0 drops --grad-prefill
+# entirely if the measurement says the expressive path does not fit at all.
+CAP=${CAP:-6000}
+GP=${GP:-1}
+GP_ARG=(); [ "$GP" = "1" ] && GP_ARG=(--grad-prefill)
 C=(--model Qwen/Qwen3-8B --gen-tokens 32 --attn sdpa --gov-frac 0.55 --standing-frac 0.18
-   --min-tokens 4000 --max-tokens 8000 --grad-prefill-max-tokens 6000)
+   --min-tokens 4000 --max-tokens 8000 --grad-prefill-max-tokens "$CAP")
 
 echo "=== 1/2: train on mixed (paged + synthetic), w=2, seed 7101 ==="
 python -m marathon.stitch_train train "${C[@]}" --population mixed \
-  --items "${ITEMS:-200}" --seed 7101 --lr 3e-5 --preserve-weight 2.0 --grad-prefill \
+  --items "${ITEMS:-200}" --seed 7101 --lr 3e-5 --preserve-weight 2.0 "${GP_ARG[@]}" \
   --checkpoint-every 50 --mid-eval-items 16 --mid-eval-seed 7999 \
   --out "$LOGS/${NAME}.pt" --jsonl "$LOGS/${NAME}_train.jsonl"
 
@@ -34,6 +40,6 @@ ADAPTER="$LOGS/${NAME}.pt"
 
 echo "=== 2/2: eval on the PAGED population, same items as the gate run (seed 5101) ==="
 python -m marathon.stitch_train eval --model Qwen/Qwen3-8B --lora "$ADAPTER" \
-  --ref-stability --population paged --items "${EVAL_ITEMS:-250}" --seed 5101 \
+  --ref-stability --population paged --items "${EVAL_ITEMS:-500}" --seed 5101 \
   --gen-tokens 32 --attn sdpa --jsonl "$LOGS/${NAME}_paged_eval.jsonl"
 echo "MIXED RETRAIN DONE (adapter $ADAPTER)"

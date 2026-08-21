@@ -1263,6 +1263,149 @@ def report(rows: list[dict]) -> str:
     return "\n".join(out)
 
 
+# ------------------------------------------------------- free-running discriminator
+
+
+@torch.no_grad()
+def stitched_greedy(model, ex: Example, old_kv, gen_tokens: int) -> list[int]:
+    """Free-running greedy continuation read off the **stitched** cache.
+
+    :func:`stitched_logits` teacher-forces the reference's own continuation, which is the
+    right thing for a KL and the wrong thing for "would the served answer differ": a
+    teacher-forced pass is re-anchored to the reference at every step, so a divergence that
+    would compound over 32 free-running tokens is corrected before it can. This is the
+    serving decode instead — each token is chosen by the model and fed back to itself.
+    """
+    all_ids = torch.cat([ex.new_ids, ex.query_ids])
+    total = int(all_ids.shape[0])
+    segments = example_segments(ex)
+    cache = grad_stitch(old_kv, segments, total, inv_freq_of(model))
+    positions = fresh_positions(segments, total, all_ids.device)
+    logits = _forward_at(model, cache, all_ids[positions], positions, total, 1)[-1]
+    toks: list[int] = []
+    for i in range(gen_tokens):
+        toks.append(int(logits.argmax()))
+        if i == gen_tokens - 1:
+            break
+        seen = cache.get_seq_length()
+        logits = _forward_at(
+            model,
+            cache,
+            torch.tensor([toks[-1]], device=all_ids.device),
+            torch.tensor([seen], device=all_ids.device),
+            seen + 1,
+            1,
+            scatter=False,
+        )[-1]
+    del cache
+    return toks
+
+
+@torch.no_grad()
+def free_run(
+    model,
+    loras: list[LoRALinear],
+    examples: list[Example],
+    tok,
+    gen_tokens: int = 32,
+    with_tuned: bool = False,
+    on_row=None,
+) -> list[dict]:
+    """Serving-shaped comparison: free-running greedy, stitched cache vs full recompute.
+
+    This is the discriminator between two explanations of the composition failure. Track L
+    measures free-running exact match on the real workload and sees it collapse (fact EM
+    7/14); the paged gate run measures 32 teacher-forced tokens and sees planted-fact
+    survive 498/500 at a KL median of 0.0186. Either teacher forcing was hiding an
+    answer-level failure, or the failure lives in the serving path rather than in stitched
+    attention. Same population, same stitched cache, free-running decode: if EM collapses
+    here, it is the former; if it holds, the connector is implicated.
+    """
+    rows = []
+    for ex in examples:
+        with adapters(loras, False):
+            ref = greedy_tokens(model, torch.cat([ex.new_ids, ex.query_ids]), gen_tokens)
+            old_kv, _ = _prefill(model, ex.old_ids)
+            old_kv = [(k.detach(), v.detach()) for k, v in old_kv]
+            got = stitched_greedy(model, ex, old_kv, gen_tokens)
+        tuned = None
+        if with_tuned:
+            with adapters(loras, True):
+                t_kv, _ = _prefill(model, ex.old_ids)
+                tuned = stitched_greedy(
+                    model, ex, [(k.detach(), v.detach()) for k, v in t_kv], gen_tokens
+                )
+                del t_kv
+
+        def hit(toks, expected=ex.expected):
+            if not expected or tok is None:
+                return None
+            text = tok.decode(toks)
+            return any(e in text for e in expected)
+
+        rows.append(
+            {
+                "sid": ex.sid,
+                "edit_kind": ex.edit_kind,
+                "qtype": ex.qtype,
+                "exact_match": got == ref,
+                "tuned_exact_match": None if tuned is None else tuned == ref,
+                # how far in the two decodes agree: 32 means identical, 0 means the very
+                # first served token differs
+                "agree_prefix": next(
+                    (i for i, (a, b) in enumerate(zip(ref, got, strict=False)) if a != b),
+                    min(len(ref), len(got)),
+                ),
+                "ref_fact_ok": hit(ref),
+                "base_fact_ok": hit(got),
+                "tuned_fact_ok": None if tuned is None else hit(tuned),
+            }
+        )
+        if on_row:
+            on_row(rows[-1])
+        if len(rows) % 25 == 0:
+            print(f"  freerun {len(rows)}/{len(examples)}", flush=True)
+            if ex.old_ids.device.type == "cuda":
+                torch.cuda.empty_cache()
+    return rows
+
+
+def free_run_report(rows: list[dict]) -> str:
+    """Exact match and planted-fact accuracy — the statistics serving is judged on."""
+    n = len(rows)
+    if not n:
+        return "no rows"
+    em = sum(bool(r["exact_match"]) for r in rows)
+    graded = [r for r in rows if r["ref_fact_ok"] is not None]
+    out = [
+        f"free-running greedy, {n} items, stitched cache vs full recompute",
+        f"  exact match (32 tokens)   {em}/{n} = {em / n:.3f}",
+        f"  mean agreeing prefix      {statistics.fmean(r['agree_prefix'] for r in rows):.1f}"
+        f" / 32 tokens   (median {statistics.median(r['agree_prefix'] for r in rows):.0f})",
+        f"  first served token differs {sum(r['agree_prefix'] == 0 for r in rows)}/{n}",
+    ]
+    if graded:
+        rf = sum(bool(r["ref_fact_ok"]) for r in graded)
+        bf = sum(bool(r["base_fact_ok"]) for r in graded)
+        out.append(
+            f"  planted-fact EM           reference {rf}/{len(graded)} = {rf / len(graded):.3f}"
+            f" ; stitched {bf}/{len(graded)} = {bf / len(graded):.3f}"
+        )
+        lost = sum(1 for r in graded if r["ref_fact_ok"] and not r["base_fact_ok"])
+        gained = sum(1 for r in graded if r["base_fact_ok"] and not r["ref_fact_ok"])
+        out.append(f"  facts lost to reuse {lost}, gained {gained}")
+    tuned = [r for r in rows if r["tuned_exact_match"] is not None]
+    if tuned:
+        tem = sum(bool(r["tuned_exact_match"]) for r in tuned)
+        tg = [r for r in tuned if r["tuned_fact_ok"] is not None]
+        line = f"  ADAPTER exact match       {tem}/{len(tuned)} = {tem / len(tuned):.3f}"
+        if tg:
+            tf = sum(bool(r["tuned_fact_ok"]) for r in tg)
+            line += f" ; planted-fact {tf}/{len(tg)} = {tf / len(tg):.3f}"
+        out.append(line)
+    return "\n".join(out)
+
+
 # --------------------------------------------------------------- dependent-edit probe
 
 #: The hand-built scenarios from the dependent-edit study. ``dep-instruction`` is the one
@@ -1350,7 +1493,7 @@ def _load(model_name: str, device: str, attn: str, r: int, alpha: int, dropout: 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="marathon.stitch_train", description=__doc__)
-    ap.add_argument("cmd", choices=["train", "eval", "probe"])
+    ap.add_argument("cmd", choices=["train", "eval", "probe", "freerun"])
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
     ap.add_argument("--device", default="cuda")
     # sdpa, like kvshift_eval: eager materialises the full [heads, q, kv] fp32 score matrix,
@@ -1498,6 +1641,28 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
 
+    if args.cmd == "freerun":
+        with contextlib.ExitStack() as stack:
+            sink = (
+                stack.enter_context(open(args.jsonl, "w", encoding="utf-8")) if args.jsonl else None
+            )
+
+            def emit(row):
+                sink.write(json.dumps(row) + "\n")
+                sink.flush()
+
+            rows = free_run(
+                model,
+                loras,
+                examples,
+                tok,
+                args.gen_tokens,
+                with_tuned=bool(args.lora),
+                on_row=emit if sink else None,
+            )
+        print("\n" + free_run_report(rows))
+        return 0
+
     if args.cmd == "train":
         if args.grad_prefill:
             longest = max(int(ex.new_ids.shape[0] + ex.query_ids.shape[0]) for ex in examples)
@@ -1569,35 +1734,51 @@ def main(argv: list[str] | None = None) -> int:
                     flush=True,
                 )
             history.append(row)
+            emit_ckpt(row)
 
-        log = train(
-            model,
-            loras,
-            examples,
-            lr=args.lr,
-            epochs=args.epochs,
-            gen_tokens=args.gen_tokens,
-            anchor_weight=args.anchor_weight,
-            grad_prefill=args.grad_prefill,
-            grad_prefill_max_tokens=args.grad_prefill_max_tokens,
-            preserve_weight=args.preserve_weight,
-            preserve_slack=args.preserve_slack,
-            checkpoint_every=args.checkpoint_every,
-            on_checkpoint=on_checkpoint if args.checkpoint_every else None,
-            anchor_every=args.anchor_every,
-            accum=args.accum,
-        )
+        # Stream the training rows and the checkpoint curve as they happen. Yesterday's
+        # mixed retrain died at item ~20 of 200 and left nothing behind at all, because both
+        # files were written after the loop: an hour of GPU time with no curve to look at.
+        with contextlib.ExitStack() as stack:
+            train_sink = (
+                stack.enter_context(open(args.jsonl, "w", encoding="utf-8")) if args.jsonl else None
+            )
+            ckpt_sink = (
+                stack.enter_context(open(f"{args.jsonl}.checkpoints", "w", encoding="utf-8"))
+                if args.jsonl
+                else None
+            )
+
+            def _emit(sink):
+                def go(row):
+                    if sink:
+                        sink.write(json.dumps(row) + "\n")
+                        sink.flush()
+
+                return go
+
+            emit_step, emit_ckpt = _emit(train_sink), _emit(ckpt_sink)
+            log = train(
+                model,
+                loras,
+                examples,
+                lr=args.lr,
+                epochs=args.epochs,
+                gen_tokens=args.gen_tokens,
+                anchor_weight=args.anchor_weight,
+                grad_prefill=args.grad_prefill,
+                grad_prefill_max_tokens=args.grad_prefill_max_tokens,
+                preserve_weight=args.preserve_weight,
+                preserve_slack=args.preserve_slack,
+                checkpoint_every=args.checkpoint_every,
+                on_checkpoint=on_checkpoint if args.checkpoint_every else None,
+                on_step=emit_step,
+                anchor_every=args.anchor_every,
+                accum=args.accum,
+            )
         if args.out:
             torch.save(lora_state(loras), args.out)
             print(f"wrote adapter -> {args.out}")
-        if args.jsonl:
-            with open(args.jsonl, "w", encoding="utf-8") as f:
-                for row in log:
-                    f.write(json.dumps(row) + "\n")
-        if history:
-            with open(f"{args.jsonl}.checkpoints", "w", encoding="utf-8") as f:
-                for row in history:
-                    f.write(json.dumps(row) + "\n")
         downgraded = sum(1 for r in log if args.grad_prefill and not r["grad_prefill"])
         if args.grad_prefill:
             ooms = sum(1 for r in log if r.get("grad_prefill_oom"))

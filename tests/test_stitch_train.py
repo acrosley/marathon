@@ -1016,3 +1016,53 @@ def test_oom_during_backward_falls_back_without_double_counting_the_gradient(tin
     for g, w in zip(got, want, strict=True):
         assert torch.allclose(g, w, atol=1e-6), "partial backward leaked into the retry"
     clear()
+
+
+def test_free_run_decodes_from_the_stitched_cache_and_scores_exact_match(tiny):
+    """The discriminator: free-running greedy off the stitched cache vs full recompute."""
+    from marathon.stitch_train import free_run, free_run_report, greedy_tokens, stitched_greedy
+
+    model, loras = tiny
+    ex = _example()
+    with torch.no_grad(), adapters(loras, False):
+        old_kv, _ = _prefill(model, ex.old_ids)
+        got = stitched_greedy(model, ex, [(k, v) for k, v in old_kv], 5)
+    assert len(got) == 5 and all(isinstance(t, int) for t in got)
+    # free-running is NOT teacher-forced: it must not be re-anchored to the reference
+    ref = greedy_tokens(model, torch.cat([ex.new_ids, ex.query_ids]), 5)
+    assert len(ref) == 5
+
+    rows = free_run(model, loras, [ex], None, 5)
+    r = rows[0]
+    assert r["exact_match"] == (got == ref)
+    assert 0 <= r["agree_prefix"] <= 5
+    assert r["tuned_exact_match"] is None  # off unless asked for
+    text = free_run_report(rows)
+    assert "exact match (32 tokens)" in text and "agreeing prefix" in text
+
+    # with the adapter on, the tuned column appears and is scored against the same reference
+    rows2 = free_run(model, loras, [ex], None, 5, with_tuned=True)
+    assert rows2[0]["tuned_exact_match"] in (True, False)
+    assert "ADAPTER exact match" in free_run_report(rows2)
+
+
+def test_free_run_grades_planted_facts_when_a_tokenizer_is_given(tiny):
+    from marathon.stitch_train import free_run
+
+    model, loras = tiny
+    ex = _example()
+    graded = Example(
+        ex.sid,
+        ex.edit_kind,
+        ex.family,
+        ex.old_ids,
+        ex.new_ids,
+        ex.query_ids,
+        ex.qtype,
+        ["zzz-NEVER"],
+        ex.span,
+    )
+    rows = free_run(model, loras, [graded], ByteTokenizer(), 4)
+    assert rows[0]["ref_fact_ok"] is False and rows[0]["base_fact_ok"] is False
+    # ungraded examples stay None rather than counting as failures
+    assert free_run(model, loras, [ex], ByteTokenizer(), 4)[0]["ref_fact_ok"] is None

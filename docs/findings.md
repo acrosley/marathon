@@ -1548,4 +1548,82 @@ The collapse reproduces on the *same model* Phase 3 measured at 250/250 with an 
 
 **Limits.** One run per cell, 20 scored turns each; the 8B control at 0.75 means differences of one or two answers are not resolvable. The verification run is 0.6B with a single reuse turn and one δ, so "correct in every layer" is established for that shape, not swept over deltas or models — though the CPU test does sweep deltas. `--max-segments` is a diagnostic, not a proposed policy: it trades reuse for accuracy and still loses to connector-off.
 
+## 2026-08-21 — Training on the paged population works and still fails the gates; the free-running decode says stale attention changes wording, not answers — so Phase 3 is not the composition's blocker
+
+Command: `scripts/stitch_sizing.py --items 20`, `scripts/stitch_freerun.sh --items 250`, `scripts/stitch_mixed_retrain.sh` with `CAP=6000 GP=1 ITEMS=200 EVAL_ITEMS=500` (WSL2, `~/marathon-venv`, torch 2.13.0+cu130, transformers 5.15.0, sdpa, bf16, RTX 5090) · Model: `Qwen/Qwen3-8B` · Cost: $0.
+
+Three experiments, and together they answer the question this phase has actually been about.
+
+### The discriminator: teacher forcing was hiding divergence, but not the failure that matters
+
+Free-running greedy, 32 tokens, stitched cache against full recompute, on the same 250 paged items the gate run measured:
+
+```
+exact match (32 tokens)     117/250 = 0.468
+mean agreeing prefix        23.3 / 32   (median 29)
+first served token differs  0/250
+planted-fact EM             reference 250/250 = 1.000 ; stitched 250/250 = 1.000
+ADAPTER (w=2) exact match   114/250 = 0.456 ; planted-fact 250/250
+```
+
+**Both halves resolve, in opposite directions.** Teacher forcing *was* hiding something: free-running, **53% of served answers differ** from full recompute, against a teacher-forced picture that looked benign at 498/500 fact-ok. So the KL median of 0.0186 is a real behavioural difference, not a numerical curiosity — a teacher-forced pass re-anchors to the reference at every step and cannot show it.
+
+But it is **not** Track L's failure. Planted-fact EM is **250/250 on both sides** — not one fact lost, against serving's 7/14. The prefix numbers say why: **no answer diverges at token 0**, and the median decode stays identical for **29 of 32 tokens**. Divergence is a tail-of-the-answer phenomenon; the fact is emitted early and identically, and the wording drifts afterwards. Stale attention over a paged multi-segment view changes *how the answer is worded*, not *what it says*.
+
+**Track L confirmed this independently the same day**: stitched KV is numerically correct in the live engine, the collapse reproduces on Qwen3-8B bf16 in vLLM (0.75 off vs 0.35 on), and `--max-segments 1` recovers half the gap — pointing at the k+1 phase trick and compounding re-saves rather than at the model. Two independent routes to the same conclusion: **the composition's wrongness is a serving-path bug, and Phase 3's target is not the blocker.**
+
+### Training on the paged population does work — and still fails the gates
+
+The constructive experiment yesterday's crash denied. Mixed 50/50 (100 paged + 100 synthetic), w=2, `--grad-prefill` at the measured cap, `--mid-eval-seed 7999`, evaluated on 500 paged items (seed 5101, the same population as the gate run), base and tuned from the same pass:
+
+```
+                      n    mean   median     p95     max  >.05
+base   paged        500  0.0339   0.0196  0.1095  0.6356    98
+tuned  paged        500  0.0312   0.0185  0.0938  0.5603    86
+clean drift         500  0.0049   0.0034  0.0137  0.0422     0
+
+reference stability 428/500 stable (86%); the 72 unstable carry 15% of base KL
+paired delta (stable, n=428)  mean -0.00325  CI [-0.00468, -0.00183]  258/428 improved
+  ... the same measurement on the synthetic-trained w=2 adapter: -0.00013, CI [-0.00083, +0.00058]
+planted-fact ok     500/500 for reference, base and tuned alike
+```
+
+**The interval excludes zero.** Training on the population repairs it, where training on synthetic edits did not: −0.00325 with a CI clear of zero and 60% of items improving, against the synthetic-trained adapter's −0.00013 straddling zero on the identical items. That is a real, if small, transfer — **10% on the mean, 5% on the median**.
+
+**Against the rewritten gates it fails three of four:**
+
+| criterion | measured | |
+|---|---|---|
+| 1a. superiority | paired mean delta −0.00325, CI **[−0.00468, −0.00183]** | **pass** |
+| 1b. tail | >0.05: 84 → 71, 21 fixed but **8 newly broken**; >0.2: 7 → 6, 2 fixed, **1 newly broken** | **fail** |
+| 1c. corroboration | median −0.00175, trim20 −0.00234, same sign as the mean | **pass** |
+| 2. clean context | **0.00452**, CI [0.00410, 0.00497] — 2.3× the 0.002 budget | **fail** |
+| 3. no regression | not measured on this eval; the mid-training slice shows the guarded synthetic bucket's median going **0.0012 → 0.0024–0.0039** | **fail** |
+
+**The checkpoint rule selected nothing, and that was correct.** Every checkpoint had the guarded bucket's median 2–3× over its base, so the pre-registered constraint rejected all four and the final adapter was evaluated and reported as such. This is the rule's "allowed to select nothing" branch firing for the first time, and it does exactly what it was written to do: the run bought the target bucket by spending the collateral at every point measured.
+
+**So the honest shape of the result is a trade, not a win.** A 10% mean improvement on paged reuse, bought with clean-context drift at 2.3× budget and a 2–3× regression on the population that already worked. Criterion 2 exists precisely because *efficiency that changes answers is a regression, not a win*, so this adapter is not shippable — and the trade looks worse still now that the discriminator says the thing being bought is answer *wording* rather than answer *content*.
+
+### Memory: peak tracks segment structure, not context length
+
+`scripts/stitch_sizing.py` runs the real training step — forward, loss *and* backward — over 20 items sorted longest-first:
+
+```
+  [  1] insert          7993 tok  peak 23.19 GiB  grad_prefill=False
+  [  7] rewrite         6945 tok  peak 22.22 GiB  grad_prefill=False
+  [ 17] paged           5408 tok  peak 26.73 GiB  grad_prefill=True    <- worst, and the shortest paged item
+  [ 18] mid-governing   5402 tok  peak 23.12 GiB  grad_prefill=True
+measured peak 26.73 GiB; median 23.69; 13/20 expressive; 0 OOM fallbacks
+```
+
+**The worst item is the shortest paged one.** Items 17 and 18 are the controlled comparison — same ~5.4k length, same expressive path — and the paged item costs **+3.6 GiB**. Every `--grad-prefill` cap in this phase was computed as `tokens × bytes-per-token`, and that formula does not price this population at all: the cost is in the multi-segment stitch, not in the context length. That is why yesterday's estimate looked comfortable and then died in the backward pass.
+
+The sizing sample still **under-estimated**: the full 200-item run peaked at **29.09 GiB** against the sampled 26.73, with 143/200 items keeping the expressive path and **0 OOM fallbacks**. Twenty items out of two hundred is not the maximum of two hundred, and a run that survives at 29.09 GiB on a 32 GiB card is doing so with about 3 GiB of margin. The backward-covering OOM fallback was never exercised, which is the one claim this run cannot make for it.
+
+### Where this leaves Phase 3
+
+The phase's bet was that an adapter could make reuse robust enough for `reuse_plan` to stop refusing. Three things now bear on it. The adapter **can** be trained to improve the population that matters, but only by ~10% and only while breaking both do-no-harm gates. The failure it repairs is, on the free-running evidence, a **wording** difference rather than a factual one. And the composition's actual wrongness — the 75–91% Track L measured — has been independently traced to the serving path rather than the model. **The honest recommendation is to stop tuning this adapter.** The Phase 3 questions still worth GPU time are diagnostic rather than constructive: whether the wording divergence matters to any downstream consumer, and what the `>0.05` tail on paged views is actually made of.
+
+Caveats: one model, one seed per experiment, one epoch, 200 training items. Criterion 3 was not measured on the paged eval at all — the failure is inferred from a 16-item mid-training slice, which is a weak instrument for a gate and should be re-measured on the synthetic population before the "2–3× regression" is quoted as settled. The discriminator's 250 items are drawn from the gate run's population, so its exact-match rate and the gate's KL are not independent measurements. `planted-fact` grades a substring of the decoded answer, so a fact restated in different words scores as lost and one recited by luck scores as kept. The free-running comparison is greedy, so it says nothing about sampled generation. And the GPU sat idle for roughly three hours of today's window through my own failure to watch running jobs — what is here is what fit around that, not what the day could have held.
+
 @acrosley 2026-08-21
