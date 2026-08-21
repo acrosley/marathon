@@ -70,6 +70,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.logger import init_logger
 
+from . import gapfill_channel
 from .shift_kernels import RopeShift, rope_shift, scatter_shifted, warmup
 from .shift_store import (
     DEFAULT_STORE_TOKENS,
@@ -99,6 +100,14 @@ logger = init_logger("vllm.marathon_shift")
 #: live serving path, at the cost of a read-back per layer -- diagnostic only, off by
 #: default.
 VERIFY_LOAD = os.environ.get("MARATHON_VERIFY_LOAD", "") not in ("", "0")
+
+#: ``MARATHON_GAPFILL=1`` switches to the single-request path: a turn sends *all* its
+#: reused segments as ``kv_transfer_params["loads"]``, the connector declares a non-prefix
+#: match through :mod:`marathon.gapfill_channel`, and the engine prefills only the gaps.
+#: Inert unless ``scripts/patch_vllm_gapfill.py`` has been applied -- without the patch
+#: the scheduler ignores the channel and the request would be told nothing is matched, so
+#: the connector declines instead of guessing.
+GAPFILL = os.environ.get("MARATHON_GAPFILL", "") not in ("", "0")
 
 # The scheduler-side and worker-side connectors are separate instances (and, with a
 # non-uniprocess executor, separate processes). Both register here so `stats()` can
@@ -173,6 +182,7 @@ class MarathonShiftConnector(KVConnectorBase_V1):
         self._table = SessionTable()
         self._params: dict[str, dict[str, Any]] = {}
         self._plans: dict[str, tuple[int, int, int]] = {}  # req -> (lo, hi, delta)
+        self._multi: dict[str, list[dict]] = {}  # req -> every segment, single-request mode
         self._need_load: set[str] = set()
         self._blocks: dict[str, list[int]] = {}
 
@@ -212,11 +222,56 @@ class MarathonShiftConnector(KVConnectorBase_V1):
                 request.request_id,
             )
 
+    def _accept_multi(self, request: Request, session: str, loads: list, num_computed: int):
+        """Block-align and coverage-check every segment of a single-request load.
+
+        Returns the segments the store can actually serve. A segment is dropped -- never
+        guessed at -- if alignment leaves it under a block, if it lies inside what the
+        engine already has locally, or if the store no longer holds its source.
+        """
+        limit = (request.num_prompt_tokens - 1) // self._bs * self._bs
+        floor = -(-num_computed // self._bs) * self._bs
+        out = []
+        for ld in loads:
+            delta = int(ld["delta"])
+            lo = max(-(-int(ld["dst_start"]) // self._bs) * self._bs, floor)
+            hi = min(int(ld["dst_end"]), limit) // self._bs * self._bs
+            if hi - lo < self._bs:
+                continue
+            if not self._store.covers(session, lo - delta, hi - lo):
+                logger.warning("shift: gapfill dropping [%d,%d): store lost the source", lo, hi)
+                continue
+            out.append({"dst_start": lo, "dst_end": hi, "delta": delta})
+        return out
+
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:
         session = self._table.session_of(request.request_id)
-        req = (self._params.get(request.request_id) or {}).get("load")
+        params = self._params.get(request.request_id) or {}
+
+        multi = params.get("loads")
+        if GAPFILL and session and multi:
+            from .gapfill import plan_gaps
+
+            accepted = self._accept_multi(request, session, multi, num_computed_tokens)
+            if not accepted:
+                return 0, False
+            gp = plan_gaps(
+                accepted, self._bs, request.num_prompt_tokens, local_hit=num_computed_tokens
+            )
+            gapfill_channel.offer(request.request_id, gp.compute, gp.filled_tokens)
+            self._multi[request.request_id] = accepted
+            logger.info(
+                "shift: gapfill %d segments, %d/%d tokens filled, %d to compute",
+                len(accepted),
+                gp.filled_tokens,
+                gp.n_prompt,
+                len(gp.compute),
+            )
+            return max(gp.filled_tokens - num_computed_tokens, 0), False
+
+        req = params.get("load")
         decision, why = plan_load(
             self._store,
             session,
@@ -279,7 +334,18 @@ class MarathonShiftConnector(KVConnectorBase_V1):
         for req in scheduler_output.scheduled_new_reqs:
             rid = req.req_id
             self._blocks[rid] = list(req.block_ids[0])
-            if rid in self._need_load:
+            if rid in self._need_load and rid in self._multi:
+                for seg in self._multi[rid]:
+                    meta.loads.append(
+                        _Load(
+                            self._table.session_of(rid) or "",
+                            slots(self._blocks[rid], seg["dst_start"], seg["dst_end"], self._bs),
+                            seg["dst_start"] - seg["delta"],
+                            seg["delta"],
+                        )
+                    )
+                self._need_load.discard(rid)
+            elif rid in self._need_load:
                 lo, hi, delta = self._plans[rid]
                 meta.loads.append(
                     _Load(
@@ -306,6 +372,8 @@ class MarathonShiftConnector(KVConnectorBase_V1):
         return meta
 
     def _forget(self, rid: str) -> None:
+        gapfill_channel.release(rid)
+        self._multi.pop(rid, None)
         self._blocks.pop(rid, None)
         self._params.pop(rid, None)
         self._plans.pop(rid, None)

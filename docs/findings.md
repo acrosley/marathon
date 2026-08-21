@@ -1627,3 +1627,73 @@ The phase's bet was that an adapter could make reuse robust enough for `reuse_pl
 Caveats: one model, one seed per experiment, one epoch, 200 training items. Criterion 3 was not measured on the paged eval at all — the failure is inferred from a 16-item mid-training slice, which is a weak instrument for a gate and should be re-measured on the synthetic population before the "2–3× regression" is quoted as settled. The discriminator's 250 items are drawn from the gate run's population, so its exact-match rate and the gate's KL are not independent measurements. `planted-fact` grades a substring of the decoded answer, so a fact restated in different words scores as lost and one recited by luck scores as kept. The free-running comparison is greedy, so it says nothing about sampled generation. And the GPU sat idle for roughly three hours of today's window through my own failure to watch running jobs — what is here is what fit around that, not what the day could have held.
 
 @acrosley 2026-08-21
+
+## 2026-08-21 — Draft: a single-request load path for k segments, and a generation-0 remap that the store cannot host yet
+
+CPU-only weekend work following the 2026-08-21 result that the connector's multi-request path,
+not the stitched KV and not FP8, is where the paged workload loses its answers. Two designs,
+one implemented and awaiting a GPU, one implemented and **blocked for a reason worth recording**.
+Nothing here is measured on hardware.
+
+**Where the "matched = prefix" contract actually lives, and how small the patch is.** Reading
+vLLM 0.27's scheduler and model runner, the contiguity assumption enters input construction in
+exactly one line — `positions_np = num_computed_tokens_cpu[req_indices] + query_pos` in
+`v1/worker/gpu_model_runner.py`. Token ids, slot mapping, block tables and attention metadata are
+all derived from that array. So a connector can be allowed to declare a *set* of filled spans
+with two edits: the scheduler republishes a gap plan and treats `num_computed_tokens` as
+*matched + gaps already computed* (which keeps every "done prefilling" comparison in that file
+correct, chunked prefill included), and the runner overwrites that request's slice of
+`positions_np` with explicit positions. `scripts/patch_vllm_gapfill.py` does both, idempotently,
+with `--revert`, asserting each anchor appears exactly once so a vLLM upgrade fails loudly
+instead of mis-patching.
+
+Prefilling only the gaps is sound for one reason worth stating plainly: attention reads earlier
+positions out of the paged cache through the block table, so a token must be *present*, not
+*computed in the same pass* as the tokens attending to it. The connector writes reused spans in
+`start_load_kv`, before the forward; gaps earlier in the same batch are written to their slots
+before later gaps attend to them.
+
+The arithmetic is `marathon.gapfill`, pure and covered by 23 tests: block-align the plan's loads,
+**drop** anything that cannot survive alignment rather than rounding outward onto positions the
+connector will not actually fill, merge, fold in the engine's own prefix hit, and emit the exact
+complement. One test pins that `align()` clips identically to `reuse_plan.phases`, so the two
+paths reuse the *same* spans and an A/B measures the request structure and nothing else — which
+is the only way the comparison means anything.
+
+**The compounding fix is correct and unusable, and the blocker is structural.** An edit turn
+currently saves with `"full"`, re-gathering the whole prompt out of the paged cache *including
+the span just stitched into it*, so after two reuse turns the store holds a rotated copy of a
+rotated copy that is indistinguishable from fresh KV. `marathon.remap` avoids that: never
+re-save a reused span, and keep an address book from logical position to store index. It rests on
+the store's existing invariant — index `i` holds keys as computed at position `i` — so a span now
+at `p` needs one rotation of exactly `p − i`, and offsets compose by addition because rotations
+do. A span moved by `d1` then `d2` is still reachable by a *single* exact rotation of `d1 + d2`,
+forever. Ten tests cover it, including a twelve-turn paged simulation checking every emitted load
+reaches the span's generation-0 index at 2400 tokens of drift.
+
+It cannot be wired in. `ShiftStore` is a flat `[base, filled)` window and a save at a lower
+`dst_start` truncates everything above it. Under no-resave the fresh gaps between reused segments
+are saved at their own, lower, indices every turn — so each save destroys exactly the
+generation-0 bytes the remap addresses higher up. The fingerprint harness caught it immediately:
+**19 truncating writes and 80 corrupted positions over 20 paged turns.** `resave=False` therefore
+raises `NotImplementedError` instead of offering a silent wrong-answer path, and two tests pin the
+mechanism — one on the server, one isolating the store call that throws the bytes away. Unblocking
+it means per-position validity: an interval-allocating store with a free list and a matching
+scheduler-side mirror. That should wait, because if the single-request path restores exact-match on
+its own then compounding was never the binding constraint and the rewrite is unnecessary.
+
+**Also worth recording: the harness earned its keep twice.** My first wiring of the remap fed the
+*translated* loads back into `after_turn`, double-counting each offset; the fingerprint model
+caught it as an off-by-one store index (turn 15, position 1265, wanted token 116, got 115) rather
+than as a plausible-looking wrong answer three GPU-hours later. The coordinate system is the easy
+thing to get backwards here — a plan's delta is measured against the *previous* state, so
+`loads_for` takes the pre-turn map and `after_turn` produces the post-turn one — and that ordering
+is now documented in the function that needs it.
+
+**Limits.** Nothing in this entry has run on a GPU. The patch's risks are the scheduler's budget
+accounting when the gap count exceeds one step, and any place other than `positions_np` that
+assumes contiguity — attention metadata construction is the one to watch. Tensor parallelism is
+unsupported by the channel and not attempted. `--max-segments`, `--gapfill` and `--no-resave` are
+all diagnostics, not proposed policy.
+
+@acrosley 2026-08-21

@@ -519,3 +519,32 @@ def test_refresh_turns_never_inherit_stitched_blocks_from_the_prefix_cache():
     offenders = [(t, n) for t, n in leaked.items() if rows[t]["refreshed"]]
     assert not offenders, f"refresh turns inherited stitched blocks: {offenders}"
     assert not leaked, f"turns prefix-hit stitched blocks: {sorted(leaked.items())[:5]}"
+
+
+# ------------------------------------------------- no-resave (generation-0 reuse)
+
+
+def test_no_resave_is_refused_until_the_store_can_host_it():
+    """Do not let a known-broken path look available.
+
+    ``marathon.remap`` is correct and unit-tested, but it addresses bytes the store does
+    not keep: ``ShiftStore`` is a flat ``[base, filled)`` window, and a save at a lower
+    ``dst_start`` truncates everything above it. Under no-resave the fresh gaps between
+    reused segments are saved at their own (lower) indices every turn, so each save
+    destroys the generation-0 bytes the remap points at higher up. Measured on CPU: 19
+    truncating writes and 80 corrupted positions over 20 paged turns.
+    """
+    with pytest.raises(NotImplementedError, match="per-position validity"):
+        MarathonServer(engine=FingerprintEngine(), tokenizer=FakeTokenizer(), resave=False)
+
+
+def test_the_flat_store_truncates_exactly_where_the_remap_needs_bytes():
+    """The blocker, isolated: a save below `filled` throws away everything above it."""
+    store = ShiftStore(budget_tokens=8192, device="cpu", allocate=False)
+    assert store.reserve("s", 0, 1000)  # generation-0 content for [0, 1000)
+    assert store.covers("s", 900, 100)
+    # a later turn computes a fresh gap low down and saves it at its own index
+    assert store.reserve("s", 200, 50)
+    assert not store.covers("s", 900, 100), (
+        "the bytes the remap addresses at 900 are gone; this is what blocks no-resave"
+    )
