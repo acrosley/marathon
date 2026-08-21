@@ -34,13 +34,14 @@ class FakeEngine:
     def __init__(self):
         self.calls = []
 
-    def generate(self, ids, session, max_tokens, load=None, save=False):
+    def generate(self, ids, session, max_tokens, load=None, save=False, loads=None):
         self.calls.append(
             {
                 "n": len(ids),
                 "session": session,
                 "max_tokens": max_tokens,
                 "load": load,
+                "loads": loads,
                 "save": save,
             }
         )
@@ -547,3 +548,39 @@ def test_churn_accumulates_across_consecutive_reused_turns_and_resets_on_refresh
     assert run == sorted(run), run
     # the turn counter is deliberately not the thing being enforced here
     assert max(r["stale"] for r in rows) > 1
+
+
+# --- single-request multi-segment load -------------------------------------------
+
+
+def test_gapfill_sends_every_segment_in_one_request():
+    """The phase sequence is replaced by a single request carrying all the loads."""
+    server, engine = make_server(gapfill=True, max_churn=None, max_stale=10**6)
+    c = make_client(server)
+    for i in range(8):
+        c.turn("s", f"turn {i} " + LONG)
+    c.edit("s", 0, "REWRITTEN " + LONG)
+    c.edit("s", 4, "ALSO REWRITTEN " + LONG)
+    before = len(engine.calls)
+    r = c.turn("s", "after the edits " + LONG)
+
+    assert len(engine.calls) - before == 1, "gapfill must not issue warm-up phases"
+    call = engine.calls[-1]
+    assert call["load"] is None
+    assert call["loads"] and len(call["loads"]) == len(r["deltas"]) - (
+        1 if r["deltas"] and r["deltas"][0] == 0 else 0
+    )
+    assert call["save"] == "full"
+    assert r["reused_tokens"] > 0
+
+
+def test_gapfill_off_still_uses_the_phase_sequence():
+    server, engine = make_server(max_churn=None, max_stale=10**6)
+    c = make_client(server)
+    for i in range(8):
+        c.turn("s", f"turn {i} " + LONG)
+    c.edit("s", 0, "REWRITTEN " + LONG)
+    before = len(engine.calls)
+    c.turn("s", "after the edit " + LONG)
+    assert len(engine.calls) - before >= 2, "phase path should warm up then generate"
+    assert engine.calls[-1]["loads"] is None

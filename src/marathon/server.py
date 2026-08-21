@@ -51,6 +51,7 @@ from . import reuse_plan
 from .canonical import canonical_bytes
 from .cold import ColdTier, TransformerEmbedder
 from .protocol import BaselineStore, ProtocolError, TurnPayload, resolve_turn
+from .remap import Remap, loads_for
 from .reuse_plan import _lines
 from .session import Session
 from .shift_store import churn_tokens
@@ -179,11 +180,15 @@ class VllmEngine:
         max_tokens: int,
         load: dict | None = None,
         save: bool | str = False,
+        loads: list[dict] | None = None,
     ) -> str:
         params = self._sampling(temperature=0, max_tokens=max_tokens)
         kv: dict[str, Any] = {"session": session, "save": save}
         if load:
             kv["load"] = load
+        if loads:
+            # single-request path: every reused segment at once, non-prefix match
+            kv["loads"] = loads
         params.extra_args = {"kv_transfer_params": kv}
         out = self.llm.generate({"prompt_token_ids": ids}, params)
         return out[0].outputs[0].text
@@ -206,6 +211,8 @@ class MarathonServer:
         max_stale: int = 1,
         max_churn: float | None = None,
         max_segments: int = 0,
+        gapfill: bool = False,
+        resave: bool = True,
         active_window: int | None = None,
         cold_kwargs: dict | None = None,
     ) -> None:
@@ -247,6 +254,28 @@ class MarathonServer:
         # over as k+1 sequential requests. This isolates that difference -- 1 makes the
         # serving path as close to a single stitch as the connector API allows.
         self.max_segments = max_segments
+        # Hand every reused segment over in ONE request instead of the k+1 phase
+        # sequence, which needs scripts/patch_vllm_gapfill.py applied to vLLM. The
+        # phase path is what the 2026-08-21 measurement blamed for the paged workload's
+        # answer collapse; this is the alternative it motivates.
+        self.gapfill = gapfill
+        # ``resave=False`` stops an edit turn re-saving the span it just stitched. The
+        # store keeps its generation-0 bytes and a per-session address book
+        # (:mod:`marathon.remap`) records how far each span has drifted, so every reuse
+        # re-rotates from the original once instead of stitching from stitched values.
+        # Testing the compounding hypothesis for the paged collapse (findings 2026-08-21).
+        if not resave:
+            raise NotImplementedError(
+                "resave=False needs a store with per-position validity. ShiftStore is a "
+                "flat [base, filled) window whose save at a lower dst_start truncates "
+                "everything above it -- which is exactly the generation-0 bytes the "
+                "remap addresses. Measured on CPU 2026-08-21: 19 truncating writes and "
+                "80 corrupted positions over 20 paged turns. marathon.remap is correct "
+                "and tested; wiring it needs an interval-allocating store first. See "
+                "docs/single-request-load.md."
+            )
+        self.resave = resave
+        self._remap: dict[str, Remap] = {}
         self.store = BaselineStore()
         self._lock = threading.Lock()
         # per session: previous *active* state and line -> ids cache
@@ -350,11 +379,30 @@ class MarathonServer:
                 refreshed = bool(loads) and stale >= self.max_stale
             if refreshed:
                 loads = []  # spend one honest recompute to reset the staleness clock
+            # ``planned`` stays in the *plan's* coordinates (delta measured against the
+            # previous state); that is what the remap has to be updated with. What the
+            # engine gets may be a re-addressed version of it, and feeding those deltas
+            # back into the remap would count each offset twice.
+            planned = list(loads)
+            if not self.resave and loads:
+                # reach the generation-0 bytes rather than whatever the last turn
+                # stitched; one segment may split into several loads
+                loads = loads_for(self._remap.get(session_id, Remap()), loads)
             phases = reuse_plan.phases(loads, self.engine.block_size, len(ids))
 
             start = time.perf_counter()
             if not generate:
                 reply = ""
+            elif self.gapfill and loads:
+                # one request, every segment: no warm-up phases, so no truncated-prompt
+                # prefills and no reliance on the prefix cache to carry earlier segments
+                reply = self.engine.generate(
+                    ids,
+                    session_id,
+                    self.max_tokens,
+                    loads=loads,
+                    save="full" if self.resave else True,
+                )
             elif phases:
                 # every phase but the last is a max_tokens=1 warm-up whose only job is
                 # to leave its blocks in vLLM's prefix cache for the phase after it
@@ -364,7 +412,11 @@ class MarathonServer:
                 # position coordinates -- otherwise the *next* edit would plan against a
                 # layout that no longer exists. See the connector's _plan_save.
                 reply = self.engine.generate(
-                    ids, session_id, self.max_tokens, load=phases[-1][1], save="full"
+                    ids,
+                    session_id,
+                    self.max_tokens,
+                    load=phases[-1][1],
+                    save="full" if self.resave else True,
                 )
             else:
                 reply = self.engine.generate(ids, session_id, self.max_tokens, save=self.reuse)
@@ -377,6 +429,14 @@ class MarathonServer:
                 # turns that follow (flagged by Track L, 2026-08-19).
                 self._stale[session_id] = stale + 1 if loads else 0
                 self._churn[session_id] = churn if loads else 0
+            if not self.resave:
+                prior = self._remap.get(session_id, Remap())
+                if planned:
+                    segs = [(d["dst_start"], d["dst_end"], d["delta"]) for d in planned]
+                    self._remap[session_id] = prior.after_turn(segs, len(ids))
+                else:
+                    # everything from the first change on was recomputed and re-saved
+                    self._remap[session_id] = prior.restrict(plan.p if plan else 0)
             self._prev[session_id] = state
             return {
                 "reply": reply,
@@ -395,6 +455,7 @@ class MarathonServer:
                 "phases": max(len(phases), 1),
                 "stale": self._stale.get(session_id, 0),
                 "churn": round(churn_frac, 4),
+                "remap_depth": self._remap.get(session_id, Remap()).depth(),
                 "refreshed": refreshed,
                 "wire_bytes": wire_bytes,
                 "state_bytes": len(state),
@@ -467,6 +528,16 @@ def main(argv: list[str] | None = None) -> int:
         "the KV (an append-only turn resets the count)",
     )
     p.add_argument(
+        "--no-resave",
+        action="store_true",
+        help="do not re-save a stitched span; keep generation-0 bytes and remap them",
+    )
+    p.add_argument(
+        "--gapfill",
+        action="store_true",
+        help="single-request multi-segment load (needs scripts/patch_vllm_gapfill.py)",
+    )
+    p.add_argument(
         "--max-segments",
         type=int,
         default=0,
@@ -508,6 +579,8 @@ def main(argv: list[str] | None = None) -> int:
         max_stale=args.max_stale,
         max_churn=args.max_churn,
         max_segments=args.max_segments,
+        gapfill=args.gapfill,
+        resave=not args.no_resave,
         repair_first=args.repair_first,
         active_window=args.active_window,
         cold_kwargs={
