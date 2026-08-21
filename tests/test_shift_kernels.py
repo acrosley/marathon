@@ -88,3 +88,68 @@ def test_zero_length_load_is_a_noop():
     shift = shift_kernels.rope_shift(4, 128, _inv_freq(), dev)
     shift_kernels.scatter_shifted(src, kv, slots, 16, True, shift)
     assert torch.equal(kv, before)
+
+
+@pytest.mark.parametrize("hnd", [True, False])
+@pytest.mark.parametrize("delta", [0, 1, -1, 17, -17, 566, -566, -1133, 6759])
+def test_scatter_lands_exactly_what_rerotate_keys_says_qwen3_geometry(delta: int, hnd: bool):
+    """The serving write path, checked against the HF reference at Qwen3's real geometry.
+
+    ``tests/test_paged_depth.py`` models KV as token ids, so it can prove a span landed
+    in the right *place* and never that it landed with the right *values*: a wrong
+    rotation angle, a write into the wrong layer, or a layout/stride mistake are all
+    invisible to it. This is the same comparison ``MARATHON_VERIFY_LOAD`` makes inside a
+    live engine, run on CPU at the geometry that matters — head_size 128, 8 KV heads,
+    block 16, theta 1e6, full rotary — over the segment deltas the 14B paged run
+    actually produced, negative ones included.
+    """
+    torch.manual_seed(delta + 1)
+    heads, head_size, block_size, blocks, n = 8, 128, 16, 12, 40
+    inv = 1.0 / (1e6 ** (torch.arange(0, head_size, 2, dtype=torch.float32) / head_size))
+
+    src = torch.randn(n, heads, 2 * head_size, dtype=torch.float32)
+    shape = (
+        (blocks, heads, block_size, 2 * head_size)
+        if hnd
+        else (blocks, block_size, heads, 2 * head_size)
+    )
+    kv = torch.zeros(shape, dtype=torch.float32)
+    slots = torch.randperm(blocks * block_size)[:n].to(torch.int64)
+
+    shift_kernels.scatter_shifted(
+        src,
+        kv,
+        slots,
+        block_size,
+        hnd,
+        shift_kernels.rope_shift(delta, head_size, inv, "cpu"),
+    )
+
+    want_k = rerotate_keys(src[..., :head_size], delta, inv)
+    want = torch.cat((want_k, src[..., head_size:]), dim=-1)
+    blk, off = slots // block_size, slots % block_size
+    got = kv[blk, :, off] if hnd else kv[blk, off]
+    assert torch.allclose(got, want, atol=1e-4), (
+        f"delta={delta} hnd={hnd}: max abs diff {(got - want).abs().max():.4g}"
+    )
+
+
+def test_the_scatter_check_actually_catches_a_wrong_angle():
+    """Guard against the test above passing because it is looking at nothing."""
+    heads, head_size, block_size, blocks, n = 8, 128, 16, 12, 40
+    inv = 1.0 / (1e6 ** (torch.arange(0, head_size, 2, dtype=torch.float32) / head_size))
+    src = torch.randn(n, heads, 2 * head_size, dtype=torch.float32)
+    kv = torch.zeros((blocks, heads, block_size, 2 * head_size), dtype=torch.float32)
+    slots = torch.arange(n, dtype=torch.int64)
+    # scatter with delta 100 but check against delta 101: must not agree
+    shift_kernels.scatter_shifted(
+        src,
+        kv,
+        slots,
+        block_size,
+        True,
+        shift_kernels.rope_shift(100, head_size, inv, "cpu"),
+    )
+    want = torch.cat((rerotate_keys(src[..., :head_size], 101, inv), src[..., head_size:]), -1)
+    got = kv[slots // block_size, :, slots % block_size]
+    assert not torch.allclose(got, want, atol=1e-4)

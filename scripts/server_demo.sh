@@ -20,6 +20,8 @@ demote=""
 json=""
 maxstale=""
 maxchurn=""
+maxseg=""
+verify=""
 fixed=""
 factprobe=""
 repair=""
@@ -41,6 +43,8 @@ while [ $# -gt 0 ]; do
     --fact-probe) factprobe="--fact-probe"; shift;;
     --max-stale) maxstale="$2"; shift 2;;
     --max-churn) maxchurn="$2"; shift 2;;
+    --max-segments) maxseg="$2"; shift 2;;
+    --verify-load) verify=1; shift;;
     --repair-first) repair="$2"; shift 2;;
     --active-window) window="$2"; shift 2;;
     *) echo "unknown arg: $1"; exit 2;;
@@ -54,6 +58,7 @@ repo="$(dirname "$here")"
 export PYTHONPATH="$repo/src${PYTHONPATH:+:$PYTHONPATH}"
 # ponytail: WSL2 has no UVA (pinned host-mapped memory); vLLM 0.27 v2 runner needs it
 export VLLM_USE_V2_MODEL_RUNNER=0
+[ -n "$verify" ] && export MARATHON_VERIFY_LOAD=1
 py="$HOME/marathon-venv/bin/python"
 mkdir -p "$HOME/marathon-logs"
 tag="serverdemo_$(echo "$model$extra$demote" | tr -c "a-zA-Z0-9" "_")"
@@ -63,7 +68,7 @@ echo "=== $model $extra on port $port (server log: $log) ==="
 cd "$HOME"
 "$py" -m marathon.server --model "$model" --port "$port" --gpu-util "$gpu_util" \
   --max-model-len "$max_model_len" --store-tokens "$store_tokens" \
-  --max-tokens "$max_tokens" $extra ${maxstale:+--max-stale "$maxstale"} ${maxchurn:+--max-churn "$maxchurn"} ${repair:+--repair-first "$repair"} ${window:+--active-window "$window"} > "$log" 2>&1 &
+  --max-tokens "$max_tokens" $extra ${maxstale:+--max-stale "$maxstale"} ${maxchurn:+--max-churn "$maxchurn"} ${maxseg:+--max-segments "$maxseg"} ${repair:+--repair-first "$repair"} ${window:+--active-window "$window"} > "$log" 2>&1 &
 srv=$!
 trap 'kill $srv 2>/dev/null' EXIT
 

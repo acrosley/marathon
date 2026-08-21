@@ -205,6 +205,7 @@ class MarathonServer:
         reuse: bool = True,
         max_stale: int = 1,
         max_churn: float | None = None,
+        max_segments: int = 0,
         active_window: int | None = None,
         cold_kwargs: dict | None = None,
     ) -> None:
@@ -240,6 +241,12 @@ class MarathonServer:
         # benign repeated edit that barely disturbs the span's prefix can then keep
         # reusing, where the turn counter would have forced a recompute.
         self.max_churn = max_churn
+        # Diagnostic: keep at most this many reused segments (the longest ones), leaving
+        # the rest for the engine to recompute. Phase 3's HF experiment stitches one
+        # cache in a single forward and loses no facts; the connector hands k segments
+        # over as k+1 sequential requests. This isolates that difference -- 1 makes the
+        # serving path as close to a single stitch as the connector API allows.
+        self.max_segments = max_segments
         self.store = BaselineStore()
         self._lock = threading.Lock()
         # per session: previous *active* state and line -> ids cache
@@ -329,6 +336,10 @@ class MarathonServer:
 
             plan = self.plan_for(session_id, state, pieces)
             loads = plan.to_kv_transfer_params() if plan else []
+            if self.max_segments and len(loads) > self.max_segments:
+                keep = sorted(loads, key=lambda d: d["dst_end"] - d["dst_start"], reverse=True)
+                keep = keep[: self.max_segments]
+                loads = [d for d in loads if d in keep]
             stale = self._stale.get(session_id, 0)
             changed, span_len = churn_tokens(loads)
             churn = self._churn.get(session_id, 0) + changed
@@ -456,6 +467,13 @@ def main(argv: list[str] | None = None) -> int:
         "the KV (an append-only turn resets the count)",
     )
     p.add_argument(
+        "--max-segments",
+        type=int,
+        default=0,
+        help="diagnostic: stitch at most this many (longest) segments, recomputing the "
+        "rest -- 1 approximates a single-shot stitch",
+    )
+    p.add_argument(
         "--max-churn",
         type=float,
         default=None,
@@ -489,6 +507,7 @@ def main(argv: list[str] | None = None) -> int:
         reuse=not args.no_reuse,
         max_stale=args.max_stale,
         max_churn=args.max_churn,
+        max_segments=args.max_segments,
         repair_first=args.repair_first,
         active_window=args.active_window,
         cold_kwargs={

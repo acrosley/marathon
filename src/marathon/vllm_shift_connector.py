@@ -91,6 +91,15 @@ if TYPE_CHECKING:
 # vLLM only configures handlers under the "vllm" logger namespace.
 logger = init_logger("vllm.marathon_shift")
 
+#: ``MARATHON_VERIFY_LOAD=1`` reads every loaded span back out of the paged cache and
+#: compares it against the torch reference (:func:`marathon.kvshift.rerotate_keys` on the
+#: same source rows). The fingerprint harness in ``tests/test_paged_depth.py`` models KV
+#: as token ids, so it proves *placement* and can never catch a wrong rotation angle, a
+#: write into the wrong layer, or a layout/stride mistake. This catches all three, in the
+#: live serving path, at the cost of a read-back per layer -- diagnostic only, off by
+#: default.
+VERIFY_LOAD = os.environ.get("MARATHON_VERIFY_LOAD", "") not in ("", "0")
+
 # The scheduler-side and worker-side connectors are separate instances (and, with a
 # non-uniprocess executor, separate processes). Both register here so `stats()` can
 # report whatever is reachable from the caller's process.
@@ -364,6 +373,43 @@ class MarathonShiftConnector(KVConnectorBase_V1):
         src = kv.permute(0, 2, 1, 3) if self._hnd else kv
         return src[blk, off]
 
+    def _verify(self, layer: str, kv, row, slot, delta: int) -> None:
+        """Read a just-scattered span back and compare it to the torch reference.
+
+        ``row`` is what the store handed us, ``[n, heads, 2*head_size]`` with K in the
+        first half. The reference re-rotates K with :func:`marathon.kvshift.rerotate_keys`
+        -- the same function ``kvshift`` is unit-tested against -- and leaves V alone,
+        then checks that is what actually landed in the paged cache at ``slot``. A
+        nonzero difference localises the bug to this write: wrong angle, wrong layer,
+        wrong slot, or wrong layout.
+        """
+        from .kvshift import rerotate_keys
+
+        d = row.shape[-1] // 2
+        if 2 * int(self._inv_freq.numel()) != d:
+            logger.warning(
+                "shift-verify: partial rotary (%d of %d) unsupported; skipped",
+                2 * int(self._inv_freq.numel()),
+                d,
+            )
+            return
+        want_k = rerotate_keys(
+            row[..., :d].to(torch.float32), int(delta), self._inv_freq.to(row.device)
+        )
+        want = torch.cat((want_k, row[..., d:].to(torch.float32)), dim=-1)
+        got = kv[self._paged(kv, slot)].to(torch.float32)
+        diff = (got - want).abs()
+        rel = diff.max() / want.abs().max().clamp_min(1e-6)
+        logger.info(
+            "shift-verify: layer=%s delta=%d n=%d max_abs=%.4g max_rel=%.4g mean_abs=%.4g",
+            layer,
+            delta,
+            row.shape[0],
+            float(diff.max()),
+            float(rel),
+            float(diff.mean()),
+        )
+
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
         meta = self._get_connector_metadata()
         if not isinstance(meta, ShiftConnectorMetadata) or not meta.loads:
@@ -397,9 +443,10 @@ class MarathonShiftConnector(KVConnectorBase_V1):
                         name,
                     )
                     return
-                scatter_shifted(
-                    src.to(kv.device, non_blocking=True), kv, slot, self._bs, self._hnd, shift
-                )
+                row = src.to(kv.device, non_blocking=True)
+                scatter_shifted(row, kv, slot, self._bs, self._hnd, shift)
+                if VERIFY_LOAD:
+                    self._verify(name, kv, row, slot, load.delta)
                 _bytes += src.numel() * src.element_size()
             torch.cuda.synchronize()
             _ms = (time.perf_counter() - _t0) * 1e3
