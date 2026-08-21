@@ -70,6 +70,12 @@ class FingerprintEngine:
         self.corruptions: list[tuple[int, int, int, int]] = []  # (turn, pos, want, got)
         self.saved_token_steps = 0  # positions written to the store, summed over steps
         self.saves: list[tuple[int, int, int]] = []  # (turn, lo, hi) of every store write
+        # provenance of every published block: a block the connector *wrote* holds
+        # stitched (re-rotated, approximate) KV in a real engine, and a later request
+        # that prefix-hits it silently inherits that approximation -- including a
+        # refresh turn, whose whole job is to recompute honestly
+        self.block_origin: dict[int, str] = {}
+        self.stitched_hits: list[tuple[int, int]] = []  # (turn, blocks hit that were loaded)
         self.turn = -1
 
     # ---------------------------------------------------------------- paged cache
@@ -81,17 +87,29 @@ class FingerprintEngine:
     def _key(self, ids: list[int], k: int) -> str:
         return str(ids[: (k + 1) * BLOCK])
 
+    def _mark(self, blocks: list[int], lo: int, hi: int, origin: str) -> None:
+        for b in range(lo // BLOCK, (hi + BLOCK - 1) // BLOCK):
+            # "loaded" wins: a block holding any stitched token is stitched
+            if b < len(blocks) and (
+                origin == "loaded" or self.block_origin.get(blocks[b]) != "loaded"
+            ):
+                self.block_origin[blocks[b]] = origin
+
     def _blocks_for(self, ids: list[int]) -> tuple[list[int], int]:
         """Block table for ``ids`` plus the block-aligned prefix hit, as vLLM would."""
-        blocks, hit, broken = [], 0, False
+        blocks, hit, broken, stitched = [], 0, False, [0]
         for k in range((len(ids) + BLOCK - 1) // BLOCK):
             cached = None if broken else self.prefix.get(self._key(ids, k))
             if cached is not None and (k + 1) * BLOCK <= len(ids):
                 blocks.append(cached)
                 hit = (k + 1) * BLOCK
+                if self.block_origin.get(cached) == "loaded":
+                    stitched[0] += 1
             else:
                 broken = True
                 blocks.append(self._new_block())
+        if stitched[0]:
+            self.stitched_hits.append((self.turn, stitched[0]))
         return blocks, hit
 
     def _publish(self, ids: list[int], blocks: list[int]) -> None:
@@ -120,10 +138,12 @@ class FingerprintEngine:
             src = self.store.read(session, "L0", decision.src_start, n)
             assert src is not None, "covers() promised a span that read() will not serve"
             self._write(blocks, decision.lo, decision.hi, [int(v) for v in src[:, 0, 0].tolist()])
+            self._mark(blocks, decision.lo, decision.hi, "loaded")
             num_computed = decision.hi
 
         # vLLM prefills whatever is left
         self._write(blocks, num_computed, len(ids), ids[num_computed:])
+        self._mark(blocks, num_computed, len(ids), "computed")
 
         # every position must now hold its own token, or the model saw the wrong KV
         for pos, got in enumerate(self._read(blocks, 0, len(ids))):
@@ -475,3 +495,27 @@ def test_presizing_off_by_default_keeps_geometric_growth():
     assert store.session_cap == 0
     assert store.reserve("s", 0, 100)
     assert store._sessions["s"].capacity == SLAB
+
+
+def test_refresh_turns_never_inherit_stitched_blocks_from_the_prefix_cache():
+    """A refresh turn must actually recompute, not prefix-hit connector-written blocks.
+
+    The engine's own prefix cache is keyed by token ids and knows nothing about how a
+    block's KV was produced, so in principle a block the connector filled with stitched
+    (re-rotated, approximate) KV could be served to a later request — including a refresh
+    turn, whose entire purpose is to recompute honestly. On a paged workload it cannot
+    happen, and for a structural reason worth recording: paging rewrites the *front* of
+    the view every turn, so the token-id prefix diverges before it ever reaches a
+    stitched block, and prefix caching only ever matches from position 0. This pins that
+    reasoning, so a future policy that stops editing the front (or a cache that matches
+    suffixes) trips this instead of silently reintroducing the approximation.
+    """
+    engine = FingerprintEngine()
+    rows, _, _ = run_cold_session(30, engine)
+    stitched = sum(1 for v in engine.block_origin.values() if v == "loaded")
+    assert stitched > 0, "no block was ever written by the connector; nothing was tested"
+
+    leaked = dict(engine.stitched_hits)
+    offenders = [(t, n) for t, n in leaked.items() if rows[t]["refreshed"]]
+    assert not offenders, f"refresh turns inherited stitched blocks: {offenders}"
+    assert not leaked, f"turns prefix-hit stitched blocks: {sorted(leaked.items())[:5]}"

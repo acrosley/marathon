@@ -1513,6 +1513,41 @@ Caveats: one crash, one configuration. No claim is made here about whether the m
 
 @acrosley 2026-08-20
 
+## 2026-08-21 — It is the serving path, not FP8 and not the arithmetic: the stitched KV is bit-right to bf16, yet Qwen3-8B drops 0.75 → 0.35 through the connector
+
+Phase 3's free-running decode on a fully stitched HF cache (Qwen3-8B, n=250) keeps planted-fact EM at 250/250 for both stitched and reference, with divergence only in the answer tail. My serving runs on the same workload shape score 7/14. Something between those two facts is a bug in the serving path. Four things ruled out, one located, one narrowed.
+
+**The stitched KV the connector writes is numerically correct — in a live engine, in every layer.** `MARATHON_VERIFY_LOAD=1` reads each loaded span back out of the paged cache and diffs it against `kvshift.rerotate_keys` on the same source rows. Qwen3-0.6B, a paged turn with δ = −566 over 1200 tokens:
+
+```
+layer  0  max_abs=0.9995  max_rel=0.002206  mean_abs=0.002769
+layer  1  max_abs=0.4998  max_rel=0.002819  mean_abs=0.001910
+layer  2  max_abs=0.4995  max_rel=0.002537  mean_abs=0.001879
+...        (28 of 28 layers, max_rel 0.0020-0.0032 throughout)
+```
+
+`max_rel` of 2–3e−3 is bf16 rounding and nothing else. A wrong rotation angle, a write into the wrong layer, a swapped K/V half or a layout/stride mistake would all show O(1) relative error on some layer; none does, uniformly across the stack. This is the check the fingerprint harness structurally cannot make — it models KV as token ids, so it proves *placement* and is blind to *values*, and it uses a single layer, so it is blind to layer permutation too. Backed on CPU by a new test that scatters at Qwen3's real geometry (head_size 128, 8 KV heads, block 16, θ=1e6, full rotary) over the deltas the 14B run actually produced (0, ±1, ±17, ±566, −1133, 6759), both layouts, against `rerotate_keys` — plus a guard that deliberately checks δ=100 against δ=101 and fails, so the test cannot pass by looking at nothing.
+
+**It is not FP8 and not 14B.** Qwen3-8B bf16, same paged workload (window 8192, 40 turns, `max_churn=1.0`), against its own connector-off control:
+
+| model / condition | fact EM | note |
+|---|---:|---|
+| Qwen3-8B, connector **off** | **15/20 = 0.75** | paging alone is already lossy |
+| Qwen3-8B, connector **on** | **7/20 = 0.35** | |
+| Qwen3-8B, connector on, `--max-segments 1` | **10/20 = 0.50** | |
+| Qwen3-14B-FP8, connector off (2026-08-20) | 14/14 = 1.00 | |
+| Qwen3-14B-FP8, connector on | 4/14 = 0.29 | |
+
+The collapse reproduces on the *same model* Phase 3 measured at 250/250 with an HF stitched cache, in bf16, with no quantised KV anywhere. Roughly half the answers are lost on both models. Note the 8B control is 0.75, not 1.0 — 8B is weaker on this probe, so the honest statement is a *relative* halving on both, not an absolute collapse only on 14B.
+
+**Narrowed: the k+1 phase trick is part of it.** The connector cannot hand k segments to vLLM in one shot — the API expresses externally matched tokens only as a prefix — so `phases()` issues k+1 sequential requests, each loading one segment and relying on the engine's prefix cache to carry the earlier ones. Phase 3's HF experiment instead stitches every segment into one cache and runs a single forward. Forcing the connector as close to that as its API allows, `--max-segments 1` (stitch only the longest run, recompute the rest), recovers **0.35 → 0.50** of the 0.75 control. So sequential multi-segment consumption costs real accuracy — and it is not the whole story, because one segment still loses a third of the remaining gap.
+
+**Also ruled out, on CPU.** Coordinates under the real `cold.py` policy (demotions, promotions, evictions, 6-segment plans) are exact, and fault injection of a one-block δ error produces 1181 corrupted positions, so that harness is looking. Store bookkeeping is clean in the live runs: zero evictions, zero refusals, zero "no stored KV". And stitched blocks never leak into a later turn through the engine's prefix cache — a new test pins the reason, which is structural rather than lucky: paging rewrites the *front* of the view every turn, so the token-id prefix diverges before it ever reaches a stitched block, and prefix caching only matches from position 0. That matters because it means a refresh turn really does recompute honestly; the leak hypothesis is dead.
+
+**What is left.** Two candidates, in order. First, the residue of the phase trick beyond segment count: each warm-up request computes a *truncated* prompt, and although causal masking makes that sound in principle, the fresh spans it computes are the ones the final request then attends over. Second, compounding — a reuse turn re-saves its own stitched KV with `save="full"`, so consecutive reuse turns stitch from already-stitched values, which Phase 3's single-shot experiment never does; `max_churn=0.25` (which refreshes between reuse turns) scored 0.50 against `1.0`'s 0.29 on 14B, consistent with compounding mattering. Both are testable with the `--max-segments` knob plus a run that forces exactly one reuse turn per refresh.
+
+**Limits.** One run per cell, 20 scored turns each; the 8B control at 0.75 means differences of one or two answers are not resolvable. The verification run is 0.6B with a single reuse turn and one δ, so "correct in every layer" is established for that shape, not swept over deltas or models — though the CPU test does sweep deltas. `--max-segments` is a diagnostic, not a proposed policy: it trades reuse for accuracy and still loses to connector-off.
+
 ## 2026-08-21 — Training on the paged population works and still fails the gates; the free-running decode says stale attention changes wording, not answers — so Phase 3 is not the composition's blocker
 
 Command: `scripts/stitch_sizing.py --items 20`, `scripts/stitch_freerun.sh --items 250`, `scripts/stitch_mixed_retrain.sh` with `CAP=6000 GP=1 ITEMS=200 EVAL_ITEMS=500` (WSL2, `~/marathon-venv`, torch 2.13.0+cu130, transformers 5.15.0, sdpa, bf16, RTX 5090) · Model: `Qwen/Qwen3-8B` · Cost: $0.
